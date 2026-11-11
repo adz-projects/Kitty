@@ -343,7 +343,7 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
     // The Anthropic wire mode and the delegate level ride the provider row, so
     // the engine needs the card re-synced when either changes.
     if resync {
-        if let Err(e) = crate::bigtiny::providers::sync_all_providers(app).await {
+        if let Err(e) = crate::bigtiny::providers::sync_one_provider(app, &card.id).await {
             tracing::warn!("could not re-sync providers after effort detection: {e}");
         }
     }

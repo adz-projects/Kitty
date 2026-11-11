@@ -34,30 +34,50 @@ pub enum Decision {
     Prompt { warning: String },
 }
 
-/// The paths a tool call names, from the argument shapes Kitty's tools use.
-fn target_path(args: &Value) -> Option<&str> {
-    args.get("path")
-        .or_else(|| args.get("file_path"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            args.get("paths")
-                .and_then(|p| p.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-        })
-        .filter(|p| !p.is_empty())
+/// Every path a tool call names, from the argument shapes tools use. All
+/// entries of a `paths` array count: checking only the first let a second
+/// path outside the chat's folders through.
+fn target_paths(args: &Value) -> Vec<&str> {
+    let mut out: Vec<&str> = ["path", "file_path", "output_path", "destination"]
+        .iter()
+        .filter_map(|k| args.get(*k).and_then(|v| v.as_str()))
+        .collect();
+    if let Some(a) = args.get("paths").and_then(|p| p.as_array()) {
+        out.extend(a.iter().filter_map(|v| v.as_str()));
+    }
+    out.retain(|p| !p.is_empty());
+    out
 }
 
 /// Commands whose blast radius (remote access, destructive filesystem or
 /// network changes, privilege escalation) is too high to run unattended just
 /// because shell is not sandboxed anyway. Matched against the whole command,
-/// so a wrapper (`cmd /c rm -rf ...`) still matches.
+/// so a wrapper (`cmd /c rm -rf ...`) still matches. Covers the Windows forms
+/// too, since `lean_shell` runs under `cmd.exe` there.
 fn security_sensitive(command: &str) -> bool {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)\b(ssh|scp|sftp|sudo|su|rm\s+-rf|chmod|chown|curl\s+-o|wget\s+-O|netsh|iptables|shutdown|format|diskpart|nc|ncat|telnet|taskkill)\b",
-        )
+        regex::Regex::new(concat!(
+            r"(?i)",
+            // Remote access, privilege, permissions, network, power.
+            r"\b(ssh|scp|sftp|sudo|su|runas|chmod|chown|icacls|takeown|cacls|netsh|iptables|",
+            r"shutdown|format|diskpart|nc|ncat|telnet|taskkill|schtasks|bcdedit|vssadmin|cipher|",
+            r"Stop-Computer|Restart-Computer|Set-ExecutionPolicy)\b",
+            // Unix recursive or forced removal, in any flag order or spelling.
+            r"|\brm\s+(?:-\S*\s+)*-\S*[rRf]",
+            r"|\brm\s+--(?:recursive|force)\b",
+            // Windows deletion: del/erase with any switch, rd/rmdir /s,
+            // PowerShell Remove-Item (and its aliases) recursive or forced.
+            r"|\b(del|erase)\s+(?:\S+\s+)*?/[sqfSQF]\b",
+            r"|\b(rd|rmdir)\s+(?:\S+\s+)*?/[sS]\b",
+            r"|\b(Remove-Item|ri)\b[^|;&]*-(Recurse|Force)\b",
+            r"|\b(reg)\s+(delete|add|import)\b",
+            // Downloads to disk.
+            r"|\bcurl\b[^|;&]*\s-[a-zA-Z]*[oO]\b|\bwget\b[^|;&]*\s-O\b",
+            r"|\b(Invoke-WebRequest|iwr|Start-BitsTransfer|certutil)\b[^|;&]*(-OutFile|-urlcache|Destination)",
+            // Encoded or hidden PowerShell.
+            r"|\b(powershell|pwsh)(\.exe)?\b[^|;&]*\s-(e|ec|enc|encodedcommand)\b",
+        ))
         .expect("the pattern is valid")
     })
     .is_match(command)
@@ -123,18 +143,27 @@ fn lexical_normalize(path: &Path) -> String {
 
 /// Decide an approval request. `dirs` is everything the session may touch
 /// (chat folder, working folders, attached files), from the daemon's own
-/// view of the session.
+/// view of the session; `None` when that view could not be read.
 ///
 /// A path-based file operation must stay inside one of `dirs`; a
 /// security-sensitive shell command always needs a person; everything else
-/// is allowed.
-pub fn decide(args: &Value, dirs: &[String]) -> Decision {
-    if let Some(path) = target_path(args) {
+/// is allowed. When the folders are unknown, a call that names a path asks:
+/// failing to read the grants must not approve everything.
+pub fn decide(args: &Value, dirs: Option<&[String]>) -> Decision {
+    for path in target_paths(args) {
+        if is_internal_tool_cache_path(path) {
+            continue;
+        }
+        let Some(dirs) = dirs else {
+            return Decision::Prompt {
+                warning: format!(
+                    "Kitty could not read this chat's folders, so it cannot tell whether \
+                     this file operation stays inside them ({path})."
+                ),
+            };
+        };
         let bases: Vec<&String> = dirs.iter().filter(|d| !d.is_empty()).collect();
-        if !bases.is_empty()
-            && !bases.iter().any(|base| path_within_dir(base, path))
-            && !is_internal_tool_cache_path(path)
-        {
+        if !bases.is_empty() && !bases.iter().any(|base| path_within_dir(base, path)) {
             return Decision::Prompt {
                 warning: format!(
                     "A file operation wants to reach outside this chat's folders ({path})."
@@ -232,17 +261,17 @@ mod tests {
         assert_eq!(
             decide(
                 &json!({"path": "C:\\Users\\me\\Kitty\\chats\\c1\\out.docx"}),
-                &d
+                Some(&d)
             ),
             Decision::Allow
         );
         assert_eq!(
-            decide(&json!({"path": "notes/a.md"}), &d),
+            decide(&json!({"path": "notes/a.md"}), Some(&d)),
             Decision::Allow,
             "relative resolves inside"
         );
         assert_eq!(
-            decide(&json!({"file_path": "c:/USERS/me/kitty/CHATS/c1/x"}), &d),
+            decide(&json!({"file_path": "c:/USERS/me/kitty/CHATS/c1/x"}), Some(&d)),
             Decision::Allow,
             "case-insensitive"
         );
@@ -252,18 +281,18 @@ mod tests {
     fn a_file_op_outside_every_granted_folder_prompts() {
         let d = dirs(&["C:/Users/me/Kitty/chats/c1", "D:/project"]);
         assert!(matches!(
-            decide(&json!({"path": "C:/Windows/system.ini"}), &d),
+            decide(&json!({"path": "C:/Windows/system.ini"}), Some(&d)),
             Decision::Prompt { .. }
         ));
         assert!(
             matches!(
-                decide(&json!({"path": "../c2/secret"}), &d),
+                decide(&json!({"path": "../c2/secret"}), Some(&d)),
                 Decision::Prompt { .. }
             ),
             "no ..-walk out"
         );
         assert_eq!(
-            decide(&json!({"paths": ["D:/project/src/a.rs"]}), &d),
+            decide(&json!({"paths": ["D:/project/src/a.rs"]}), Some(&d)),
             Decision::Allow,
             "any granted folder"
         );
@@ -281,7 +310,7 @@ mod tests {
         assert_eq!(
             decide(
                 &json!({"path": "C:/Users/me/AppData/Block/goose/cache/page.html"}),
-                &d
+                Some(&d)
             ),
             Decision::Allow
         );
@@ -291,29 +320,92 @@ mod tests {
     fn security_sensitive_commands_prompt_and_others_run() {
         let d = dirs(&["C:/chats/c1"]);
         assert!(matches!(
-            decide(&json!({"command": "ssh box"}), &d),
+            decide(&json!({"command": "ssh box"}), Some(&d)),
             Decision::Prompt { .. }
         ));
         assert!(matches!(
-            decide(&json!({"command": "cmd /c rm -rf C:/x"}), &d),
+            decide(&json!({"command": "cmd /c rm -rf C:/x"}), Some(&d)),
             Decision::Prompt { .. }
         ));
         assert_eq!(
-            decide(&json!({"command": "python make_docx.py"}), &d),
+            decide(&json!({"command": "python make_docx.py"}), Some(&d)),
             Decision::Allow
         );
         assert_eq!(
-            decide(&json!({"command": "git status"}), &d),
+            decide(&json!({"command": "git status"}), Some(&d)),
             Decision::Allow
         );
     }
 
     #[test]
-    fn with_no_folders_known_a_path_is_not_judged() {
+    fn with_no_folders_granted_a_path_is_not_judged() {
         assert_eq!(
-            decide(&json!({"path": "C:/anything"}), &[]),
+            decide(&json!({"path": "C:/anything"}), Some(&[])),
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn unreadable_folders_make_a_path_ask() {
+        assert!(matches!(
+            decide(&json!({"path": "C:/anything"}), None),
+            Decision::Prompt { .. }
+        ));
+        assert_eq!(
+            decide(&json!({"command": "git status"}), None),
+            Decision::Allow,
+            "a call without a path is unaffected"
+        );
+    }
+
+    #[test]
+    fn every_entry_of_paths_is_checked() {
+        let d = dirs(&["D:/project"]);
+        assert!(matches!(
+            decide(
+                &json!({"paths": ["D:/project/a.rs", "C:/Windows/system.ini"]}),
+                Some(&d)
+            ),
+            Decision::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn windows_and_reordered_deletes_are_sensitive() {
+        for cmd in [
+            "del /s /q C:\\x",
+            "del C:\\x\\*.* /Q",
+            "erase /f a.txt",
+            "rd /s /q build",
+            "rmdir /S dist",
+            "Remove-Item -Recurse C:\\x",
+            "ri .\\x -Force",
+            "reg delete HKCU\\Software\\X /f",
+            "rm -r -f /tmp/x",
+            "rm -fr /tmp/x",
+            "rm -R dir",
+            "rm --recursive dir",
+            "powershell -enc SQBFAFgA",
+            "pwsh.exe -NoProfile -EncodedCommand SQBFAFgA",
+            "icacls C:\\x /grant Everyone:F",
+            "takeown /f C:\\x",
+            "schtasks /create /tn x /tr y",
+            "curl -L -o out.bin https://x",
+            "Invoke-WebRequest https://x -OutFile y",
+        ] {
+            assert!(security_sensitive(cmd), "{cmd}");
+        }
+        for cmd in [
+            "rm notes.txt",
+            "dir /s",
+            "git rm --cached a",
+            "python -m pytest",
+            "cargo build --release",
+            "echo delivered",
+            "Get-ChildItem -Recurse",
+        ] {
+            assert!(!security_sensitive(cmd), "{cmd}");
+        }
     }
 
     // Always-allow scope.

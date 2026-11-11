@@ -37,6 +37,17 @@ pub struct SessionInfo {
     /// The card's id, which is also its id in the engine's registry.
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
+    /// A resumed chat's transcript, as the same `{event, payload}` pairs a
+    /// live turn emits (`chat://user-message`, `chat://message-delta`, ...).
+    /// Returned to the window that asked rather than broadcast: emitted, it
+    /// reached every window, and any other window showing the same chat
+    /// appended the whole history again. Empty for a new chat.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replay: Vec<serde_json::Value>,
+    /// For a resumed chat: whether Kitty has a turn running in it right now,
+    /// so the window need not ask separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy: Option<bool>,
 }
 
 /// Start a new session. An explicit `cwd` (e.g. a dropped folder) overrides

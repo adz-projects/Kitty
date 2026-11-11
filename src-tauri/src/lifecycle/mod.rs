@@ -120,7 +120,7 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let client = crate::util::http_client();
+        let client = crate::util::engine_http_client();
         // Bounded to a few minutes total — well past any realistic onefile
         // self-extraction stall, but not forever: if the daemon truly never
         // comes up, the regular 5s health loop (`spawn_health_loop`) is what

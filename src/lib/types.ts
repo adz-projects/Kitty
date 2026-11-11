@@ -849,6 +849,11 @@ export interface SessionInfo {
       results that carry no pin (resume/fork). */
   provider_id: string | null;
   model_id: string | null;
+  /** A resumed chat's transcript as `{event, payload}` pairs in the shapes a
+      live turn emits; applied by the same handlers, in one store write. */
+  replay?: { event: string; payload: unknown }[];
+  /** A resumed chat: whether Kitty has a turn running in it right now. */
+  busy?: boolean;
 }
 
 export interface EffortOption {

@@ -196,9 +196,16 @@ pub fn daemon_env(
     let tokenizer = crate::models::tokenizer_path()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| tokenizer_path.trim().to_string());
-    let summarizer_litertlm = crate::models::resolve(&summarizer.model)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // Sent only when the local summarizer is switched on: the engine loads
+    // whatever model it is given, so a path sent with the switch off kept the
+    // model resident (RAM or VRAM) for nothing.
+    let summarizer_litertlm = if summarizer.enabled {
+        crate::models::resolve(&summarizer.model)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Bare filename: loaded via `Library::from_path`, which dlopen/LoadLibrary
     // resolves through the OS search path — the APK `jniLibs` dir on Android and
     // the daemon's own directory on Windows, where each is bundled.
@@ -217,11 +224,15 @@ pub fn daemon_env(
         "litert-lm-embed.dll"
     };
     // `embedding_model_ready` already required the tokenizer for a `.tflite`.
-    let litert_enabled = !embed_model.is_empty();
-    if !litert_enabled {
+    // On whenever either local model is usable: the engine starts the local
+    // summarizer only with LiteRT on, so tying it to the embedding model alone
+    // sent compaction to the chat's provider whenever EmbeddingGemma was not
+    // downloaded. The embedder checks its own path separately.
+    let litert_enabled = !embed_model.is_empty() || !summarizer_litertlm.is_empty();
+    if embed_model.is_empty() {
         tracing::info!(
             embedding_model = %pathway_embedding_model,
-            "embedding model not found (or a .tflite without its tokenizer.json); LiteRT engine stays off"
+            "embedding model not found (or a .tflite without its tokenizer.json); local embeddings stay off"
         );
     }
 

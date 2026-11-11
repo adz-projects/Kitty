@@ -336,6 +336,11 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
 
     remove_retired_builtins(&client).await;
 
+    // The decision model's key for a hosted endpoint, from the keychain (an
+    // async read, so before the config lock below).
+    let decider_key =
+        crate::config::providers::get_secret_async(crate::commands::DECIDER_KEY_MAIN).await;
+
     let (
         kitty_wasm_enabled,
         brave_search_enabled,
@@ -365,7 +370,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
             memory.memorabilia_active,
             cfg.specialists.timeout_secs,
             cfg.specialists.enabled,
-            decider_web_env(&cfg.decider),
+            decider_web_env(&cfg.decider, decider_key.as_deref()),
         )
     };
 
@@ -661,7 +666,10 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
 /// kitty-web's share of the decision-model settings, as env pairs. Empty when
 /// there is no decision model or both web checks are off, so the row's env is
 /// exactly what it was before the feature existed.
-fn decider_web_env(d: &crate::config::DeciderSettings) -> Vec<(String, String)> {
+fn decider_web_env(
+    d: &crate::config::DeciderSettings,
+    api_key: Option<&str>,
+) -> Vec<(String, String)> {
     let mut features = Vec::new();
     if d.features.page_classify {
         features.push("page_classify");
@@ -674,6 +682,14 @@ fn decider_web_env(d: &crate::config::DeciderSettings) -> Vec<(String, String)> 
         ("KITTY_DECIDER_DIALECT".to_string(), d.dialect.clone()),
         ("KITTY_DECIDER_FEATURES".to_string(), features.join(",")),
     ];
+    // A hosted endpoint needs its model id (sent in the body) and its key;
+    // without them every page check silently answered "no opinion".
+    if let Some(m) = d.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        env.push(("KITTY_DECIDER_MODEL".to_string(), m.to_string()));
+    }
+    if let Some(k) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        env.push(("KITTY_DECIDER_API_KEY".to_string(), k.to_string()));
+    }
     if !d.thresholds.is_empty() {
         env.push((
             "KITTY_DECIDER_THRESHOLDS".to_string(),
@@ -880,14 +896,14 @@ mod tests {
     #[test]
     fn kitty_web_gets_decider_env_only_when_a_web_check_is_on() {
         let mut d = crate::config::DeciderSettings::default();
-        assert!(decider_web_env(&d).is_empty());
+        assert!(decider_web_env(&d, None).is_empty());
         d.url = "http://box:8080".into();
-        let env: HashMap<_, _> = decider_web_env(&d).into_iter().collect();
+        let env: HashMap<_, _> = decider_web_env(&d, None).into_iter().collect();
         assert_eq!(env["KITTY_DECIDER_URL"], "http://box:8080");
         assert_eq!(env["KITTY_DECIDER_FEATURES"], "page_classify");
         assert!(!env.contains_key("KITTY_DECIDER_THRESHOLDS"));
         d.features.page_classify = false;
-        assert!(decider_web_env(&d).is_empty());
+        assert!(decider_web_env(&d, None).is_empty());
     }
 
     /// The daemon's `mcp::builtin::BUILTIN_SERVERS`, mirrored.

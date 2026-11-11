@@ -13,7 +13,9 @@
 //! The daemon sends a keepalive comment every 15s, so a stream that goes
 //! quiet for [`SILENCE_LIMIT`] is treated as dead and reconnected.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use bigtiny2_client::sse::{drain_complete_frames, parse_frame};
@@ -76,29 +78,59 @@ async fn listen_once(app: &AppHandle) -> Result<(), String> {
         };
         buffer.extend_from_slice(&chunk);
         for frame in drain_complete_frames(&mut buffer, &mut scan_from) {
+            // The engine says `: lagged N` when this listener fell behind and
+            // events were dropped. Approvals among them would stay invisible,
+            // so collect whatever is pending again.
+            if frame.trim_start().starts_with(": lagged") {
+                tracing::warn!("app event stream lagged ({}); re-syncing approvals", frame.trim());
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move { recover_pending(&app).await });
+                continue;
+            }
             if let Some(frame) = parse_frame(&frame) {
-                handle(app, frame.event).await;
+                handle(app, frame.event);
             }
         }
     }
 }
 
-async fn handle(app: &AppHandle, event: SSEEvent) {
+fn handle(app: &AppHandle, event: SSEEvent) {
     match event.event_type {
         SSEEventType::HitlPause => {
             let (Some(action_id), Some(session_id)) = (event.action_id, event.session_id) else {
                 return;
             };
-            on_pause(
-                app,
-                action_id,
-                session_id,
-                event.tool_name.unwrap_or_default(),
-                event.tool_args.unwrap_or(Value::Null),
-            )
-            .await;
+            // Each pause is answered on its own task: tools a step runs
+            // concurrently are approved concurrently, and a slow lookup for
+            // one never holds up the stream (which is what lets it lag).
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                on_pause(
+                    &app,
+                    action_id,
+                    session_id,
+                    event.tool_name.unwrap_or_default(),
+                    event.tool_args.unwrap_or(Value::Null),
+                )
+                .await;
+            });
         }
         SSEEventType::ScheduleRun => schedule_run(app, &event),
+        // A chat's derived title, which lands after its turn stream closed.
+        SSEEventType::SessionTitle => {
+            let (Some(session_id), Some(title)) = (event.session_id, event.content) else {
+                return;
+            };
+            app.state::<AppState>()
+                .bigtiny_titled_sessions
+                .lock()
+                .unwrap()
+                .insert(session_id.clone());
+            let _ = app.emit(
+                "chat://session-title",
+                json!({ "session_id": session_id, "title": title }),
+            );
+        }
         SSEEventType::HitlResolved => {
             let Some(action_id) = event.action_id else {
                 return;
@@ -187,8 +219,13 @@ async fn on_pause(
     {
         return;
     }
+    // Pauses are handled concurrently, and a re-sync can deliver one that is
+    // already being handled: only one task may answer it.
+    let Some(_handling) = Handling::claim(&action_id) else {
+        return;
+    };
     let session = session_view(app, &session_id).await;
-    let mut decision = approvals::decide(&tool_args, &session.dirs);
+    let mut decision = approvals::decide(&tool_args, session.dirs.as_deref());
     // A shell command Kitty would allow on its own gets a second opinion from
     // the decision model, when there is one. Escalation only: a flagged
     // command goes to a person; anything else is decided as before.
@@ -291,28 +328,78 @@ fn resolved(app: &AppHandle, action_id: &str, session_id: Option<&str>, timed_ou
     );
 }
 
+/// Action ids some task is answering right now.
+fn handling_set() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Holds an action id in [`handling_set`] for as long as it lives.
+struct Handling(String);
+
+impl Handling {
+    fn claim(action_id: &str) -> Option<Self> {
+        handling_set()
+            .lock()
+            .unwrap()
+            .insert(action_id.to_string())
+            .then(|| Self(action_id.to_string()))
+    }
+}
+
+impl Drop for Handling {
+    fn drop(&mut self) {
+        handling_set().lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Whether a session belongs to a scheduled run. Fixed when the session is
+/// created, so it is looked up once per session and remembered.
+fn scheduled_cache() -> &'static Mutex<HashMap<String, bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// What the approval policy needs to know about a session.
 struct SessionView {
-    /// Everything it may touch: its folders and attached files.
-    dirs: Vec<String>,
+    /// Everything it may touch: its folders and attached files. `None` when
+    /// they could not be read, which makes any path-naming call ask.
+    dirs: Option<Vec<String>>,
     /// A scheduled run's session.
     scheduled: bool,
 }
 
 async fn session_view(app: &AppHandle, session_id: &str) -> SessionView {
-    let dirs = match crate::bigtiny::sessions::allowed_dirs(app, session_id).await {
-        Ok(v) => grant_dirs(&v),
-        Err(e) => {
-            tracing::warn!("could not read {session_id}'s folders for an approval: {e}");
-            Vec::new()
+    // The folders are read fresh every time (a grant can be revoked between
+    // two calls); whether the chat is a scheduled run's never changes.
+    let known = scheduled_cache().lock().unwrap().get(session_id).copied();
+    let scheduled_lookup = async {
+        if let Some(s) = known {
+            return s;
         }
-    };
-    let scheduled = match crate::bigtiny::client::ensure_client(app) {
-        Ok(client) => crate::bigtiny::sessions::metadata(&client, session_id)
+        let Ok(client) = crate::bigtiny::client::ensure_client(app) else {
+            return false;
+        };
+        let s = crate::bigtiny::sessions::metadata(&client, session_id)
             .await
             .get("schedule_id")
-            .is_some_and(|v| !v.is_null()),
-        Err(_) => false,
+            .is_some_and(|v| !v.is_null());
+        scheduled_cache()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), s);
+        s
+    };
+    let (dirs, scheduled) = tokio::join!(
+        crate::bigtiny::sessions::allowed_dirs(app, session_id),
+        scheduled_lookup
+    );
+    let dirs = match dirs {
+        Ok(v) => Some(grant_dirs(&v)),
+        Err(e) => {
+            tracing::warn!("could not read {session_id}'s folders for an approval: {e}");
+            None
+        }
     };
     SessionView { dirs, scheduled }
 }

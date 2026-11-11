@@ -351,6 +351,7 @@ export const ipc = {
           held, nothing old enough — so the UI can stop rendering all of them
           as the same unhelpful line. */
       reason?: string;
+      skip?: string;
     }>('compact_session', { sessionId }),
   setThinkingEffort: (sessionId: string, value: string) =>
     invoke<ThinkingEffort | null>('set_thinking_effort', { sessionId, value }),

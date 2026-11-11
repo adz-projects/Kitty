@@ -100,17 +100,26 @@ pub(crate) fn find_frame_boundary(haystack: &[u8], from: usize) -> Option<usize>
 /// continues cleanly from the next frame.
 pub(crate) fn drain_complete_frames(buffer: &mut Vec<u8>, scan_from: &mut usize) -> Vec<String> {
     let mut frames = Vec::new();
+    // Frames are read in place from a moving start offset, and the consumed
+    // prefix is drained once at the end: draining per frame shifted the whole
+    // remainder down for every frame, quadratic when one network chunk
+    // carries many token frames.
+    let mut start = 0usize;
     // `saturating_sub(1)` guards the one case a pure resume-point would
     // miss: a "\n\n" boundary split exactly across the old/new chunk join,
     // with one "\n" at the very end of the previously-scanned region and
     // the second "\n" at the very start of the new tail.
-    while let Some(pos) = find_frame_boundary(buffer, scan_from.saturating_sub(1)) {
-        let frame_bytes: Vec<u8> = buffer.drain(..pos + 2).collect();
-        *scan_from = 0;
-        match std::str::from_utf8(&frame_bytes[..frame_bytes.len() - 2]) {
+    let mut from = scan_from.saturating_sub(1);
+    while let Some(pos) = find_frame_boundary(buffer, from) {
+        match std::str::from_utf8(&buffer[start..pos]) {
             Ok(frame) => frames.push(frame.to_string()),
             Err(e) => tracing::warn!("dropping a non-UTF-8 SSE frame ({e})"),
         }
+        start = pos + 2;
+        from = start;
+    }
+    if start > 0 {
+        buffer.drain(..start);
     }
     // No further boundary in the buffer yet — resume the next chunk's scan
     // from here instead of position 0.
@@ -156,9 +165,7 @@ impl From<String> for StreamFailure {
 fn send_refusal(status: reqwest::StatusCode, body: &str) -> StreamFailure {
     if status == reqwest::StatusCode::CONFLICT {
         return StreamFailure {
-            message:
-                "This chat is still finishing its previous reply. Wait a moment, then send again."
-                    .to_string(),
+            message: TURN_IN_PROGRESS.to_string(),
             error_type: Some("turn_in_progress"),
         };
     }
@@ -191,21 +198,28 @@ struct TurnOutcome {
 /// equivalent (`commands::models`'s `foreground::Session`); the difference is
 /// scope — this spans a turn, not a multi-GB transfer.
 mod foreground {
-    /// Starts the turn foreground service on construction, stops it on drop, so
-    /// every exit path out of the streaming task (success, error, panic) tears
-    /// it down without anyone having to remember to.
+    #[cfg(target_os = "android")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Turns currently holding the foreground service. The service is one
+    /// instance shared by every turn, so it starts on 0→1 and stops on 1→0:
+    /// the first of two overlapping turns to finish must not stop it under the
+    /// other.
+    #[cfg(target_os = "android")]
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Holds the turn foreground service for its lifetime, so every exit path
+    /// out of the streaming task (success, error, panic) releases it without
+    /// anyone having to remember to.
     pub struct TurnSession;
 
     impl TurnSession {
         pub fn start() -> Self {
             #[cfg(target_os = "android")]
-            {
-                // Asked for at the first turn rather than at startup: a
-                // permission prompt before the user has done anything needing
-                // one is the kind everybody dismisses. Shared with downloads —
-                // it's the generic POST_NOTIFICATIONS request, not
-                // download-specific.
-                crate::android::download_service::request_notification_permission();
+            if ACTIVE.fetch_add(1, Ordering::SeqCst) == 0 {
+                // `turn_service::start` asks for the notification permission
+                // itself, once and off this thread: the turn must not wait on
+                // the permission dialog.
                 crate::android::turn_service::start();
             }
             TurnSession
@@ -215,8 +229,50 @@ mod foreground {
     impl Drop for TurnSession {
         fn drop(&mut self) {
             #[cfg(target_os = "android")]
-            crate::android::turn_service::stop();
+            if ACTIVE.fetch_sub(1, Ordering::SeqCst) == 1 {
+                crate::android::turn_service::stop();
+            }
         }
+    }
+}
+
+/// The message for a send refused because this chat already has a turn.
+const TURN_IN_PROGRESS: &str =
+    "This chat is still finishing its previous reply. Wait a moment, then send again.";
+
+/// Marks a session in flight for as long as it lives. Only the task that owns
+/// the turn holds one, so a refused second send can never clear the flag of
+/// the turn that is still running.
+struct InFlight {
+    app: AppHandle,
+    session_id: String,
+}
+
+impl InFlight {
+    /// `None` when this session already has a turn in flight from Kitty.
+    fn claim(app: &AppHandle, session_id: &str) -> Option<Self> {
+        let state = app.state::<AppState>();
+        let inserted = state
+            .in_flight_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
+        inserted.then(|| Self {
+            app: app.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.app
+            .state::<AppState>()
+            .in_flight_sessions
+            .lock()
+            .unwrap()
+            .remove(&self.session_id);
+        notifications::refresh_tray(&self.app);
     }
 }
 
@@ -231,6 +287,11 @@ pub async fn send_prompt(
     attached_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
     let client = ensure_client(&app)?;
+    // Claimed before anything else, and answered to the calling window only:
+    // a refused second send must neither touch the running turn's flag nor
+    // broadcast an error that would end that turn in every window.
+    let in_flight = InFlight::claim(&app, &session_id).ok_or(TURN_IN_PROGRESS)?;
+    notifications::refresh_tray(&app);
 
     // Register any drag-and-drop / pasted file paths as this session's
     // approval-free read set BEFORE the turn streams, so the model can open an
@@ -292,23 +353,24 @@ pub async fn send_prompt(
         json!({ "message": text, "images": image_blocks })
     };
 
-    app.state::<AppState>()
-        .in_flight_sessions
-        .lock()
-        .unwrap()
-        .insert(session_id.clone());
-    notifications::refresh_tray(&app);
+    // Keep the process foreground for the whole turn on Android; moved into
+    // the task below and dropped at its end. No-op on desktop.
+    let turn_foreground = foreground::TurnSession::start();
+    // Open the stream here, not in the task: a refusal (409: a turn started
+    // elsewhere, e.g. by a schedule) is this caller's error alone.
+    let resp = open_send_stream(&client, &session_id, &body)
+        .await
+        .map_err(|f| f.message)?;
+    // The card this chat is pinned to: its Response timeout bounds the
+    // stream, and its reachability is what the result reports on. Known
+    // this run in almost every case; the engine is asked only on a miss.
+    let card = session_card(&app, &client, &session_id).await;
 
     let app_bg = app.clone();
     tauri::async_runtime::spawn(async move {
-        // Keep the process foreground for the whole turn on Android; dropped at
-        // the end of this task (every match arm below and the cleanup after),
-        // which stops the foreground service. No-op on desktop.
-        let _turn_foreground = foreground::TurnSession::start();
-        // The card this chat is pinned to: its Response timeout bounds the
-        // stream, and its reachability is what the result reports on.
-        let card = session_card(&app_bg, &client, &session_id).await;
-        let outcome = run_stream(&app_bg, &client, &session_id, &body, card.as_ref()).await;
+        let _turn_foreground = turn_foreground;
+        let _in_flight = in_flight;
+        let outcome = consume_stream(&app_bg, &session_id, resp, idle_for(card.as_ref())).await;
         match outcome {
             Ok(TurnOutcome {
                 error: None,
@@ -368,6 +430,11 @@ pub async fn send_prompt(
                     card.as_ref(),
                     Some(error_type.as_deref().unwrap_or("")),
                 );
+                // The engine starts a forced compaction after an overflow;
+                // watch for it so the chat reopens when it lands.
+                if error_type.as_deref() == Some("context_exceeded") {
+                    poll_forced_compaction(app_bg.clone(), session_id.clone());
+                }
             }
             Err(StreamFailure {
                 message,
@@ -386,13 +453,7 @@ pub async fn send_prompt(
                 );
             }
         }
-        app_bg
-            .state::<AppState>()
-            .in_flight_sessions
-            .lock()
-            .unwrap()
-            .remove(&session_id);
-        notifications::refresh_tray(&app_bg);
+        drop(_in_flight);
         // A restart queued behind this turn (§6.4) can now go ahead. No-op
         // unless one is actually outstanding.
         crate::lifecycle::engine_restart::apply_if_pending(&app_bg);
@@ -415,23 +476,46 @@ fn poll_compaction_status(app: AppHandle, session_id: String) {
         // is a nice-to-have, not correctness-critical, and a missed poll
         // is simply caught by the next turn's poll instead.
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        check_compaction(&app, &session_id).await;
+    });
+}
 
-        let Ok(stats) = crate::bigtiny::sessions::get_stats(&app, &session_id).await else {
-            return;
-        };
-        let Some(rowid) = stats
-            .get("compacted_through_rowid")
-            .and_then(|v| v.as_i64())
-        else {
-            return;
-        };
+/// After a `context_exceeded` turn: the engine's forced pass takes as long as
+/// the summarizer does, so look several times. The first look is immediate,
+/// so it records the watermark from before the pass as the baseline.
+fn poll_forced_compaction(app: AppHandle, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        for delay in [0u64, 4, 8, 15, 30, 60, 120] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            if check_compaction(&app, &session_id).await {
+                return;
+            }
+        }
+    });
+}
 
+/// Read the chat's compaction watermark and announce it if it moved since
+/// the last look. The first look at a chat in this run only records a
+/// baseline: a missing entry is "unknown", not 0, or every previously
+/// compacted chat would announce an old compaction once per run. `true` when
+/// a compaction was announced.
+async fn check_compaction(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(stats) = crate::bigtiny::sessions::get_stats(app, session_id).await else {
+        return false;
+    };
+    let Some(rowid) = stats
+        .get("compacted_through_rowid")
+        .and_then(|v| v.as_i64())
+    else {
+        return false;
+    };
+    let previous = {
         let state = app.state::<AppState>();
         let mut watermarks = state.bigtiny_compaction_watermarks.lock().unwrap();
-        let previous = watermarks.get(&session_id).copied().unwrap_or(0);
-        if rowid > previous {
-            watermarks.insert(session_id.clone(), rowid);
-            drop(watermarks);
+        watermarks.insert(session_id.to_string(), rowid)
+    };
+    match previous {
+        Some(previous) if rowid > previous => {
             let _ = app.emit(
                 "chat://compaction",
                 json!({
@@ -440,8 +524,10 @@ fn poll_compaction_status(app: AppHandle, session_id: String) {
                     "memory_slots": stats.get("memory_slots"),
                 }),
             );
+            true
         }
-    });
+        _ => false,
+    }
 }
 
 /// BigTiny derives a session's title in a detached task that runs *after*
@@ -477,6 +563,18 @@ fn poll_session_title(app: AppHandle, session_id: String) {
         // the persisted name anyway.
         for delay in [2u64, 3, 5, 10] {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            // An engine that publishes the title on the app event stream has
+            // already delivered it (`lifecycle::app_events`); this poll only
+            // covers an older engine.
+            if app
+                .state::<AppState>()
+                .bigtiny_titled_sessions
+                .lock()
+                .unwrap()
+                .contains(&session_id)
+            {
+                return;
+            }
 
             let Ok(sessions) = crate::bigtiny::sessions::list(&app).await else {
                 continue;
@@ -517,23 +615,47 @@ async fn session_card(
     client: &BigTinyClient,
     session_id: &str,
 ) -> Option<crate::config::providers::ProviderProfile> {
-    let meta = crate::bigtiny::sessions::metadata(client, session_id).await;
-    let provider = meta.get("provider").and_then(|p| p.as_str())?.to_string();
+    // Which card each chat is on is remembered when a chat is created,
+    // loaded, branched or moved; reading the engine's metadata (which pages
+    // the session list) is only for a chat this run has not seen.
+    let known = {
+        let state = app.state::<AppState>();
+        let c = state
+            .session_cards
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|(card, _)| card.clone());
+        c
+    };
+    let provider = match known {
+        Some(card) => card,
+        None => {
+            let meta = crate::bigtiny::sessions::metadata(client, session_id).await;
+            meta.get("provider").and_then(|p| p.as_str())?.to_string()
+        }
+    };
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap();
     cfg.providers.iter().find(|p| p.id == provider).cloned()
 }
 
-/// Drive one send stream to completion, emitting `chat://*` events as frames
-/// arrive. Transport errors surface as `Err`; agent-level errors (BigTiny's
-/// `error` events) as `Ok` with `outcome.error` set.
-async fn run_stream(
-    app: &AppHandle,
+/// The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.
+fn idle_for(card: Option<&crate::config::providers::ProviderProfile>) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(
+        card.and_then(|c| c.prompt_idle_timeout_secs)
+            .filter(|s| *s > 0)
+            .unwrap_or(300),
+    ))
+}
+
+/// Start a turn: POST `/send` and return the open SSE response, or the
+/// refusal.
+async fn open_send_stream(
     client: &BigTinyClient,
     session_id: &str,
     body: &Value,
-    card: Option<&crate::config::providers::ProviderProfile>,
-) -> Result<TurnOutcome, StreamFailure> {
+) -> Result<reqwest::Response, StreamFailure> {
     let resp = client
         .request_stream(
             reqwest::Method::POST,
@@ -548,13 +670,7 @@ async fn run_stream(
         let text = resp.text().await.unwrap_or_default();
         return Err(send_refusal(status, &text));
     }
-    // The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.
-    let idle = std::time::Duration::from_secs(u64::from(
-        card.and_then(|c| c.prompt_idle_timeout_secs)
-            .filter(|s| *s > 0)
-            .unwrap_or(300),
-    ));
-    consume_stream(app, session_id, resp, idle).await
+    Ok(resp)
 }
 
 /// Read one turn's SSE stream to its end, emitting `chat://*` events as frames
@@ -596,12 +712,13 @@ async fn consume_stream(
     // never cut off; this only fires when the daemon itself stops answering.
     let mut bytes = resp.bytes_stream();
     let mut deltas = DeltaBatcher::default();
+    let mut saw_last = false;
     'outer: loop {
         let chunk = match tokio::time::timeout(idle, bytes.next()).await {
             Ok(Some(item)) => {
                 item.map_err(|e| format!("The connection to the engine broke: {e}"))?
             }
-            Ok(None) => break, // daemon closed the stream cleanly
+            Ok(None) => break, // daemon closed the stream
             Err(_) => {
                 return Err(StreamFailure {
                     message: format!(
@@ -634,6 +751,7 @@ async fn consume_stream(
             );
             if is_last {
                 deltas.flush(app, session_id);
+                saw_last = true;
                 break 'outer;
             }
         }
@@ -647,6 +765,17 @@ async fn consume_stream(
     // The stream can also end via `Ok(None)` (daemon closed cleanly) without an
     // `is_last` frame, so flush once more rather than stranding buffered text.
     deltas.flush(app, session_id);
+    // A stream that ends without its terminal frame did not finish: the
+    // engine went away mid-turn (shutdown, crash). Reporting it as a
+    // completed reply would show "Kitty finished" for a half answer.
+    if !saw_last && !outcome.cancelled && outcome.error.is_none() {
+        return Err(StreamFailure {
+            message: "The engine closed the connection before the reply finished. \
+                      Send it again; if it keeps happening, restart the engine."
+                .to_string(),
+            error_type: Some("stream_closed"),
+        });
+    }
     Ok(outcome)
 }
 
@@ -1070,8 +1199,14 @@ pub async fn fetch_full_tool_result(
     tool_call_id: &str,
 ) -> Result<String, String> {
     let client = ensure_client(app)?;
+    // Asks for that one row (`tool_call_id`); an engine that does not know
+    // the filter ignores it and sends the whole history, which the search
+    // below handles the same way.
     let history = client
-        .get_json_long(&format!("/api/chat/{session_id}/history?limit=10000"))
+        .get_json_long(&format!(
+            "/api/chat/{session_id}/history?limit=10000&tool_call_id={}",
+            urlencoding_component(tool_call_id)
+        ))
         .await?;
     let rows = history
         .get("messages")
@@ -1090,6 +1225,19 @@ pub async fn fetch_full_tool_result(
                 .map(str::to_string)
         })
         .ok_or_else(|| "That tool's output is no longer in this chat's history.".to_string())
+}
+
+/// Percent-encode a query value (ids are normally plain, but nothing
+/// guarantees it).
+fn urlencoding_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Follow a turn already running in another place (a specialist's own chat,

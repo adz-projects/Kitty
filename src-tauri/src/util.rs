@@ -57,6 +57,25 @@ pub fn http_client() -> reqwest::Client {
         .clone()
 }
 
+static ENGINE_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// The client for calls to the engine on loopback. It never uses a proxy: with
+/// `HTTP_PROXY`/`ALL_PROXY` set, or a system proxy without a loopback bypass,
+/// requests to `127.0.0.1` went to the proxy and the engine looked down.
+/// Calls to the internet (Hugging Face, OpenRouter, providers) keep using
+/// [`http_client`], which honours the proxy.
+pub fn engine_http_client() -> reqwest::Client {
+    ENGINE_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("kitty-app")
+                .no_proxy()
+                .build()
+                .expect("reqwest client")
+        })
+        .clone()
+}
+
 /// Build a [`Command`] that does not flash a console window on Windows.
 #[allow(dead_code)]
 pub fn hidden_command(program: &Path) -> Command {

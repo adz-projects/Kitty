@@ -474,7 +474,38 @@ function getOrCreateSession(cwd?: string): Promise<SessionInfo> {
 let recentOwnSessionDeleteAt = 0;
 const OWN_DELETE_RETRY_WINDOW_MS = 3000;
 
-export const useChatStore = create<ChatState>((set, get) => {
+export const useChatStore = create<ChatState>((rawSet, rawGet) => {
+  // Batching for a resumed chat's replay: while `batch` is set, every `set`
+  // applies to it instead of the store, and the result is committed in one
+  // store write. A replay is processed synchronously, so nothing else can
+  // write the store in between.
+  let batch: ChatState | null = null;
+  const set: typeof rawSet = ((partial: unknown, replace?: boolean) => {
+    if (batch) {
+      const p =
+        typeof partial === 'function'
+          ? (partial as (s: ChatState) => Partial<ChatState>)(batch)
+          : (partial as Partial<ChatState>);
+      batch = replace ? (p as ChatState) : { ...batch, ...p };
+      return;
+    }
+    (rawSet as (p: unknown, r?: boolean) => void)(partial, replace);
+  }) as typeof rawSet;
+  const get = (): ChatState => batch ?? rawGet();
+  const runBatched = (fn: () => void) => {
+    batch = rawGet();
+    try {
+      fn();
+    } finally {
+      const result = batch;
+      batch = null;
+      rawSet(result);
+    }
+  };
+  // The live listeners for the events a replay carries, registered by
+  // `bindEvents`, so a resumed chat's transcript is applied by exactly the
+  // code that applies a live turn.
+  const replayHandlers = new Map<string, (payload: never) => void>();
   // Inline a *user-attached* file's content rather than sending a path, so a
   // provider with no filesystem tools can still see it (see
   // `addDroppedPaths`, which decides which handoff a drop gets). Distinct
@@ -1019,6 +1050,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!sid) return;
       try {
         const r = await ipc.compactSession(sid);
+        // The engine starts its own pass after an overflow. If it is still
+        // running, say so (its `chat://compaction` reopens the chat); if it
+        // already folded everything, there is nothing left to do here and the
+        // chat must reopen rather than stay blocked.
+        const reopen =
+          r.compacted || r.skip === 'nothing_to_fold' || r.skip === 'below_threshold';
+        if (r.skip === 'lock_held') {
+          set({
+            compactionNotice:
+              'This chat is being compacted now. It will reopen as soon as that finishes.',
+          });
+          return;
+        }
         set((s) => ({
           // The daemon distinguishes its skip reasons now (summarizer
           // unreachable, lock held, nothing old enough, storage failure);
@@ -1035,9 +1079,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           // silently reopen a session concluded on some other ground, so this
           // is keyed on the reason, not on `sessionConcluded` alone.
           sessionConcluded:
-            r.compacted && s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
+            reopen && s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
           concludedReason:
-            r.compacted && s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
+            reopen && s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
         }));
       } catch (e) {
         set({
@@ -1254,9 +1298,10 @@ export const useChatStore = create<ChatState>((set, get) => {
             // Snapshot of live render state, for adoptSession() to apply after
             // its replay — see that action's own comment for why this is
             // needed (session/load's replay alone can drop an in-progress
-            // turn's partial content).
-            messages: s.messages,
-            artifacts: s.artifacts,
+            // turn's partial content). Only while a turn is running: an idle
+            // chat's replay is complete, and shipping the whole transcript
+            // through IPC twice bought nothing.
+            ...(s.busy ? { messages: s.messages, artifacts: s.artifacts } : {}),
           }
         : null;
       // A rejected window-open/hide pair used to escape as an unhandled
@@ -1506,6 +1551,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       providerId?: string,
       modelId?: string
     ) => {
+      // Set from `load_session`'s answer; read in `finally`.
+      let replayBusy: boolean | undefined;
       // Set the id first so replayed events (which arrive during the call) match.
       // Clear any force-stop abandonment up front — otherwise reloading a
       // previously force-stopped session would drop its replay events.
@@ -1607,6 +1654,17 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         const info = await ipc.loadSession(sessionId, cwd);
         if (epoch !== get().sessionEpoch) return;
+        replayBusy = info.busy;
+        // The transcript, applied by the live handlers but committed to the
+        // store in one write: one render for the whole chat, not one per row.
+        if (info.replay?.length) {
+          runBatched(() => {
+            for (const { event, payload } of info.replay ?? []) {
+              replayHandlers.get(event)?.(payload as never);
+            }
+            flushDeltas();
+          });
+        }
         set((s) => ({
           thinkingEffort: info.thinking_effort,
           isDefaultFolder: info.is_default_folder,
@@ -1620,7 +1678,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           // search hit): the engine's record of it.
           ...(cwd ? {} : { cwd: info.cwd, chatDir: info.cwd }),
         }));
-        await get().refreshProvider(undefined);
+        // The provider list is already in hand: no second fetch.
+        await get().refreshProvider(providers);
       } catch (e) {
         if (epoch === get().sessionEpoch) set({ error: String(e) });
       } finally {
@@ -1642,7 +1701,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           // indicator reflects reality instead of looking stalled. Re-open the
           // last message when it's the in-progress assistant turn so further
           // streamed deltas append to it instead of spawning a duplicate bubble.
-          const stillBusy = await ipc.isSessionBusy(sessionId).catch(() => false);
+          // `load_session` answers this itself; ask separately only when the
+          // load failed before it could.
+          const stillBusy =
+            replayBusy ?? (await ipc.isSessionBusy(sessionId).catch(() => false));
           // Re-check the epoch *after* the await above: a New Chat / session
           // switch could have landed during the `isSessionBusy` round-trip
           // (its UI cost is hidden while replay's placeholder is up), in which
@@ -2051,13 +2113,17 @@ export const useChatStore = create<ChatState>((set, get) => {
           return { messages: closed };
         });
 
-      void onMessageDelta((e) => {
+      const handleMessageDelta = (e: { session_id: string; text: string }) => {
         if (forActive(e.session_id)) bufferDelta('text', e.text);
-      });
-      void onReasoningDelta((e) => {
+      };
+      const handleReasoningDelta = (e: { session_id: string; text: string }) => {
         if (forActive(e.session_id)) bufferDelta('reasoning', e.text);
-      });
-      void onUserMessage((e) => {
+      };
+      replayHandlers.set('chat://message-delta', handleMessageDelta);
+      replayHandlers.set('chat://reasoning-delta', handleReasoningDelta);
+      void onMessageDelta(handleMessageDelta);
+      void onReasoningDelta(handleReasoningDelta);
+      const handleUserMessage: Parameters<typeof onUserMessage>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas(); // keep a replayed user turn after any buffered agent text
         // Strip any client-side prompt preamble before it's stored in
@@ -2087,7 +2153,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             return { messages: msgs };
           });
         }
-      });
+      };
+      replayHandlers.set('chat://user-message', handleUserMessage);
+      void onUserMessage(handleUserMessage);
       // Replay of a "Regenerate": the answer before it was replaced by the
       // one that follows, so collapse it and let the next answer open anew.
       // Something about how this reply is being produced (a failover, the
@@ -2123,7 +2191,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           return { messages: closed };
         });
       });
-      void onSuperseded((e) => {
+      const handleSuperseded: Parameters<typeof onSuperseded>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas();
         set((s) => {
@@ -2133,9 +2201,11 @@ export const useChatStore = create<ChatState>((set, get) => {
           msgs[msgs.length - 1] = { ...last, superseded: true, open: false, streaming: false };
           return { messages: msgs };
         });
-      });
+      };
+      replayHandlers.set('chat://superseded', handleSuperseded);
+      void onSuperseded(handleSuperseded);
 
-      void onToolCall((e) => {
+      const handleToolCall: Parameters<typeof onToolCall>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas(); // tool cards must land after the streamed text before them
 
@@ -2228,7 +2298,9 @@ export const useChatStore = create<ChatState>((set, get) => {
               : s.artifacts;
           return { messages: msgs, artifacts };
         });
-      });
+      };
+      replayHandlers.set('chat://tool-call', handleToolCall);
+      void onToolCall(handleToolCall);
 
       void onSessionTitle((e) => {
         if (forActive(e.session_id)) set({ title: e.title });
@@ -2503,11 +2575,17 @@ export const useChatStore = create<ChatState>((set, get) => {
       void onCompaction((e) => {
         if (!forActive(e.session_id)) return;
         const state = e.memory_slots?.current_state;
-        set({
+        set((s) => ({
           compactionNotice: state
             ? `Context compacted — memory updated: ${state}`
             : 'Older context was compacted into a background summary.',
-        });
+          // The engine's own forced pass (after an overflow) repaired this
+          // chat: reopen it, exactly as a manual Compact would.
+          sessionConcluded:
+            s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
+          concludedReason:
+            s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
+        }));
       });
     },
   };

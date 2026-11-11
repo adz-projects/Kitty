@@ -137,7 +137,7 @@ pub async fn start(
     // without a key, so it is what tells us the daemon is actually serving.
     // Registering against a listener that has bound but not finished coming up
     // would fail for a reason that has nothing to do with the credential.
-    let client = crate::util::http_client();
+    let client = crate::util::engine_http_client();
     let mut healthy = false;
     for _ in 0..60 {
         if crate::lifecycle::bigtiny_proc::probe_health(&client, port).await {

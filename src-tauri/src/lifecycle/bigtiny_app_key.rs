@@ -94,7 +94,7 @@ async fn obtain_key(
 /// Whether the daemon accepts `key`: `Some(false)` only on an explicit
 /// rejection, `None` when the answer was anything else.
 async fn key_is_accepted(base_url: &str, key: &str) -> Option<bool> {
-    let resp = crate::util::http_client()
+    let resp = crate::util::engine_http_client()
         .get(format!("{base_url}/api/apps/me"))
         .header("X-API-Key", key)
         .timeout(std::time::Duration::from_secs(5))

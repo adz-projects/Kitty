@@ -54,6 +54,19 @@ fn normalize_scheme(base_url: &str) -> String {
 /// Called at every attach and after any card is added, edited, duplicated or
 /// deleted.
 pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
+    sync_providers(app, None).await
+}
+
+/// Push one card's current settings to its engine row, leaving every other
+/// row alone. For a change to a single card (a confirmed context length):
+/// re-sending every card rebuilt every provider's HTTP client in the engine,
+/// dropping warm connections and route caches for all of them at the moment
+/// the user was sending.
+pub async fn sync_one_provider(app: &AppHandle, card_id: &str) -> Result<(), String> {
+    sync_providers(app, Some(card_id)).await
+}
+
+async fn sync_providers(app: &AppHandle, only: Option<&str>) -> Result<(), String> {
     let (profiles, default_id, anthropic_thinking, delegate_effort) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -61,6 +74,7 @@ pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
             .providers
             .iter()
             .filter(|p| p.is_usable())
+            .filter(|p| only.map_or(true, |id| p.id == id))
             .cloned()
             .collect::<Vec<_>>();
         let anthropic_thinking = profiles
@@ -105,6 +119,11 @@ pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
         cards.push(body);
     }
     let client = ensure_client(app)?;
+    if only.is_some() {
+        // One row only: no pruning (the other cards are not in `cards`) and
+        // the default is unchanged.
+        return sync_card_rows(&client, &cards).await;
+    }
     sync_cards(&client, &cards, default_id.as_deref()).await?;
     // Once there is an OpenRouter card to judge (#21): the subagent denylist
     // is seeded from what this user actually has, so seeding before the
@@ -204,6 +223,33 @@ pub(crate) async fn sync_cards(
     cards: &[ProviderCard],
     default_id: Option<&str>,
 ) -> Result<(), String> {
+    let (rows, result) = upsert_rows(client, cards).await?;
+    for stale in stale_rows(&rows, cards) {
+        if let Err(e) = client.delete(&format!("/api/providers/{stale}")).await {
+            tracing::warn!("could not remove provider {stale} from the engine: {e}");
+        }
+    }
+
+    if let Some(id) = default_id.filter(|id| cards.iter().any(|c| c.id == *id)) {
+        set_app_default(client, id).await;
+    }
+    result
+}
+
+/// Create or update the rows for `cards` only.
+async fn sync_card_rows(
+    client: &super::client::BigTinyClient,
+    cards: &[ProviderCard],
+) -> Result<(), String> {
+    upsert_rows(client, cards).await?.1
+}
+
+/// Create or update each card's row. Returns the engine's rows as they were
+/// before, and the first error.
+async fn upsert_rows(
+    client: &super::client::BigTinyClient,
+    cards: &[ProviderCard],
+) -> Result<(Vec<Value>, Result<(), String>), String> {
     let existing = client.get_json("/api/providers").await?;
     let rows: Vec<Value> = existing
         .get("providers")
@@ -246,17 +292,7 @@ pub(crate) async fn sync_cards(
             first_error.get_or_insert(e);
         }
     }
-
-    for stale in stale_rows(&rows, cards) {
-        if let Err(e) = client.delete(&format!("/api/providers/{stale}")).await {
-            tracing::warn!("could not remove provider {stale} from the engine: {e}");
-        }
-    }
-
-    if let Some(id) = default_id.filter(|id| cards.iter().any(|c| c.id == *id)) {
-        set_app_default(client, id).await;
-    }
-    first_error.map_or(Ok(()), Err)
+    Ok((rows, first_error.map_or(Ok(()), Err)))
 }
 
 async fn create_row(

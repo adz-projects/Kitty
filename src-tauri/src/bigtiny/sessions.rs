@@ -39,6 +39,8 @@ fn session_info(
         is_default_folder,
         provider_id,
         model_id,
+        replay: Vec::new(),
+        busy: None,
     }
 }
 
@@ -221,9 +223,8 @@ pub async fn list(app: &AppHandle) -> Result<Vec<Value>, String> {
     list_with_limit(app, 200).await
 }
 
-/// [`list`] with an explicit daemon-side `limit`, for callers resolving one
-/// specific session that may be older than the default 200-session window
-/// (`windows::focus_or_open_session`'s cwd lookup retries through this).
+/// [`list`] with an explicit daemon-side `limit` (the engine caps a page at
+/// 500). To find one specific session, use [`session_row`] instead.
 pub async fn list_with_limit(app: &AppHandle, limit: u32) -> Result<Vec<Value>, String> {
     let client = ensure_client(app)?;
     let result = client
@@ -355,10 +356,10 @@ pub async fn set_specialists_disabled(
 
 /// One session's row, as the engine's session list returns it.
 ///
-/// The engine has no `GET /api/chat/{id}` — that path takes only PATCH
-/// (rename) and DELETE — so every read of one session's metadata or name that
-/// asked it got an error, and its callers quietly fell back to their
-/// defaults. The per-chat Specialists switch therefore always read back as
+/// Read through `GET /api/chat/{id}` (one row, delegates included). Engines
+/// older than that route had none — the path took only PATCH (rename) and
+/// DELETE — so every read of one session's metadata or name that asked it got
+/// an error, and its callers quietly fell back to their defaults. The per-chat Specialists switch therefore always read back as
 /// "on", a resumed chat lost its pinned card and model, and the effort
 /// resolver's card fallback never found anything. The list route returns the
 /// same row, `metadata` included, so the session is found there: newest
@@ -373,6 +374,14 @@ pub(crate) async fn session_row(client: &BigTinyClient, session_id: &str) -> Opt
     const MAX_PAGES: usize = 40;
     if session_id.is_empty() {
         return None;
+    }
+    // An engine with the single-session route answers in one small read,
+    // delegates included. A 404 there is a real "no such session"; any other
+    // failure (an older engine without the route) falls back to paging.
+    match client.get_json(&format!("/api/chat/{session_id}")).await {
+        Ok(row) if row.get("id").is_some() => return Some(row),
+        Err(e) if e.contains("404") => return None,
+        _ => {}
     }
     for page in 0..MAX_PAGES {
         let result = client
@@ -517,8 +526,16 @@ pub async fn transcript(app: &AppHandle, session_id: String) -> Result<Vec<Value
 
 pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
-    let rows = fetch_history(&client, &session_id).await?;
-    let meta = metadata(&client, &session_id).await;
+    // History and metadata are independent reads.
+    let (rows, meta) = tokio::join!(
+        fetch_history(&client, &session_id),
+        metadata(&client, &session_id)
+    );
+    let rows = rows?;
+    let mut replay: Vec<Value> = Vec::with_capacity(rows.len() * 2);
+    let mut push = |event: &str, payload: Value| {
+        replay.push(json!({ "event": event, "payload": payload }));
+    };
 
     for row in &rows {
         let role = row.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -529,7 +546,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                 if turn.regenerate {
                     // Not a new question: the answer before it was replaced by
                     // the one after it, exactly as it looked live.
-                    let _ = app.emit("chat://superseded", json!({ "session_id": session_id }));
+                    push("chat://superseded", json!({ "session_id": session_id }));
                     continue;
                 }
                 let mut attachments = turn.attachments;
@@ -540,7 +557,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                         pinned: false,
                     });
                 }
-                let _ = app.emit(
+                push(
                     "chat://user-message",
                     json!({ "session_id": session_id, "text": turn.text, "attachments": attachments }),
                 );
@@ -551,13 +568,13 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                     .and_then(|r| r.as_str())
                     .filter(|r| !r.is_empty())
                 {
-                    let _ = app.emit(
+                    push(
                         "chat://reasoning-delta",
                         json!({ "session_id": session_id, "text": reasoning }),
                     );
                 }
                 if !text.is_empty() {
-                    let _ = app.emit(
+                    push(
                         "chat://message-delta",
                         json!({ "session_id": session_id, "text": text }),
                     );
@@ -565,7 +582,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                 // Replay tool calls the assistant made this turn; their
                 // results arrive as the following role="tool" rows.
                 for tc in parse_tool_calls(row) {
-                    let _ = app.emit(
+                    push(
                         "chat://tool-call",
                         json!({
                             "session_id": session_id,
@@ -580,7 +597,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                     continue;
                 };
                 let failed = crate::bigtiny::stream::tool_result_is_error(&text);
-                let _ = app.emit(
+                push(
                     "chat://tool-call",
                     json!({
                         "session_id": session_id,
@@ -612,13 +629,16 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
     } else {
         cwd
     };
-    Ok(session_info(
-        app,
-        session_id,
-        cwd,
-        text_of("provider"),
-        text_of("model"),
-    ))
+    let busy = app
+        .state::<crate::state::AppState>()
+        .in_flight_sessions
+        .lock()
+        .unwrap()
+        .contains(&session_id);
+    let mut info = session_info(app, session_id, cwd, text_of("provider"), text_of("model"));
+    info.replay = replay;
+    info.busy = Some(busy);
+    Ok(info)
 }
 
 /// How many images a stored user turn carried.

@@ -144,10 +144,11 @@ async fn apply(app: &AppHandle) -> Result<(), String> {
         let cfg = state.config.lock().unwrap();
         desired(&cfg.decider, main_key.as_deref(), backup_key.as_deref())
     };
-    let have = client.get_json("/api/apps/me/decider").await?;
-    let have = have.get("config").cloned().unwrap_or(Value::Null);
+    let reply = client.get_json("/api/apps/me/decider").await?;
+    let have = reply.get("config").cloned().unwrap_or(Value::Null);
+    let defaults = reply.get("default_thresholds");
     match want {
-        Some(want) if !same(&have, &want) => {
+        Some(want) if !same_with_defaults(&have, &want, defaults) => {
             client.put_json("/api/apps/me/decider", &want).await?;
         }
         None if !have.is_null() => {
@@ -161,14 +162,56 @@ async fn apply(app: &AppHandle) -> Result<(), String> {
 /// Whether the engine's stored document already says what we want. The
 /// engine echoes the thresholds back with every default filled in, so those
 /// are compared by the keys we set rather than wholesale.
+#[cfg(test)]
 fn same(have: &Value, want: &Value) -> bool {
-    let keys = ["dialect", "url", "model", "api_key"];
-    if keys.iter().any(|k| have.get(k) != want.get(k)) {
+    same_with_defaults(have, want, None)
+}
+
+/// The engine's fingerprint of a key (`decider::key_fingerprint`): the first
+/// eight bytes of its SHA-256, in hex.
+fn key_fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An endpoint document with its key reduced to what the engine reports:
+/// `api_key_set` and the fingerprint. An older engine that still echoes the
+/// key itself is reduced the same way, so either compares.
+fn endpoint_view(v: Option<&Value>) -> Option<Value> {
+    let mut v = v?.clone();
+    if let Some(o) = v.as_object_mut() {
+        let key = o.remove("api_key").and_then(|k| k.as_str().map(str::to_string));
+        let fp = key
+            .as_deref()
+            .map(key_fingerprint)
+            .or_else(|| o.get("api_key_fingerprint").and_then(Value::as_str).map(str::to_string));
+        o.remove("api_key_fingerprint");
+        o.remove("api_key_set");
+        if let Some(fp) = fp {
+            o.insert("api_key_fingerprint".into(), Value::String(fp));
+        }
+    }
+    Some(v)
+}
+
+/// [`same`], with the engine's default thresholds: a threshold Kitty no
+/// longer sends (the user cleared an override) must be back at its default
+/// in the engine, or the old cutoff stays in force there.
+fn same_with_defaults(have: &Value, want: &Value, defaults: Option<&Value>) -> bool {
+    if ["dialect", "url", "model"].iter().any(|k| have.get(*k) != want.get(*k)) {
         return false;
     }
-    // The fallback model, when present, is echoed back verbatim (the engine
-    // skip-serializes a `None`, so an absent one compares equal to absent).
-    if have.get("secondary") != want.get("secondary") {
+    let key_of = |v: &Value| {
+        endpoint_view(Some(v)).and_then(|e| e.get("api_key_fingerprint").cloned())
+    };
+    if key_of(have) != key_of(want) {
+        return false;
+    }
+    // The fallback model, when present, is echoed back verbatim except for
+    // its key (the engine skip-serializes a `None`, so an absent one compares
+    // equal to absent).
+    if endpoint_view(have.get("secondary")) != endpoint_view(want.get("secondary")) {
         return false;
     }
     // The engine echoes every feature it knows, the ones Kitty does not send
@@ -202,9 +245,25 @@ fn same(have: &Value, want: &Value) -> bool {
     }
     let empty = serde_json::Map::new();
     let want_t = want["thresholds"].as_object().unwrap_or(&empty);
-    want_t
+    if !want_t
         .iter()
         .all(|(k, v)| have["thresholds"].get(k).and_then(Value::as_f64) == v.as_f64())
+    {
+        return false;
+    }
+    // Every threshold Kitty does not send must be at the engine's default.
+    let Some(defaults) = defaults.and_then(Value::as_object) else {
+        return true;
+    };
+    let have_t = have["thresholds"].as_object().unwrap_or(&empty);
+    have_t.iter().all(|(k, v)| {
+        want_t.contains_key(k)
+            || defaults
+                .get(k)
+                .map_or(true, |d| {
+                    (d.as_f64().unwrap_or(f64::NAN) - v.as_f64().unwrap_or(f64::NAN)).abs() < 1e-9
+                })
+    })
 }
 
 /// Tool groups with the engine's defaults filled in, for comparison.
@@ -232,6 +291,37 @@ mod tests {
 
     /// The engine's echo of the catalog, as it serializes `ToolGroup`: every
     /// field present. Kitty must recognise it as what it sent.
+    #[test]
+    fn a_cleared_threshold_must_be_back_at_its_default() {
+        let s = DeciderSettings {
+            url: "http://box:8080".into(),
+            ..DeciderSettings::default()
+        };
+        let want = desired(&s, None, None).unwrap();
+        let mut have = want.clone();
+        have["thresholds"] = json!({"tool_gating_add": 0.9});
+        let defaults = json!({"tool_gating_add": 0.75});
+        assert!(!same_with_defaults(&have, &want, Some(&defaults)));
+        have["thresholds"] = json!({"tool_gating_add": 0.75});
+        assert!(same_with_defaults(&have, &want, Some(&defaults)));
+    }
+
+    #[test]
+    fn the_key_is_compared_by_fingerprint() {
+        let s = DeciderSettings {
+            url: "http://box:8080".into(),
+            ..DeciderSettings::default()
+        };
+        let want = desired(&s, Some("secret"), None).unwrap();
+        let mut have = want.clone();
+        have.as_object_mut().unwrap().remove("api_key");
+        have["api_key_set"] = json!(true);
+        have["api_key_fingerprint"] = json!(key_fingerprint("secret"));
+        assert!(same(&have, &want));
+        have["api_key_fingerprint"] = json!(key_fingerprint("other"));
+        assert!(!same(&have, &want));
+    }
+
     #[test]
     fn the_engines_echo_of_the_catalog_counts_as_the_same() {
         let s = DeciderSettings {

@@ -456,14 +456,17 @@ pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
         Some(cwd) => cwd,
         None => {
             // `sessions::list` is capped at the 200 most recent sessions —
-            // an older chat silently falls off that window and used to
-            // resolve to `cwd: ""`. Ask once more with a much larger window
-            // before settling for the default.
-            crate::bigtiny::sessions::list_with_limit(app, 10_000)
-                .await
-                .ok()
-                .and_then(|rows| find_cwd(rows, session_id))
-                .unwrap_or_default()
+            // an older chat falls off that window and used to resolve to
+            // `cwd: ""`. Read that one session's row instead (the engine caps
+            // a list page at 500, so asking for a longer list did not help).
+            match crate::bigtiny::client::ensure_client(app) {
+                Ok(client) => crate::bigtiny::sessions::session_row(&client, session_id)
+                    .await
+                    .map(|row| crate::bigtiny::sessions::translate_session_row(&row))
+                    .and_then(|row| find_cwd(vec![row], session_id))
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
         }
     };
 

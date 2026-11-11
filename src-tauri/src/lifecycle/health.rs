@@ -28,8 +28,11 @@ pub struct StackStatusPayload {
 /// Recompute status every 5s and emit `stack://status` when it changes.
 pub fn spawn_health_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let client = crate::util::http_client();
+        let client = crate::util::engine_http_client();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        // After the PC sleeps, carry on from now rather than firing every
+        // missed tick back to back.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Debounce: a degraded reading must appear on two *consecutive* ticks
         // before it's actually stored/reported. A single missed/slow probe
         // (OS scheduling jitter, a momentary daemon hiccup) shouldn't flip

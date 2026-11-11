@@ -51,7 +51,7 @@ impl BigTinyClient {
     /// `AppHandle`.
     pub fn new(base: impl Into<String>, secret: Option<String>) -> Self {
         Self {
-            http: crate::util::http_client(),
+            http: crate::util::engine_http_client(),
             base: base.into(),
             secret,
         }

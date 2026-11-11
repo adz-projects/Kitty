@@ -52,14 +52,18 @@ pub async fn send_prompt(
         confirmed.insert(session_id.clone())
     };
     if first_turn {
-        crate::bigtiny::effort::confirm_model_effort(&app, &session_id).await;
-        // Rides the same gate: the daemon's wrap-up valve reads the model's
-        // context window off the provider row, and a row without one leaves it
-        // budgeting against the daemon's 64k default instead of the model's
-        // real window. Same first-turn moment, same write-only-when-changed
-        // rule as the effort confirmation above.
-        crate::bigtiny::context_window::confirm_model_context_length(&app, &session_id).await;
-        crate::bigtiny::vision::confirm_model_vision(&app, &session_id).await;
+        // The context-length confirmation rides the same gate: the daemon's
+        // wrap-up valve reads the model's context window off the provider
+        // row, and a row without one leaves it budgeting against the daemon's
+        // 64k default instead of the model's real window. Same first-turn
+        // moment, same write-only-when-changed rule as the effort
+        // confirmation. The three write different provider fields, so they
+        // run together rather than one after another.
+        tokio::join!(
+            crate::bigtiny::effort::confirm_model_effort(&app, &session_id),
+            crate::bigtiny::context_window::confirm_model_context_length(&app, &session_id),
+            crate::bigtiny::vision::confirm_model_vision(&app, &session_id),
+        );
     }
     crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths).await
 }

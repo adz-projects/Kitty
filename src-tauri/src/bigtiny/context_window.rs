@@ -224,7 +224,7 @@ pub async fn confirm_model_context_length(app: &AppHandle, session_id: &str) {
     };
 
     if needs_push {
-        if let Err(e) = crate::bigtiny::providers::sync_all_providers(app).await {
+        if let Err(e) = crate::bigtiny::providers::sync_one_provider(app, &card_id).await {
             tracing::warn!("failed to push confirmed context length to the daemon: {e}");
         }
     }

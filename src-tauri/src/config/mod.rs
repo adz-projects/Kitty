@@ -1239,10 +1239,22 @@ fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
 /// because `load` treats a corrupt config as a hard error (it never silently
 /// discards user settings), so a torn write would otherwise brick startup.
 pub fn save(config: &Config) -> Result<(), ConfigError> {
+    // One writer at a time: every save shares the temp file, and two saves
+    // racing outside the config lock would interleave their bytes in it.
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = config_path()?;
     let text = serde_json::to_string_pretty(config)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text)?;
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        // Flushed to disk before the rename: otherwise a power loss between
+        // the rename and the data reaching disk can leave an empty file under
+        // the real name.
+        f.sync_all()?;
+    }
     fs::rename(&tmp, &path)?;
     if let Some(notify) = ON_SAVED.get() {
         notify();

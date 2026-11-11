@@ -332,6 +332,16 @@ pub fn refresh_tray(app: &AppHandle) {
             !state.pending_approvals.lock().unwrap().is_empty(),
             !state.in_flight_sessions.lock().unwrap().is_empty(),
         );
+        // Unchanged since the last refresh (the common case: every turn start
+        // and end): nothing to redraw.
+        static LAST: std::sync::Mutex<Option<TrayState>> = std::sync::Mutex::new(None);
+        {
+            let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+            if *last == Some(tray_state) {
+                return;
+            }
+            *last = Some(tray_state);
+        }
         if let Some(tray) = app.tray_by_id("main-tray") {
             let _ = tray.set_tooltip(Some(tray_state.tooltip()));
             if let Some(icon) = tray_icon(app, tray_state) {

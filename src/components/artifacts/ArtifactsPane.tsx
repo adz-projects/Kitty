@@ -12,6 +12,8 @@ import type { FileEntry } from '@/lib/types';
 import { relativeTime } from '@/lib/relativeTime';
 
 const POLL_INTERVAL_MS = 5000;
+/** How often the folder is rescanned while no turn is running. */
+const IDLE_POLL_INTERVAL_MS = 30000;
 
 /** Collapsible right-side pane listing files in the chat folder this session,
     derived from tool-call events plus a disk scan (CLAUDE.md Phase 4, Round-7
@@ -51,14 +53,29 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
   useEffect(() => {
     if (!cwd || view !== 'chat') return;
     void refreshArtifactsFromDisk();
+    let lastScan = Date.now();
+    const scan = () => {
+      lastScan = Date.now();
+      void refreshArtifactsFromDisk();
+      void pruneMissingArtifacts();
+    };
     const id = setInterval(() => {
       // Skip the round-trip while the window is minimized/backgrounded —
       // nothing's watching, and it just spends IPC + disk I/O for no reason.
       if (document.hidden) return;
-      void refreshArtifactsFromDisk();
-      void pruneMissingArtifacts();
+      // Every tick while a turn runs (that is when files appear); otherwise
+      // only every IDLE_POLL_INTERVAL_MS, plus whenever the window regains
+      // focus (a file dropped in from Explorer meanwhile).
+      const busy = useChatStore.getState().busy;
+      if (!busy && Date.now() - lastScan < IDLE_POLL_INTERVAL_MS) return;
+      scan();
     }, POLL_INTERVAL_MS);
-    return () => clearInterval(id);
+    const onFocus = () => scan();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener('focus', onFocus);
+    };
   }, [cwd, view, refreshArtifactsFromDisk, pruneMissingArtifacts]);
 
   const sheet = android && onClose !== undefined;

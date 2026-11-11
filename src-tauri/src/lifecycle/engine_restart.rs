@@ -298,7 +298,7 @@ async fn ask_to_restart(
 /// a different instance.
 #[cfg(not(target_os = "android"))]
 async fn wait_for_exit(port: u16, instance_id: Option<&str>) {
-    let client = crate::util::http_client();
+    let client = crate::util::engine_http_client();
     let url = format!("http://127.0.0.1:{port}/api/health");
     for _ in 0..100 {
         let answer = client
