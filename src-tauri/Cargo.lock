@@ -3769,6 +3769,7 @@ version = "1.0.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bigtiny2-protocol",
  "dirs 5.0.1",
  "ego-tree",
  "htmd",

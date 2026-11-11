@@ -1533,6 +1533,23 @@ task's write; a learn pass commits in one transaction; reads outside a
 transaction use a read-only pool; Pathway's recall candidates are cached
 against a trigger-maintained counter (migration 008).
 
+- `GET /api/apps/me/approval-policy` (GET/PUT/DELETE): an app's rule for
+  calls the engine approves itself (inside the chat's folders, not a
+  sensitive command, not flagged by the shell screen). Kitty sets it at
+  attach with its own sensitive-command pattern, so safe calls no longer
+  pause and wait on a round trip through Kitty.
+- `GET /api/chat/?slim=true` leaves out `memory_slots`.
+
+**Self-hosted latency**: background summarizer calls get a slot of their own
+on a multi-slot server and, on a one-slot server, give the slot up when a chat
+needs it (a forced compaction excepted); one cache in front of the shared
+embedding model serves both memory engines; recall lookups share one budget.
+The local summarizer (Windows) asks LiteRT-LM for a 32,768-token window, refuses
+a prompt that cannot fit before generating (measured: a 14k prompt fails at the
+default window, rather than being silently cut), and compaction sizes chunks to
+that window. The System One wire format is shared by the engine and kitty-web
+(`bigtiny2_protocol::systemone`).
+
 **Compaction** recovers from overflow: a larger summarizer reply budget with
 truncated-JSON recovery, per-chunk commits under a drop-guarded lock, and
 forced passes that survive the next turn. Kitty reopens the chat when the

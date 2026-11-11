@@ -2503,6 +2503,7 @@ version = "1.0.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bigtiny2-protocol",
  "dirs",
  "ego-tree",
  "htmd",
