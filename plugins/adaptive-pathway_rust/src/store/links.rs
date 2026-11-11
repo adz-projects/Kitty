@@ -49,7 +49,7 @@ impl Db {
         .bind(b)
         .bind(relation.as_str())
         .bind(Utc::now().to_rfc3339())
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -68,7 +68,7 @@ impl Db {
         for id in ids.iter().chain(ids.iter()) {
             q = q.bind(id);
         }
-        Ok(q.fetch_all(self.pool())
+        Ok(q.fetch_all(self.read_pool())
             .await?
             .into_iter()
             .filter_map(|(a, b, r)| Some((a, b, Relation::parse(&r)?)))
@@ -92,7 +92,7 @@ impl Db {
         .bind(session_id)
         .bind(message_hash)
         .bind(Utc::now().to_rfc3339())
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -105,7 +105,7 @@ impl Db {
         )
         .bind(assumption_id)
         .bind(session_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?)
     }
 
@@ -119,7 +119,7 @@ impl Db {
              WHERE t.session_id = ? AND t.judged = 0 ORDER BY t.shown_at",
         )
         .bind(session_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -129,7 +129,7 @@ impl Db {
         sqlx::query("UPDATE assumption_tests SET judged = 1 WHERE assumption_id = ? AND session_id = ?")
             .bind(assumption_id)
             .bind(session_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -149,7 +149,7 @@ impl Db {
         for id in ids.iter().chain(ids.iter()) {
             q = q.bind(id);
         }
-        Ok(q.fetch_all(self.pool()).await?)
+        Ok(q.fetch_all(self.read_pool()).await?)
     }
 
     /// Whether an open or resolved contradiction already records this pair
@@ -163,7 +163,7 @@ impl Db {
         .bind(b)
         .bind(b)
         .bind(a)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?;
         Ok(n > 0)
     }
@@ -180,7 +180,7 @@ impl Db {
         .bind(Utc::now())
         .bind(belief_id)
         .bind(belief_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }

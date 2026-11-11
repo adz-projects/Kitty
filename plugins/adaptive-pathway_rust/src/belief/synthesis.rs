@@ -109,8 +109,17 @@ async fn route_observation_inner(
     // `embedding_model` (the current one), so comparing it against a
     // stale-space candidate via cosine would be the same meaningless
     // cross-space comparison `list_recall_candidates` guards against.
+    // A context observation also merges into an identity belief: a fact
+    // promoted to identity must keep receiving its evidence (support,
+    // `last_confirmed_at`), or every repeat grew a duplicate context belief
+    // beside it while the original aged toward re-testing.
     let candidates: Vec<_> = match (layer, session_id.as_deref()) {
         (Layer::Conversation, Some(sid)) => db.list_conversation_beliefs_for_session(sid).await?,
+        (Layer::Context, _) => {
+            let mut all = db.list_beliefs(Some(Layer::Context)).await?;
+            all.extend(db.list_beliefs(Some(Layer::Identity)).await?);
+            all
+        }
         _ => db.list_beliefs(Some(layer)).await?,
     }
     .into_iter()

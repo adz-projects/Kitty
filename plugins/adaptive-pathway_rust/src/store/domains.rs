@@ -39,14 +39,14 @@ impl Db {
         .bind(d.belief_count)
         .bind(d.last_inferred)
         .bind(d.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
 
     pub async fn list_domains(&self) -> Result<Vec<Domain>> {
         let rows = sqlx::query("SELECT * FROM domains")
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await?;
         let mut out = Vec::new();
         for row in rows {

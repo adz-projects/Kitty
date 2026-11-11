@@ -83,7 +83,7 @@ impl Db {
         .bind(&p.created_at)
         .bind(&p.attribution)
         .bind(if p.stance.is_empty() { "states" } else { p.stance.as_str() })
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?
         .rows_affected())
     }
@@ -93,7 +93,7 @@ impl Db {
             "SELECT * FROM propositions WHERE node_id = ?",
         )
         .bind(node_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?)
     }
 
@@ -105,7 +105,7 @@ impl Db {
             "SELECT * FROM propositions WHERE status = ? ORDER BY rowid",
         )
         .bind(status)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -126,7 +126,7 @@ impl Db {
         .bind(chunk_id)
         .bind(node_id)
         .bind(created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -135,13 +135,44 @@ impl Db {
         sqlx::query("DELETE FROM chunk_propositions WHERE chunk_id = ? AND node_id = ?")
             .bind(chunk_id)
             .bind(node_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
 
     /// The chunk's ACTIVE supporting chunks (input to §8 confidence and to
     /// retrieval rendering).
+    /// Several propositions in one read (batched under SQLite's parameter
+    /// limit). Missing ids are simply absent.
+    pub async fn get_propositions(&self, node_ids: &[String]) -> Result<Vec<Proposition>> {
+        let mut out = Vec::with_capacity(node_ids.len());
+        for ids in node_ids.chunks(500) {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!("SELECT * FROM propositions WHERE node_id IN ({placeholders})");
+            let mut q = sqlx::query_as::<_, Proposition>(&sql);
+            for id in ids {
+                q = q.bind(id);
+            }
+            out.extend(q.fetch_all(self.read_pool()).await?);
+        }
+        Ok(out)
+    }
+
+    /// `(chunk_id, cluster_citation)` of a proposition's active supporting
+    /// chunks, in [`Self::list_active_supporting_chunks`]'s order, without
+    /// the chunk text (recall needs only these two).
+    pub async fn list_active_support_refs(&self, node_id: &str) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT c.chunk_id, c.cluster_citation FROM chunks AS c
+             JOIN chunk_propositions AS cp ON cp.chunk_id = c.chunk_id
+             WHERE cp.node_id = ? AND c.status = 'active'
+             ORDER BY c.rowid",
+        )
+        .bind(node_id)
+        .fetch_all(self.read_pool())
+        .await?)
+    }
+
     pub async fn list_active_supporting_chunks(&self, node_id: &str) -> Result<Vec<Chunk>> {
         Ok(sqlx::query_as::<_, Chunk>(
             "SELECT c.* FROM chunks AS c
@@ -150,7 +181,7 @@ impl Db {
              ORDER BY c.rowid",
         )
         .bind(node_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -170,7 +201,7 @@ impl Db {
              ORDER BY p.rowid",
         )
         .bind(chunk_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -184,7 +215,7 @@ impl Db {
              WHERE cp.node_id = ? AND c.status = 'active'",
         )
         .bind(node_id)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?)
     }
 
@@ -200,7 +231,7 @@ impl Db {
         .bind(confidence)
         .bind(is_disputed)
         .bind(node_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -210,7 +241,7 @@ impl Db {
     pub async fn delete_proposition(&self, node_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM propositions WHERE node_id = ?")
             .bind(node_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -225,7 +256,7 @@ impl Db {
             "SELECT node_id FROM chunk_propositions WHERE chunk_id = ? ORDER BY node_id",
         )
         .bind(chunk_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -243,7 +274,7 @@ impl Db {
         )
         .bind(archived_at)
         .bind(node_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }

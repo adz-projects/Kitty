@@ -50,7 +50,7 @@ impl Db {
         .bind(&o.contradicts)
         .bind(o.created_at)
         .bind(&o.batch_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -88,7 +88,7 @@ impl Db {
                 q = q.bind(id);
             }
         }
-        let rows = q.bind(COOCCURRENCE_PAIR_LIMIT).fetch_all(self.pool()).await?;
+        let rows = q.bind(COOCCURRENCE_PAIR_LIMIT).fetch_all(self.read_pool()).await?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -102,7 +102,7 @@ impl Db {
     pub async fn list_for_belief(&self, belief_id: &str) -> Result<Vec<Observation>> {
         let rows = sqlx::query("SELECT * FROM observations WHERE belief_id = ?")
             .bind(belief_id)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await?;
         Ok(map_observations(rows))
     }
@@ -110,7 +110,7 @@ impl Db {
     pub async fn list_for_session(&self, session_id: &str) -> Result<Vec<Observation>> {
         let rows = sqlx::query("SELECT * FROM observations WHERE session_id = ?")
             .bind(session_id)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await?;
         Ok(map_observations(rows))
     }
@@ -118,7 +118,7 @@ impl Db {
     pub async fn delete_for_belief(&self, belief_id: &str) -> Result<u64> {
         let res = sqlx::query("DELETE FROM observations WHERE belief_id = ?")
             .bind(belief_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(res.rows_affected())
     }
@@ -133,7 +133,7 @@ impl Db {
         )
         .bind(belief_id)
         .bind(session_id)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?;
         Ok(n > 0)
     }

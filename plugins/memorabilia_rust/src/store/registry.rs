@@ -49,7 +49,7 @@ impl Db {
         .bind(reliability)
         .bind(at)
         .bind(at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -59,7 +59,7 @@ impl Db {
             "SELECT * FROM source_registry WHERE source_entity = ?",
         )
         .bind(source_entity)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?)
     }
 
@@ -85,14 +85,14 @@ impl Db {
         .bind(at)
         .bind(at)
         .bind(source_entity)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
 
     pub async fn list_sources(&self) -> Result<Vec<Source>> {
         Ok(sqlx::query_as::<_, Source>("SELECT * FROM source_registry ORDER BY rowid")
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await?)
     }
 }

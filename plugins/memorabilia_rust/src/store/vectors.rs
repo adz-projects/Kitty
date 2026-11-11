@@ -27,11 +27,55 @@ use async_trait::async_trait;
 
 pub struct SqliteVectorIndex {
     pool: SqlitePool,
+    /// The owning `Db`'s transaction lock, so a write here outside a
+    /// transaction cannot land inside another task's (see `Db::write`).
+    /// `None` for an index built straight from a pool (tests).
+    txn_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    /// The owning `Db`'s read-only pool, for searches outside a transaction.
+    reader: Option<SqlitePool>,
 }
 
 impl SqliteVectorIndex {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            txn_lock: None,
+            reader: None,
+        }
+    }
+
+    /// The index over `db`'s connection, sharing its write lock.
+    pub fn for_db(db: &super::Db) -> Self {
+        Self {
+            pool: db.pool().clone(),
+            txn_lock: Some(db.txn_lock.clone()),
+            reader: Some(db.reader.clone()),
+        }
+    }
+
+    /// Whether this task is inside the owning `Db`'s transaction.
+    fn in_txn(&self) -> bool {
+        self.txn_lock.as_ref().is_some_and(|lock| {
+            let id = std::sync::Arc::as_ptr(lock) as usize;
+            super::IN_TXN.try_with(|ids| ids.contains(&id)).unwrap_or(false)
+        })
+    }
+
+    /// The read-only pool outside a transaction, else the write connection.
+    fn reads(&self) -> &SqlitePool {
+        match &self.reader {
+            Some(r) if !self.in_txn() => r,
+            _ => &self.pool,
+        }
+    }
+
+    /// Hold the write lock for one write, unless this task is inside the
+    /// owning `Db`'s transaction already.
+    async fn write_lock(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.in_txn() {
+            return None;
+        }
+        Some(self.txn_lock.as_ref()?.clone().lock_owned().await)
     }
 }
 
@@ -53,6 +97,8 @@ impl VectorIndex for SqliteVectorIndex {
         // canonical delete-then-reinsert pair — both statements execute on
         // the single-connection pool and are atomic under the caller's
         // `run_in_transaction`.
+        // One lock over the three statements: they are one replacement.
+        let _write = self.write_lock().await;
         sqlx::query("DELETE FROM chunks_vec WHERE chunk_id = ?")
             .bind(chunk_id)
             .execute(&self.pool)
@@ -74,6 +120,7 @@ impl VectorIndex for SqliteVectorIndex {
     }
 
     async fn remove(&self, chunk_id: &str) -> std::result::Result<(), String> {
+        let _write = self.write_lock().await;
         sqlx::query("DELETE FROM chunks_vec WHERE chunk_id = ?")
             .bind(chunk_id)
             .execute(&self.pool)
@@ -103,7 +150,7 @@ impl VectorIndex for SqliteVectorIndex {
         .bind(encode_embedding(query))
         .bind(model)
         .bind(k as i64)
-        .fetch_all(&self.pool)
+        .fetch_all(self.reads())
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows
@@ -121,6 +168,41 @@ impl VectorIndex for SqliteVectorIndex {
             .collect::<std::result::Result<Vec<_>, String>>()?)
     }
 
+    async fn search_with_vectors(
+        &self,
+        query: &[f32],
+        model: &str,
+        k: usize,
+    ) -> std::result::Result<Vec<(String, f32, Option<Vec<f32>>)>, String> {
+        let rows = sqlx::query(
+            "SELECT chunk_id, dist, embedding FROM (
+                SELECT cv.chunk_id AS chunk_id,
+                       vec_distance_cosine(cv.embedding, ?) AS dist,
+                       cv.embedding AS embedding
+                FROM chunks_vec AS cv
+                JOIN chunks AS c ON c.chunk_id = cv.chunk_id
+                WHERE c.status = 'active' AND c.embedding_model = ?
+             )
+             WHERE dist IS NOT NULL
+             ORDER BY dist ASC, chunk_id ASC
+             LIMIT ?",
+        )
+        .bind(encode_embedding(query))
+        .bind(model)
+        .bind(k as i64)
+        .fetch_all(self.reads())
+        .await
+        .map_err(|e| e.to_string())?;
+        rows.into_iter()
+            .map(|r| {
+                let id: String = r.try_get("chunk_id").map_err(|e| e.to_string())?;
+                let dist: f64 = r.try_get("dist").map_err(|e| e.to_string())?;
+                let bytes: Vec<u8> = r.try_get("embedding").map_err(|e| e.to_string())?;
+                Ok((id, (1.0 - dist) as f32, Some(decode_embedding(&bytes))))
+            })
+            .collect()
+    }
+
     async fn list_by_model(&self, model: &str) -> std::result::Result<Vec<String>, String> {
         let rows = sqlx::query(
             "SELECT cv.chunk_id AS chunk_id
@@ -130,7 +212,7 @@ impl VectorIndex for SqliteVectorIndex {
              ORDER BY cv.chunk_id",
         )
         .bind(model)
-        .fetch_all(&self.pool)
+        .fetch_all(self.reads())
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows

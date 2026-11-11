@@ -81,7 +81,7 @@ impl Db {
         .bind(c.grounding_count)
         .bind(&c.archived_at)
         .bind(&c.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -89,7 +89,7 @@ impl Db {
     pub async fn get_chunk(&self, chunk_id: &str) -> Result<Option<Chunk>> {
         Ok(sqlx::query_as::<_, Chunk>("SELECT * FROM chunks WHERE chunk_id = ?")
             .bind(chunk_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?)
     }
 
@@ -101,14 +101,14 @@ impl Db {
             "SELECT * FROM chunks WHERE content_hash = ?",
         )
         .bind(content_hash)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?)
     }
 
     pub async fn list_chunks_by_status(&self, status: &str) -> Result<Vec<Chunk>> {
         Ok(sqlx::query_as::<_, Chunk>("SELECT * FROM chunks WHERE status = ? ORDER BY rowid")
             .bind(status)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await?)
     }
 
@@ -119,7 +119,7 @@ impl Db {
     /// plan §3.5).
     pub async fn count_active_chunks(&self) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE status = 'active'")
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?)
     }
 
@@ -129,7 +129,7 @@ impl Db {
     pub async fn chunk_rowid(&self, chunk_id: &str) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar("SELECT rowid FROM chunks WHERE chunk_id = ?")
             .bind(chunk_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?)
     }
 
@@ -138,7 +138,7 @@ impl Db {
             "SELECT * FROM chunks WHERE extraction_status = 'pending' ORDER BY rowid LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -150,7 +150,7 @@ impl Db {
              ORDER BY rowid LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -164,7 +164,7 @@ impl Db {
         )
         .bind(anchor_at)
         .bind(chunk_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -174,7 +174,7 @@ impl Db {
             "UPDATE chunks SET extraction_status = 'done' WHERE chunk_id = ?",
         )
         .bind(chunk_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -189,7 +189,7 @@ impl Db {
         )
         .bind(extraction_error_at)
         .bind(chunk_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -224,7 +224,7 @@ impl Db {
         .bind(urgency_expires_at)
         .bind(anchor_at)
         .bind(chunk_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -252,7 +252,7 @@ impl Db {
         )
         .bind(ready_before)
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -264,7 +264,7 @@ impl Db {
     pub async fn delete_chunk(&self, chunk_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM chunks WHERE chunk_id = ?")
             .bind(chunk_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -281,7 +281,7 @@ impl Db {
         sqlx::query("UPDATE chunks SET embedding_model = ? WHERE chunk_id = ?")
             .bind(embedding_model)
             .bind(chunk_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -294,7 +294,7 @@ impl Db {
         sqlx::query("UPDATE chunks SET status = 'archived', archived_at = ? WHERE chunk_id = ?")
             .bind(archived_at)
             .bind(chunk_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -308,7 +308,7 @@ impl Db {
         sqlx::query("UPDATE chunks SET decay_class = ? WHERE chunk_id = ? AND decay_class != 'deadline'")
             .bind(decay_class)
             .bind(chunk_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -335,7 +335,7 @@ impl Db {
         .bind(reinforcement)
         .bind(anchor_at.map(|s| s.to_string()))
         .bind(chunk_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }

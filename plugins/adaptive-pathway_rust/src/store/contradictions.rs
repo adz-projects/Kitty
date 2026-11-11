@@ -39,14 +39,14 @@ impl Db {
         .bind(&c.reason)
         .bind(c.created_at)
         .bind(c.resolved_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
 
     pub async fn list_open(&self) -> Result<Vec<Contradiction>> {
         let rows = sqlx::query("SELECT * FROM contradictions WHERE status = 'open'")
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await?;
         let mut out = Vec::new();
         for row in rows {
@@ -80,7 +80,7 @@ impl Db {
         .bind(prefer_b)
         .bind(Utc::now())
         .bind(id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }

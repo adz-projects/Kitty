@@ -144,12 +144,9 @@ pub async fn idle_session_ids(
     idle_minutes: i64,
     active_minutes: i64,
 ) -> Result<Vec<String>> {
-    let app_clause = if app_id.is_some() { "app_id = ? AND " } else { "" };
     let sql = format!(
-        "SELECT id FROM sessions WHERE {app_clause}( \
-         (status = 'idle' AND updated_at < datetime('now', printf('-%d minutes', ?))) OR \
-         (status = 'active' AND updated_at < datetime('now', printf('-%d minutes', ?)))) \
-         ORDER BY updated_at DESC"
+        "SELECT s.id FROM sessions s WHERE {} ORDER BY s.updated_at DESC",
+        idle_filter(host_pool, app_id).await
     );
     let mut query = sqlx::query_as::<_, (String,)>(&sql);
     if let Some(app_id) = app_id {
@@ -162,6 +159,66 @@ pub async fn idle_session_ids(
         .await
         .map_err(|e| PathwayError::Host(format!("bigtiny.db sessions read: {e}")))?;
     Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+/// The `WHERE` body shared by the idle-session queries: the app (when the
+/// host records one), top-level sessions only (when the host records
+/// delegates), idle or stale-active. Binds, in order: app id (if any), idle
+/// minutes, active minutes.
+async fn idle_filter(host_pool: &SqlitePool, app_id: Option<&str>) -> String {
+    let app_clause = if app_id.is_some() { "s.app_id = ? AND " } else { "" };
+    let child_clause = if has_column(host_pool, "sessions", "parent_session_id").await {
+        "s.parent_session_id IS NULL AND "
+    } else {
+        ""
+    };
+    format!(
+        "{app_clause}{child_clause}( \
+         (s.status = 'idle' AND s.updated_at < datetime('now', printf('-%d minutes', ?))) OR \
+         (s.status = 'active' AND s.updated_at < datetime('now', printf('-%d minutes', ?))))"
+    )
+}
+
+/// [`idle_session_ids`] with each session's newest message rowid, in one
+/// query: the sweep needs both for every idle session, and asking per session
+/// cost several round trips per chat per tick, forever.
+///
+/// Delegate (child) sessions are left out where the host records them: their
+/// "user" messages were written by the parent model, not the user, so
+/// learning "about the user" from them is wrong (the turn-end hook already
+/// skips them).
+pub async fn idle_sessions_with_max_rowid(
+    host_pool: &SqlitePool,
+    app_id: Option<&str>,
+    idle_minutes: i64,
+    active_minutes: i64,
+) -> Result<Vec<(String, i64)>> {
+    let sql = format!(
+        "SELECT s.id, COALESCE((SELECT MAX(m.rowid) FROM messages m WHERE m.session_id = s.id), 0) \
+         FROM sessions s WHERE {} ORDER BY s.updated_at DESC",
+        idle_filter(host_pool, app_id).await
+    );
+    let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+    if let Some(app_id) = app_id {
+        query = query.bind(app_id);
+    }
+    query
+        .bind(idle_minutes)
+        .bind(active_minutes)
+        .fetch_all(host_pool)
+        .await
+        .map_err(|e| PathwayError::Host(format!("bigtiny.db sessions read: {e}")))
+}
+
+/// Whether `table` has `column` in the host db (hosts and test fixtures differ).
+async fn has_column(pool: &SqlitePool, table: &str, column: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false)
 }
 
 /// The rowid of the newest message in a session from the host db (or 0).

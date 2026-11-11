@@ -63,6 +63,11 @@ struct SeedResult {
     activations: HashMap<String, f64>,
     relevance: HashMap<String, f64>,
     effective_cut: Option<f64>,
+    /// Whether a deeper search could add seeds: the search came back full
+    /// (`k` hits, so the pool holds more) and its weakest hit still cleared
+    /// the floor. When the shortfall came from the floor, every deeper hit
+    /// (lower similarity) fails it too.
+    could_widen: bool,
 }
 
 /// The self-tuning seed filter. Given `(chunk_id, raw_cos, centered_cos?)`:
@@ -273,11 +278,14 @@ impl Engine {
         }
         // The injection path (unlike read-only search) logs its cut for the
         // self-tuning floor (`cut_log`).
-        let items = self.ranked_items_from(qvec, tag, true).await?;
+        let cap = self.config.injection_token_cap;
+        // An item line costs well over `INDEX_ITEM_MIN_TOKENS`, so no more
+        // than this many can ever fit in the block.
+        let max_items = (cap / INDEX_ITEM_MIN_TOKENS).max(1);
+        let items = self.ranked_items_from(qvec, tag, true, max_items).await?;
         if items.is_empty() {
             return Ok(None);
         }
-        let cap = self.config.injection_token_cap;
         let (block, grounded, shown) = render_index_block(&items, cap);
         if grounded.is_empty() {
             return Ok(None);
@@ -374,7 +382,7 @@ impl Engine {
         offset: usize,
         limit: usize,
     ) -> Vec<IndexEntry> {
-        let items = match self.ranked_items(query).await {
+        let items = match self.ranked_items(query, offset.saturating_add(limit)).await {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!("search_index: soft-failed ({e})");
@@ -498,7 +506,7 @@ impl Engine {
     /// Read-only. `None` when memory holds no such material -- the model
     /// then offers the other side from its own knowledge.
     pub async fn counterpoint(&self, stance: &str) -> Option<CounterView> {
-        let items = self.ranked_items(stance).await.ok()?;
+        let items = self.ranked_items(stance, 5).await.ok()?;
         for item in items.iter().take(5) {
             let Some((other_id, other_claim)) = item.disputed_by.clone() else {
                 continue;
@@ -518,8 +526,8 @@ impl Engine {
 
     /// The two-pass retrieval core, shared by recall and search. Read-only
     /// variant (does not update the EWMA); see [`Self::ranked_items_persist`].
-    pub(crate) async fn ranked_items(&self, query: &str) -> Result<Vec<RankedItem>> {
-        self.ranked_items_persist(query, false).await
+    pub(crate) async fn ranked_items(&self, query: &str, max_items: usize) -> Result<Vec<RankedItem>> {
+        self.ranked_items_persist(query, false, max_items).await
     }
 
     /// The two-pass retrieval core. Ranked by **centered relevance** descending
@@ -534,17 +542,21 @@ impl Engine {
         &self,
         query: &str,
         persist_cut: bool,
+        max_items: usize,
     ) -> Result<Vec<RankedItem>> {
         let (qvec, tag) = self.embedder.embed(query).await.map_err(crate::error::Error::Embed)?;
-        self.ranked_items_from(qvec, tag, persist_cut).await
+        self.ranked_items_from(qvec, tag, persist_cut, max_items).await
     }
 
     /// [`Self::ranked_items_persist`] from an already-embedded query.
+    ///
+    /// At most `max_items` items: the first `max_items` of the full ranking.
     pub(crate) async fn ranked_items_from(
         &self,
         qvec: Vec<f32>,
         tag: String,
         persist_cut: bool,
+        max_items: usize,
     ) -> Result<Vec<RankedItem>> {
         // Pass 1: seed propositions from a vector search over chunks.
 
@@ -569,9 +581,12 @@ impl Engine {
         let mut seeds = self
             .seed_from_chunks(&qvec, &tag, self.config.retrieval_seed_chunks, mean_ref, floor)
             .await?;
-        if seeds.activations.len() < self.config.retrieval_min_seeds {
+        if seeds.activations.len() < self.config.retrieval_min_seeds && seeds.could_widen {
             // Widen Pass 1 over the whole active pool once (plan §10.1) — the
-            // brute-force index already pays a full scan per search.
+            // brute-force index already pays a full scan per search. Only when
+            // the first pass was cut short by `k` rather than by the floor:
+            // an off-topic query (the common case) used to rescore every
+            // chunk and fetch every vector to reach the same empty result.
             let wider = (self.db.count_active_chunks().await?).max(1) as usize;
             if wider > self.config.retrieval_seed_chunks {
                 seeds = self.seed_from_chunks(&qvec, &tag, wider, mean_ref, floor).await?;
@@ -601,19 +616,79 @@ impl Engine {
         // Pass 2: bounded spreading activation over proposition edges.
         let activations = self.spread_activation(seeds.activations).await?;
 
-        // Rank: fetch each activated proposition, compute Priority.
-        let mut items: Vec<RankedItem> = Vec::new();
+        // Rank in two steps. First the cheap part for every activated
+        // proposition (one batched read, then Priority and relevance), and
+        // sort on exactly the keys the result is ordered by. Then hydrate
+        // (supersession, disputes, analogy, support) in that order, only
+        // until `max_items` survive: everything after is cut by the caller
+        // anyway. Hydrating every activated item first cost five to eight
+        // queries each before nearly all were thrown away.
+        let ids: Vec<String> = activations.keys().cloned().collect();
+        let props: HashMap<String, crate::store::propositions::Proposition> = self
+            .db
+            .get_propositions(&ids)
+            .await?
+            .into_iter()
+            .map(|p| (p.node_id.clone(), p))
+            .collect();
+        let mut candidates: Vec<(crate::store::propositions::Proposition, f64, Option<f64>)> =
+            Vec::new();
         for (node_id, activation) in activations {
-            let Some(prop) = self.db.get_proposition(&node_id).await? else {
+            let Some(prop) = props.get(&node_id) else {
                 continue;
             };
             if prop.status != "active" {
+                continue;
+            }
+            let boost = core::metaboost(&prop.urgency, &prop.importance, &self.config);
+            let priority = core::priority(activation, boost, self.config.metaboost_cap);
+            candidates.push((prop.clone(), priority, relevance.get(&node_id).copied()));
+        }
+        // Primary: centered relevance (a directly-seeded on-topic item leads;
+        // spread-only / hash-space items — `relevance = None` — fall to the
+        // back, ordered among themselves by Priority then id). This is what
+        // makes MetaBoost a tiebreak rather than a lever that lifts off-topic
+        // items (fix: relevance-primary ranking).
+        candidates.sort_by(|(pa, prio_a, rel_a), (pb, prio_b, rel_b)| {
+            rel_key(*rel_b)
+                .partial_cmp(&rel_key(*rel_a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| prio_b.partial_cmp(prio_a).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| pa.node_id.cmp(&pb.node_id))
+        });
+
+        let mut items: Vec<RankedItem> = Vec::new();
+        let mut analogies = 0usize;
+        for (prop, priority, rel) in candidates {
+            let node_id = prop.node_id.clone();
+            // Past the cut, only analogies are still wanted (the block sets
+            // room aside for up to `ANALOGY_SLOTS` of them, wherever they
+            // rank), and only spread-reached items can be one.
+            let past_cut = items.len() >= max_items;
+            if past_cut && (analogies >= ANALOGY_SLOTS || seeded.contains(&node_id)) {
+                if analogies >= ANALOGY_SLOTS {
+                    break;
+                }
                 continue;
             }
             // A superseded claim was true but no longer is (4.4): it stays
             // readable through `render_item`, never recalled as current.
             if self.db.superseded_by(&node_id).await?.is_some() {
                 continue;
+            }
+            let supporters = self.db.list_active_support_refs(&node_id).await?;
+            // A proposition with no active support has left the graph (plan
+            // §5.3); never surface it.
+            if supporters.is_empty() {
+                continue;
+            }
+            let mut citations: Vec<String> = Vec::new();
+            let mut supporting_chunk_ids: Vec<String> = Vec::new();
+            for (chunk_id, citation) in supporters {
+                if !citations.contains(&citation) {
+                    citations.push(citation);
+                }
+                supporting_chunk_ids.push(chunk_id);
             }
             let disputed_by = self.dispute_partner(&node_id).await?;
             // Reached only by spreading: through an analogy edge from a
@@ -630,21 +705,11 @@ impl Engine {
                 }
                 why
             };
-            let boost = core::metaboost(&prop.urgency, &prop.importance, &self.config);
-            let priority = core::priority(activation, boost, self.config.metaboost_cap);
-            let supporters = self.db.list_active_supporting_chunks(&node_id).await?;
-            let mut citations: Vec<String> = Vec::new();
-            let mut supporting_chunk_ids: Vec<String> = Vec::new();
-            for ch in &supporters {
-                if !citations.contains(&ch.cluster_citation) {
-                    citations.push(ch.cluster_citation.clone());
-                }
-                supporting_chunk_ids.push(ch.chunk_id.clone());
-            }
-            // A proposition with no active support has left the graph (plan
-            // §5.3); never surface it.
-            if supporting_chunk_ids.is_empty() {
+            if past_cut && analogy.is_none() {
                 continue;
+            }
+            if analogy.is_some() {
+                analogies += 1;
             }
             let claim = prop.display_claim();
             items.push(RankedItem {
@@ -655,29 +720,13 @@ impl Engine {
                 urgency: prop.urgency,
                 is_disputed: prop.is_disputed,
                 priority,
-                relevance: relevance.get(&node_id).copied(),
+                relevance: rel,
                 citations,
                 supporting_chunk_ids,
                 disputed_by,
                 analogy,
             });
         }
-        // Primary: centered relevance (a directly-seeded on-topic item leads;
-        // spread-only / hash-space items — `relevance = None` — fall to the
-        // back, ordered among themselves by Priority then id). This is what
-        // makes MetaBoost a tiebreak rather than a lever that lifts off-topic
-        // items (fix: relevance-primary ranking).
-        items.sort_by(|a, b| {
-            rel_key(b.relevance)
-                .partial_cmp(&rel_key(a.relevance))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    b.priority
-                        .partial_cmp(&a.priority)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.item_id.cmp(&b.item_id))
-        });
         Ok(items)
     }
 
@@ -725,18 +774,38 @@ impl Engine {
         mean: Option<&[f32]>,
         floor: f64,
     ) -> Result<SeedResult> {
-        let hits = self
+        // Each hit comes back with its vector, so the centered re-score below
+        // does not read the same vectors a second time.
+        let hits_with_vectors = self
             .vectors
-            .search(qvec, tag, k)
+            .search_with_vectors(qvec, tag, k)
             .await
             .map_err(crate::error::Error::Internal)?;
+        let mut hit_vectors: HashMap<String, Vec<f32>> = HashMap::new();
+        let hits: Vec<(String, f32)> = hits_with_vectors
+            .into_iter()
+            .map(|(id, cos, v)| {
+                if let Some(v) = v {
+                    hit_vectors.insert(id.clone(), v);
+                }
+                (id, cos)
+            })
+            .collect();
 
         // (chunk_id, raw cosine, centered cosine?) — centered only when we can
         // fetch the chunk's vector in a matching space.
         let scored: Vec<(String, f64, Option<f64>)> = match mean {
             Some(mu) if mu.len() == qvec.len() => {
-                let ids: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
-                let vecs = self.db.fetch_vectors(&ids).await?;
+                // Only vectors the search could not return are fetched.
+                let missing: Vec<String> = hits
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .filter(|id| !hit_vectors.contains_key(id))
+                    .collect();
+                let mut vecs = hit_vectors;
+                if !missing.is_empty() {
+                    vecs.extend(self.db.fetch_vectors(&missing).await?);
+                }
                 let qc = sub(qvec, mu);
                 hits.into_iter()
                     .map(|(id, raw)| {
@@ -753,6 +822,11 @@ impl Engine {
 
         // Apply the floor + per-query gap cut only where centered scores exist.
         let centered_present = scored.iter().any(|(_, _, cc)| cc.is_some());
+        let weakest_centered = scored
+            .iter()
+            .filter_map(|(_, _, cc)| *cc)
+            .fold(f64::INFINITY, f64::min);
+        let could_widen = scored.len() >= k && (!centered_present || weakest_centered >= floor);
         let (kept, effective_cut) = if centered_present {
             adaptive_cut(scored, floor, self.config.recall_gap_min)
         } else {
@@ -779,7 +853,7 @@ impl Engine {
             .into_iter()
             .map(|(node, ccs)| (node, ccs.into_iter().fold(f64::NEG_INFINITY, f64::max)))
             .collect();
-        Ok(SeedResult { activations, relevance, effective_cut })
+        Ok(SeedResult { activations, relevance, effective_cut, could_widen })
     }
 
     /// The centered-cosine relevance gate's corpus mean (`recall_min_cosine`),
@@ -992,6 +1066,11 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
 
 /// Index slots reserved for items reached by analogy (4.7).
 const ANALOGY_SLOTS: usize = 2;
+
+/// A lower bound on one index line's cost (`- [<26-char id>] claim — citation`
+/// is over 40 characters, `approx_tokens` counts four per token), so a block
+/// of `injection_token_cap` tokens never holds more than `cap / this` items.
+const INDEX_ITEM_MIN_TOKENS: usize = 10;
 
 /// The follow-up query vector: the current message, leaning a quarter on
 /// the previous one, renormalised.

@@ -12,7 +12,7 @@ impl Db {
             .bind(event)
             .bind(detail)
             .bind(Utc::now())
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -26,7 +26,7 @@ impl Db {
             "DELETE FROM audit_log WHERE event IN ('consolidate', 'maintenance') AND created_at < ?",
         )
         .bind(cutoff)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(done.rows_affected())
     }
@@ -36,7 +36,7 @@ impl Db {
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(sqlx::query_scalar("SELECT value FROM app_settings WHERE key = ?")
             .bind(key)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?)
     }
 
@@ -47,7 +47,7 @@ impl Db {
         )
         .bind(key)
         .bind(value)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -58,7 +58,7 @@ impl Db {
         Ok(
             sqlx::query_as("SELECT key, value FROM app_settings WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
                 .bind(like)
-                .fetch_all(self.pool())
+                .fetch_all(self.read_pool())
                 .await?,
         )
     }
@@ -66,7 +66,7 @@ impl Db {
     pub async fn delete_setting(&self, key: &str) -> Result<()> {
         sqlx::query("DELETE FROM app_settings WHERE key = ?")
             .bind(key)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }

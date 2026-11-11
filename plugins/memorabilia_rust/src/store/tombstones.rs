@@ -33,7 +33,7 @@ impl Db {
         .bind(&t.kind)
         .bind(t.permanent)
         .bind(&t.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -45,7 +45,7 @@ impl Db {
     pub async fn has_tombstone(&self, text_hash: &str) -> Result<bool> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tombstones WHERE text_hash = ?")
             .bind(text_hash)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?;
         Ok(n > 0)
     }
@@ -57,7 +57,7 @@ impl Db {
         Ok(sqlx::query_scalar(
             "SELECT text_hash FROM tombstones ORDER BY rowid",
         )
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 }
@@ -92,7 +92,7 @@ impl Db {
         .bind(s.permanent)
         .bind(&s.expires_at)
         .bind(&s.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -106,7 +106,7 @@ impl Db {
              ORDER BY chunk_id",
         )
         .bind(now)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 }

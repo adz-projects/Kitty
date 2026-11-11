@@ -363,7 +363,7 @@ mod tests {
         run_maintenance(&db).await.unwrap();
         assert!(is_retired(&db, &dead.text).await);
         let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suppressions")
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await
             .unwrap();
 
@@ -372,7 +372,7 @@ mod tests {
         db.set_setting(LAST_MAINTENANCE_KEY, "0").await.unwrap();
         run_maintenance(&db).await.unwrap();
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suppressions")
-            .fetch_one(db.pool())
+            .fetch_one(db.read_pool())
             .await
             .unwrap();
         assert_eq!(before, after, "an already-suppressed belief is not re-suppressed");

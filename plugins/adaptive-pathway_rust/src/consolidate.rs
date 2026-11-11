@@ -61,7 +61,10 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
     // against a snapshot is always valid; the fields updated on merge are
     // updated in the local copy too so a second conversation belief in the
     // same pass sees the first merge's effect rather than clobbering it.
+    // Identity beliefs are merge targets too: a promoted fact must keep
+    // receiving the evidence a conversation gathers for it.
     let mut context = db.list_beliefs(Some(Layer::Context)).await?;
+    context.extend(db.list_beliefs(Some(Layer::Identity)).await?);
 
     for b in conversation {
         // discard confidence < 0.25 or single-observation-with-support-1
@@ -137,7 +140,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 sqlx::query("UPDATE observations SET belief_id = ? WHERE belief_id = ?")
                     .bind(&c.id)
                     .bind(&b.id)
-                    .execute(db.pool())
+                    .execute(&*db.write().await)
                     .await?;
                 db.delete_belief(&b.id).await?;
                 merged = true;

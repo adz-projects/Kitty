@@ -104,32 +104,43 @@ pub async fn idle_sweep_with<C: SessionChat>(
     // bound as a query parameter doesn't compare correctly against it.
     const IDLE_MINUTES: i64 = 15;
     const ACTIVE_MINUTES: i64 = 30;
-    let ids =
-        crate::learn::host::idle_session_ids(host_pool, app_id, IDLE_MINUTES, ACTIVE_MINUTES).await?;
+    // Each side is asked one set-based question per tick (sessions with
+    // their newest rowid; every watermark; which sessions hold conversation
+    // beliefs); only a session with something to do gets a look of its own.
+    // Asked per session, an app with 1,000 chats cost thousands of queries a
+    // minute, forever.
+    let ids = crate::learn::host::idle_sessions_with_max_rowid(
+        host_pool,
+        app_id,
+        IDLE_MINUTES,
+        ACTIVE_MINUTES,
+    )
+    .await?;
+    let watermarks = engine.db.all_learned_rowids().await.unwrap_or_default();
+    let with_beliefs = engine
+        .db
+        .sessions_with_conversation_beliefs()
+        .await
+        .unwrap_or_default();
     backoff.retain(|_, failed_at| failed_at.elapsed() < LEARN_FAILURE_BACKOFF);
     let mut taken = 0usize;
     let batch = learn_batch.unwrap_or(IDLE_SWEEP_BATCH).max(1);
-    for session_id in &ids {
+    for (session_id, max_rowid) in &ids {
         if taken >= batch {
             break;
         }
         if backoff.contains_key(session_id) {
             continue;
         }
-        // Skip paused sessions.
-        if engine.is_paused(session_id).await.unwrap_or(false) {
+        let watermark = watermarks.get(session_id).copied().unwrap_or(0);
+        let max_rowid = *max_rowid;
+        let needs_learning = learn_batch.is_some() && max_rowid > watermark;
+        let needs_consolidation = with_beliefs.contains(session_id);
+        if !needs_learning && !needs_consolidation {
             continue;
         }
-        let watermark = engine.db.last_learned_rowid(session_id).await.unwrap_or(0);
-        let max_rowid = crate::learn::host::session_max_rowid(host_pool, session_id).await.unwrap_or(watermark);
-        let needs_learning = learn_batch.is_some() && max_rowid > watermark;
-        let needs_consolidation = engine
-            .db
-            .list_conversation_beliefs_for_session(session_id)
-            .await
-            .map(|beliefs| !beliefs.is_empty())
-            .unwrap_or(false);
-        if !needs_learning && !needs_consolidation {
+        // Skip paused sessions.
+        if engine.is_paused(session_id).await.unwrap_or(false) {
             continue;
         }
         taken += 1;

@@ -839,7 +839,7 @@ impl Engine {
              JOIN documents d ON d.document_hash = c.document_hash \
              WHERE d.source_type = 'Conversation'",
         )
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.read_pool())
         .await
         {
             Ok(ids) => ids,
@@ -872,7 +872,7 @@ impl Engine {
                 }
                 let documents =
                     sqlx::query("DELETE FROM documents WHERE source_type = 'Conversation'")
-                        .execute(db.pool())
+                        .execute(&*db.write().await)
                         .await?
                         .rows_affected();
                 db.insert_audit(&AuditEntry {

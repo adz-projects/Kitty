@@ -218,7 +218,7 @@ impl Db {
         .bind(&b.session_id)
         .bind(&b.embedding_model)
         .bind(b.kind.as_str())
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -234,7 +234,7 @@ impl Db {
             .bind(encode_embedding(embedding))
             .bind(model)
             .bind(id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -250,7 +250,7 @@ impl Db {
         )
         .bind(current_model)
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         Ok(rows.into_iter().map(map_belief).collect())
     }
@@ -261,7 +261,7 @@ impl Db {
     pub async fn count_stale_embedding_beliefs(&self, current_model: &str) -> Result<i64> {
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM beliefs WHERE embedding_model != ?")
             .bind(current_model)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?;
         Ok(count)
     }
@@ -275,27 +275,22 @@ impl Db {
     /// Rust first, then written unconditionally rather than through
     /// `COALESCE`, so a real NULL can actually be written.
     pub async fn update_belief(&self, id: &str, p: &BeliefPatch, updated_at: DateTime<Utc>) -> Result<()> {
-        let current = self.get_belief(id).await?;
-        let domain = match &p.domain {
-            Some(d) => d.clone(),
-            None => current.as_ref().and_then(|c| c.domain.clone()),
-        };
-        let session_id = match &p.session_id {
-            Some(s) => s.clone(),
-            None => current.as_ref().and_then(|c| c.session_id.clone()),
-        };
+        // `domain` and `session_id` are nullable and can be set to NULL, so
+        // "leave it" is an explicit flag rather than COALESCE. This used to
+        // read the whole row (embedding included) first just to carry the
+        // two values forward.
         sqlx::query("UPDATE beliefs SET confidence = COALESCE(?, confidence), \
                      tested = COALESCE(?, tested), \
                      support_count = COALESCE(?, support_count), \
                      distinct_sessions = COALESCE(?, distinct_sessions), \
                      contradict_count = COALESCE(?, contradict_count), \
                      pinned = COALESCE(?, pinned), \
-                     domain = ?, \
+                     domain = CASE WHEN ? THEN ? ELSE domain END, \
                      layer = COALESCE(?, layer), \
                      provenance = COALESCE(?, provenance), \
                      last_confirmed_at = COALESCE(?, last_confirmed_at), \
                      consolidated_at = COALESCE(?, consolidated_at), \
-                     session_id = ?, \
+                     session_id = CASE WHEN ? THEN ? ELSE session_id END, \
                      kind = COALESCE(?, kind), \
                      updated_at = ? WHERE id = ?")
             .bind(p.confidence)
@@ -304,16 +299,18 @@ impl Db {
             .bind(p.distinct_sessions)
             .bind(p.contradict_count)
             .bind(p.pinned)
-            .bind(domain)
+            .bind(p.domain.is_some())
+            .bind(p.domain.clone().flatten())
             .bind(p.layer.map(|l| l.as_str()))
             .bind(p.provenance.map(|pr| pr.as_str()))
             .bind(p.last_confirmed_at)
             .bind(p.consolidated_at)
-            .bind(session_id)
+            .bind(p.session_id.is_some())
+            .bind(p.session_id.clone().flatten())
             .bind(p.kind.map(|k| k.as_str()))
             .bind(updated_at)
             .bind(id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -321,7 +318,7 @@ impl Db {
     pub async fn get_belief(&self, id: &str) -> Result<Option<Belief>> {
         let row = sqlx::query_as::<_, BeliefRow>("SELECT * FROM beliefs WHERE id = ?")
             .bind(id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?;
         Ok(row.map(map_belief))
     }
@@ -331,12 +328,12 @@ impl Db {
             Some(l) => {
                 sqlx::query_as::<_, BeliefRow>("SELECT * FROM beliefs WHERE layer = ?")
                     .bind(l.as_str())
-                    .fetch_all(self.pool())
+                    .fetch_all(self.read_pool())
                     .await?
             }
             None => {
                 sqlx::query_as::<_, BeliefRow>("SELECT * FROM beliefs")
-                    .fetch_all(self.pool())
+                    .fetch_all(self.read_pool())
                     .await?
             }
         };
@@ -351,7 +348,7 @@ impl Db {
             "SELECT * FROM beliefs ORDER BY updated_at DESC LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         Ok(rows.into_iter().map(map_belief).collect())
     }
@@ -359,12 +356,25 @@ impl Db {
     /// Conversation-layer beliefs owned by exactly this session. Used by
     /// consolidation, which must never touch another session's still-fast-
     /// decaying conversation memory.
+    /// The sessions that have any conversation-layer belief, in one read.
+    pub async fn sessions_with_conversation_beliefs(
+        &self,
+    ) -> Result<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT session_id FROM beliefs \
+             WHERE layer = 'conversation' AND session_id IS NOT NULL",
+        )
+        .fetch_all(self.read_pool())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
     pub async fn list_conversation_beliefs_for_session(&self, session_id: &str) -> Result<Vec<Belief>> {
         let rows = sqlx::query_as::<_, BeliefRow>(
             "SELECT * FROM beliefs WHERE layer = 'conversation' AND session_id = ?",
         )
         .bind(session_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         Ok(rows.into_iter().map(map_belief).collect())
     }
@@ -396,23 +406,74 @@ impl Db {
     /// briefly unavailable for recall while its re-embed is pending) are
     /// fine, matching this crate's existing "never fabricate, prefer a gap"
     /// stance elsewhere (e.g. `domains::infer_query_domain`).
+    ///
+    /// Cached in memory against `belief_version` (moved by a trigger on every
+    /// change to `beliefs`): a turn whose candidates have not changed reads
+    /// one counter instead of re-reading and re-decoding up to 500 rows with
+    /// their embeddings. No counter (an erased database) means no caching.
     pub async fn list_recall_candidates(&self, session_id: &str, current_model: &str) -> Result<Vec<Belief>> {
         const RECALL_CANDIDATE_ROW_LIMIT: i64 = 500;
+        let version: Option<i64> =
+            sqlx::query_scalar("SELECT n FROM belief_version WHERE id = 1")
+                .fetch_optional(self.read_pool())
+                .await
+                .ok()
+                .flatten();
+        if let Some(hit) = version.and_then(|v| self.cached_recall_candidates(v, session_id, current_model)) {
+            return Ok(hit);
+        }
         let rows = sqlx::query_as::<_, BeliefRow>(
+            // Identity and pinned beliefs first, then by recency: they are
+            // the slowest-moving rows, so a pure recency window dropped them
+            // before the reserved identity slots were ever considered.
             "SELECT * FROM beliefs WHERE (layer != 'conversation' OR session_id = ?) \
              AND embedding_model = ? \
-             ORDER BY updated_at DESC LIMIT ?",
+             ORDER BY (layer = 'identity' OR pinned != 0) DESC, updated_at DESC LIMIT ?",
         )
         .bind(session_id)
         .bind(current_model)
         .bind(RECALL_CANDIDATE_ROW_LIMIT)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
-        Ok(rows.into_iter().map(map_belief).collect())
+        let beliefs: Vec<Belief> = rows.into_iter().map(map_belief).collect();
+        if let Some(v) = version {
+            self.store_recall_candidates(v, session_id, current_model, &beliefs);
+        }
+        Ok(beliefs)
+    }
+
+    /// Forget what one deleted chat left behind: its conversation-layer
+    /// beliefs (session-scoped by definition, so nothing else can reach them
+    /// once the chat is gone), its learn and pause state, and its pending
+    /// assumption tests. Context and identity beliefs stay: they are
+    /// cross-chat by design. One transaction, so a partial forget never
+    /// lands. Returns the number of beliefs removed.
+    pub async fn forget_session(&self, session_id: &str) -> Result<u64> {
+        let pool = self.pool().clone();
+        let sid = session_id.to_string();
+        self.run_in_transaction(|| async move {
+            let removed = sqlx::query(
+                "DELETE FROM beliefs WHERE layer = 'conversation' AND session_id = ?",
+            )
+            .bind(&sid)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            sqlx::query("DELETE FROM conversation_state WHERE session_id = ?")
+                .bind(&sid)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM assumption_tests WHERE session_id = ?")
+                .bind(&sid)
+                .execute(&pool)
+                .await?;
+            Ok(removed)
+        })
+        .await
     }
 
     pub async fn delete_belief(&self, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM beliefs WHERE id = ?").bind(id).execute(self.pool()).await?;
+        sqlx::query("DELETE FROM beliefs WHERE id = ?").bind(id).execute(&*self.write().await).await?;
         Ok(())
     }
 
@@ -443,14 +504,18 @@ impl Db {
             return Ok(None);
         }
         let what_lower = what.to_lowercase();
-        let all = self.list_beliefs(None).await?;
+        // Id and text only: a substring match needs no embeddings, and
+        // decoding every belief's vector for it was most of the cost.
+        let all: Vec<(String, String)> = sqlx::query_as("SELECT id, text FROM beliefs")
+            .fetch_all(self.read_pool())
+            .await?;
         Ok(all
             .into_iter()
-            .find(|b| {
-                let text_lower = b.text.to_lowercase();
+            .find(|(_, text)| {
+                let text_lower = text.to_lowercase();
                 text_lower.contains(&what_lower) || what_lower.contains(&text_lower)
             })
-            .map(|b| b.id))
+            .map(|(id, _)| id))
     }
 }
 

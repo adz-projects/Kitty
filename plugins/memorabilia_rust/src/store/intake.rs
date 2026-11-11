@@ -110,7 +110,7 @@ impl Db {
         sqlx::query("UPDATE captures SET lane = ? WHERE capture_id = ?")
             .bind(lane)
             .bind(capture_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -119,7 +119,7 @@ impl Db {
     pub async fn capture_lane(&self, capture_id: &str) -> Result<String> {
         Ok(sqlx::query_scalar::<_, String>("SELECT lane FROM captures WHERE capture_id = ?")
             .bind(capture_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?
             .unwrap_or_else(|| "durable".into()))
     }
@@ -129,7 +129,7 @@ impl Db {
         sqlx::query("UPDATE chunks SET lane = ? WHERE chunk_id = ?")
             .bind(lane)
             .bind(chunk_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -138,7 +138,7 @@ impl Db {
     pub async fn chunk_lane(&self, chunk_id: &str) -> Result<String> {
         Ok(sqlx::query_scalar::<_, String>("SELECT lane FROM chunks WHERE chunk_id = ?")
             .bind(chunk_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?
             .unwrap_or_else(|| "durable".into()))
     }
@@ -169,7 +169,7 @@ impl Db {
         .bind(c.paragraphs_kept)
         .bind(c.pinned)
         .bind(&c.screened_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -177,7 +177,7 @@ impl Db {
     pub async fn has_capture(&self, document_hash: &str) -> Result<bool> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM captures WHERE document_hash = ?")
             .bind(document_hash)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?;
         Ok(n > 0)
     }
@@ -186,7 +186,7 @@ impl Db {
         Ok(
             sqlx::query_as::<_, Capture>("SELECT * FROM captures WHERE capture_id = ?")
                 .bind(capture_id)
-                .fetch_optional(self.pool())
+                .fetch_optional(self.read_pool())
                 .await?,
         )
     }
@@ -198,7 +198,7 @@ impl Db {
         )
         .bind(status)
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -223,7 +223,7 @@ impl Db {
         .bind(kept.len() as i64)
         .bind(at)
         .bind(capture_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -237,7 +237,7 @@ impl Db {
         )
         .bind(status)
         .bind(capture_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -249,7 +249,7 @@ impl Db {
              WHERE status = 'unscreened' AND captured_at < ?",
         )
         .bind(cutoff)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(r.rows_affected())
     }
@@ -269,7 +269,7 @@ impl Db {
         .bind(turn_id)
         .bind(query)
         .bind(at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -283,7 +283,7 @@ impl Db {
         )
         .bind(model)
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -292,7 +292,7 @@ impl Db {
             .bind(embedding)
             .bind(model)
             .bind(id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -304,14 +304,14 @@ impl Db {
              ORDER BY id",
         )
         .bind(since)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
     pub async fn delete_queries_before(&self, cutoff: &str) -> Result<u64> {
         let r = sqlx::query("DELETE FROM demand_queries WHERE created_at < ?")
             .bind(cutoff)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(r.rows_affected())
     }
@@ -337,7 +337,7 @@ impl Db {
         .bind(&c.status)
         .bind(&c.created_at)
         .bind(&c.decided_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(r.rows_affected() > 0)
     }
@@ -345,7 +345,7 @@ impl Db {
     pub async fn has_candidate_hash(&self, content_hash: &str) -> Result<bool> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM candidates WHERE content_hash = ?")
             .bind(content_hash)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?;
         Ok(n > 0)
     }
@@ -357,7 +357,7 @@ impl Db {
              ORDER BY created_at DESC, candidate_id LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -366,7 +366,7 @@ impl Db {
             .bind(status)
             .bind(at)
             .bind(candidate_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -374,7 +374,7 @@ impl Db {
     pub async fn delete_candidate(&self, candidate_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM candidates WHERE candidate_id = ?")
             .bind(candidate_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -383,7 +383,7 @@ impl Db {
     pub async fn expire_candidates_before(&self, cutoff: &str) -> Result<u64> {
         let r = sqlx::query("DELETE FROM candidates WHERE status = 'waiting' AND created_at < ?")
             .bind(cutoff)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(r.rows_affected())
     }
@@ -404,7 +404,7 @@ impl Db {
         .bind(&e.scores)
         .bind(&e.verdict)
         .bind(&e.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -415,21 +415,21 @@ impl Db {
             "SELECT * FROM screen_log ORDER BY id DESC LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
     pub async fn delete_screen_log_before(&self, cutoff: &str) -> Result<u64> {
         let r = sqlx::query("DELETE FROM screen_log WHERE created_at < ?")
             .bind(cutoff)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(r.rows_affected())
     }
 
     pub async fn intake_backlog(&self) -> Result<IntakeBacklog> {
         let count = |sql: &'static str| async move {
-            sqlx::query_scalar::<_, i64>(sql).fetch_one(self.pool()).await
+            sqlx::query_scalar::<_, i64>(sql).fetch_one(self.read_pool()).await
         };
         Ok(IntakeBacklog {
             unscreened: count("SELECT COUNT(*) FROM captures WHERE status = 'unscreened'").await?,

@@ -37,7 +37,7 @@ impl Db {
         .bind(e.grounded)
         .bind(e.reinforced)
         .bind(&e.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -48,7 +48,7 @@ impl Db {
             "SELECT * FROM reinforcement_outbox ORDER BY rowid LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -71,13 +71,13 @@ impl Db {
         for chunk_id in chunk_ids {
             q = q.bind(chunk_id);
         }
-        q.execute(self.pool()).await?;
+        q.execute(&*self.write().await).await?;
         Ok(())
     }
 
     pub async fn outbox_count(&self) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM reinforcement_outbox")
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?)
     }
 }

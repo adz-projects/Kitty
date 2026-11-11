@@ -105,7 +105,7 @@ impl Engine {
     ) -> Result<Arc<Self>> {
         let db = Db::open(path).await?;
         db.init_vectors(config.embedding_dim).await?;
-        let vectors = Arc::new(SqliteVectorIndex::new(db.pool().clone()));
+        let vectors = Arc::new(SqliteVectorIndex::for_db(&db));
         let engine = Arc::new(Self::new(config, db, chat, embedder, vectors));
         // One-time cleanup of pre-document-harvest dialogue evidence; a no-op
         // (one settings read) once done.

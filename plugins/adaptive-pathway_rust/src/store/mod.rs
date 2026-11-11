@@ -29,6 +29,44 @@ pub struct Db {
     /// interleave, and so the abandoned-transaction rollback (see
     /// [`TxnGuard`]) always finishes before the next transaction begins.
     txn_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Names nested transactions' savepoints uniquely.
+    savepoints: std::sync::atomic::AtomicU64,
+    /// Read-only connections for reads outside a transaction (see
+    /// [`Db::read_pool`]). The same pool as `pool` for an in-memory database,
+    /// where a second connection would be a different, empty database.
+    reader: SqlitePool,
+    /// Recall candidates by `(session, model)`, valid for one
+    /// `belief_version` (see `list_recall_candidates`).
+    recall_cache: std::sync::Mutex<RecallCache>,
+}
+
+/// `(belief_version, (session, model) -> candidates)`.
+type RecallCache = (
+    i64,
+    std::collections::HashMap<(String, String), std::sync::Arc<Vec<crate::store::beliefs::Belief>>>,
+);
+
+tokio::task_local! {
+    /// The `Db`s (by [`Db::id`]) whose transaction the current task is
+    /// inside. A write made from inside one runs on its connection without
+    /// taking `txn_lock` (which that transaction already holds); every other
+    /// write takes the lock (see [`Db::write`]).
+    static IN_TXN: Vec<usize>;
+}
+
+/// The pool, plus the transaction lock while a write outside any
+/// transaction runs (see [`Db::write`]). Derefs to the pool, so a write reads
+/// `.execute(&*self.write().await)`.
+pub struct WriteGuard<'a> {
+    pool: &'a SqlitePool,
+    _lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = SqlitePool;
+    fn deref(&self) -> &SqlitePool {
+        self.pool
+    }
 }
 
 /// Rolls back a transaction whose future was dropped before it finished.
@@ -120,9 +158,29 @@ impl Db {
         let pool_options = SqlitePoolOptions::new().min_connections(1).max_connections(1);
         let pool = pool_options.connect_with(options).await?;
         Self::init(&pool).await?;
+        // Readers alongside the one writer (WAL allows that), so a turn's
+        // recall no longer queues behind whatever statement or transaction a
+        // background pass has on the write connection.
+        let reader = if is_memory {
+            pool.clone()
+        } else {
+            let reader_options = SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .foreign_keys(true)
+                .busy_timeout(Duration::from_millis(5000));
+            SqlitePoolOptions::new()
+                .min_connections(0)
+                .max_connections(2)
+                .connect_with(reader_options)
+                .await?
+        };
         Ok(Self {
             pool,
             txn_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            savepoints: std::sync::atomic::AtomicU64::new(0),
+            reader,
+            recall_cache: std::sync::Mutex::new((-1, std::collections::HashMap::new())),
         })
     }
 
@@ -141,6 +199,93 @@ impl Db {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Where a read goes: the read-only pool, or the write connection when
+    /// this task is inside its own transaction (whose uncommitted writes only
+    /// that connection can see).
+    pub fn read_pool(&self) -> &SqlitePool {
+        if self.in_txn() {
+            &self.pool
+        } else {
+            &self.reader
+        }
+    }
+
+    pub(crate) fn cached_recall_candidates(
+        &self,
+        version: i64,
+        session_id: &str,
+        model: &str,
+    ) -> Option<Vec<crate::store::beliefs::Belief>> {
+        // Never from inside a transaction: its uncommitted changes move the
+        // counter only for this connection.
+        if self.in_txn() {
+            return None;
+        }
+        let cache = self.recall_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.0 != version {
+            return None;
+        }
+        cache
+            .1
+            .get(&(session_id.to_string(), model.to_string()))
+            .map(|v| v.as_ref().clone())
+    }
+
+    pub(crate) fn store_recall_candidates(
+        &self,
+        version: i64,
+        session_id: &str,
+        model: &str,
+        beliefs: &[crate::store::beliefs::Belief],
+    ) {
+        if self.in_txn() {
+            return;
+        }
+        let mut cache = self.recall_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.0 != version {
+            *cache = (version, std::collections::HashMap::new());
+        }
+        // A handful of chats at most; a long-running engine must not grow it.
+        if cache.1.len() >= 16 {
+            cache.1.clear();
+        }
+        cache.1.insert(
+            (session_id.to_string(), model.to_string()),
+            std::sync::Arc::new(beliefs.to_vec()),
+        );
+    }
+
+    /// This `Db`'s identity for [`IN_TXN`].
+    fn id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.txn_lock) as usize
+    }
+
+    /// Whether the current task is inside this `Db`'s transaction.
+    fn in_txn(&self) -> bool {
+        IN_TXN
+            .try_with(|ids| ids.contains(&self.id()))
+            .unwrap_or(false)
+    }
+
+    /// Where every write goes. Outside a transaction it holds `txn_lock` for
+    /// the statement, so a write can never run between another task's
+    /// `BEGIN` and its `COMMIT`/`ROLLBACK` on the shared connection (and be
+    /// rolled back with it after it was reported done). Inside this task's
+    /// own transaction it is just the pool. Keep the guard a temporary of
+    /// the statement (`.execute(&*self.write().await).await`), never in a
+    /// binding that lives across other writes.
+    pub async fn write(&self) -> WriteGuard<'_> {
+        let lock = if self.in_txn() {
+            None
+        } else {
+            Some(self.txn_lock.clone().lock_owned().await)
+        };
+        WriteGuard {
+            pool: &self.pool,
+            _lock: lock,
+        }
     }
 
     /// Raw `BEGIN`/`COMMIT`/`ROLLBACK` over the pool. Correct *because* the
@@ -194,6 +339,24 @@ impl Db {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        if self.in_txn() {
+            // Nested inside this task's own transaction: a savepoint, so an
+            // inner failure undoes only its own part and the outer
+            // transaction carries on (or fails) as a whole.
+            let n = self
+                .savepoints
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("sp_{n}");
+            sqlx::query(&format!("SAVEPOINT {name}")).execute(self.pool()).await?;
+            let result = f().await;
+            if result.is_err() {
+                let _ = sqlx::query(&format!("ROLLBACK TO {name}"))
+                    .execute(&*self.write().await)
+                    .await;
+            }
+            let _ = sqlx::query(&format!("RELEASE {name}")).execute(self.pool()).await;
+            return result;
+        }
         let lock = self.txn_lock.clone().lock_owned().await;
         // Armed before `BEGIN`: a drop while `BEGIN` is in flight still rolls
         // back (harmlessly, if it never ran).
@@ -206,7 +369,9 @@ impl Db {
             guard.armed = false;
             return Err(e);
         }
-        let result = match f().await {
+        let mut ids = IN_TXN.try_with(|v| v.clone()).unwrap_or_default();
+        ids.push(self.id());
+        let result = match IN_TXN.scope(ids, f()).await {
             Ok(value) => match self.commit_txn().await {
                 Ok(()) => Ok(value),
                 // A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction
@@ -321,4 +486,92 @@ pub fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod write_lock_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// M2: a write from another task while a transaction is open waits for it,
+    /// so the transaction's rollback cannot take that write with it.
+    #[tokio::test]
+    async fn a_concurrent_write_survives_another_transactions_rollback() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let txn_db = db.clone();
+        let txn = tokio::spawn(async move {
+            let r: Result<()> = txn_db
+                .run_in_transaction(|| async {
+                    txn_db.set_setting("inside", "1").await?;
+                    let _ = started_tx.send(());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Err(PathwayError::Config("roll back".into()))
+                })
+                .await;
+            assert!(r.is_err());
+        });
+        started_rx.await.unwrap();
+        // Issued while the transaction is open; must not be part of it.
+        db.set_setting("outside", "1").await.unwrap();
+        txn.await.unwrap();
+        assert_eq!(db.get_setting("inside").await.unwrap(), None);
+        assert_eq!(db.get_setting("outside").await.unwrap().as_deref(), Some("1"));
+    }
+
+    /// A nested transaction is a savepoint: its failure undoes only itself.
+    #[tokio::test]
+    async fn a_failed_nested_transaction_undoes_only_its_own_part() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.run_in_transaction(|| async {
+            db.set_setting("outer", "1").await?;
+            let inner: Result<()> = db
+                .run_in_transaction(|| async {
+                    db.set_setting("inner", "1").await?;
+                    Err(PathwayError::Config("inner fails".into()))
+                })
+                .await;
+            assert!(inner.is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.get_setting("outer").await.unwrap().as_deref(), Some("1"));
+        assert_eq!(db.get_setting("inner").await.unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    /// A file-backed database reads through its read-only pool: committed
+    /// writes are visible there, and a transaction still reads its own.
+    #[tokio::test]
+    async fn the_read_pool_sees_committed_writes_and_a_transaction_its_own() {
+        let dir = std::env::temp_dir().join(format!(
+            "reader-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(path.to_str().unwrap()).await.unwrap();
+        db.set_setting("a", "1").await.unwrap();
+        assert_eq!(db.get_setting("a").await.unwrap().as_deref(), Some("1"));
+        db.run_in_transaction(|| async {
+            db.set_setting("b", "2").await?;
+            assert_eq!(db.get_setting("b").await?.as_deref(), Some("2"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.get_setting("b").await.unwrap().as_deref(), Some("2"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

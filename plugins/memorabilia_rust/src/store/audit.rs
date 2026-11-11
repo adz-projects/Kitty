@@ -31,7 +31,7 @@ impl Db {
         .bind(&a.category)
         .bind(&a.detail)
         .bind(&a.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -41,14 +41,14 @@ impl Db {
             "SELECT * FROM audit_log WHERE event = ? ORDER BY rowid",
         )
         .bind(event)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
     pub async fn count_audit(&self, event: &str) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE event = ?")
             .bind(event)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?)
     }
 }

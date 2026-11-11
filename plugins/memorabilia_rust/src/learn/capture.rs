@@ -24,6 +24,11 @@ pub const UNSCREENED_MAX_AGE_DAYS: i64 = 3;
 /// After this many screened paragraphs with none kept, the rest of the
 /// document is dropped unscreened.
 pub const EARLY_EXIT_AFTER: usize = 10;
+
+/// Groups of paragraphs screened at once. Small: a self-hosted decision model
+/// is often a single-slot server, where more would only queue.
+const SCREEN_CONCURRENCY: usize = 3;
+
 /// Screened captures the daytime retry handles per call.
 pub const SCREEN_PENDING_BATCH: i64 = 3;
 
@@ -268,27 +273,47 @@ impl Engine {
         let mut screened = 0usize;
         let mut any_kept = false;
         let mut stopped_at: Option<usize> = None;
-        for chunk in screen_indices.chunks(batch) {
+        // A few groups are screened at once rather than strictly one after
+        // another; results are still applied in document order, so the early
+        // exit reads top to bottom exactly as before (a wave may screen a
+        // little past the stop point; those verdicts are discarded).
+        let chunks: Vec<&[usize]> = screen_indices.chunks(batch).collect();
+        'waves: for wave in chunks.chunks(SCREEN_CONCURRENCY) {
             if screened >= EARLY_EXIT_AFTER && !any_kept {
-                stopped_at = chunk.first().copied();
+                stopped_at = wave.first().and_then(|c| c.first().copied());
                 break;
             }
-            let states: Vec<String> = chunk
+            let states: Vec<Vec<String>> = wave
                 .iter()
-                .map(|&i| screen_state(source_type, source_name, &paragraphs[i]))
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|&i| screen_state(source_type, source_name, &paragraphs[i]))
+                        .collect()
+                })
                 .collect();
-            let refs: Vec<&str> = states.iter().map(String::as_str).collect();
-            for (&i, v) in chunk.iter().zip(s.screen_batch(&refs).await) {
-                match &v {
-                    // The model is down: the whole document waits, unscreened.
-                    ScreenVerdict::Unavailable => return DocScreen::Unavailable,
-                    ScreenVerdict::Disabled => any_kept = true,
-                    ScreenVerdict::Scored { keep, .. } => {
-                        screened += 1;
-                        any_kept |= *keep;
-                    }
+            let results = futures::future::join_all(states.iter().map(|st| {
+                let refs: Vec<&str> = st.iter().map(String::as_str).collect();
+                async move { s.screen_batch(&refs).await }
+            }))
+            .await;
+            for (chunk, verdicts_for_chunk) in wave.iter().zip(results) {
+                if screened >= EARLY_EXIT_AFTER && !any_kept {
+                    stopped_at = chunk.first().copied();
+                    break 'waves;
                 }
-                verdicts.insert(i, v);
+                for (&i, v) in chunk.iter().zip(verdicts_for_chunk) {
+                    match &v {
+                        // The model is down: the whole document waits, unscreened.
+                        ScreenVerdict::Unavailable => return DocScreen::Unavailable,
+                        ScreenVerdict::Disabled => any_kept = true,
+                        ScreenVerdict::Scored { keep, .. } => {
+                            screened += 1;
+                            any_kept |= *keep;
+                        }
+                    }
+                    verdicts.insert(i, v);
+                }
             }
         }
 

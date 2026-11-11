@@ -62,7 +62,7 @@ impl Db {
         .bind(&e.revalidate_at)
         .bind(e.ttl_days)
         .bind(&e.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -70,7 +70,7 @@ impl Db {
     pub async fn delete_proposition_edge(&self, edge_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM proposition_edges WHERE edge_id = ?")
             .bind(edge_id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -85,7 +85,7 @@ impl Db {
         .bind(b)
         .bind(b)
         .bind(a)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?;
         Ok(n > 0)
     }
@@ -95,7 +95,7 @@ impl Db {
             "SELECT * FROM proposition_edges WHERE from_node = ? ORDER BY rowid",
         )
         .bind(node_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -104,7 +104,7 @@ impl Db {
             "SELECT * FROM proposition_edges WHERE to_node = ? ORDER BY rowid",
         )
         .bind(node_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -116,7 +116,7 @@ impl Db {
             "SELECT * FROM proposition_edges WHERE edge_type = ? ORDER BY rowid",
         )
         .bind(edge_type)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -139,7 +139,7 @@ impl Db {
         .bind(b)
         .bind(b)
         .bind(a)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?;
         Ok(n > 0)
     }
@@ -167,7 +167,7 @@ impl Db {
         .bind(e.strength)
         .bind(&e.opened_at)
         .bind(&e.reason)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?
         .rows_affected())
     }
@@ -180,7 +180,7 @@ impl Db {
         )
         .bind(closed_at)
         .bind(edge_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -199,7 +199,7 @@ impl Db {
         )
         .bind(chunk_id)
         .bind(chunk_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -209,7 +209,7 @@ impl Db {
         Ok(sqlx::query_as::<_, DisputedEdge>(
             "SELECT * FROM disputed_edges WHERE closed_at IS NULL ORDER BY rowid",
         )
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -222,7 +222,7 @@ impl Db {
         )
         .bind(chunk_id)
         .bind(chunk_id)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?)
     }
 }

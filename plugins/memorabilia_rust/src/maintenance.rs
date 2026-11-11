@@ -68,13 +68,11 @@ impl Engine {
             return outcome;
         };
 
-        match self.drain_outbox(now).await {
-            Ok((g, r)) => {
-                outcome.outbox_grounded = g;
-                outcome.outbox_reinforced = r;
-            }
-            Err(e) => tracing::warn!("maintenance: outbox drain failed ({e})"),
-        }
+        // The whole backlog, before decay is judged: a chunk whose
+        // reinforcement is still queued must not be archived as unused.
+        let (g, r) = self.drain_outbox_fully(now).await;
+        outcome.outbox_grounded = g;
+        outcome.outbox_reinforced = r;
 
         match self.resolve_decay(now, &now_naive).await {
             Ok((archived, p_arch, p_del, disputes)) => {
@@ -128,6 +126,36 @@ impl Engine {
         }
 
         outcome
+    }
+
+    /// Drain the reinforcement outbox completely, a bounded batch at a time.
+    /// Local and model-free, so the host runs it on every sweep tick, not
+    /// only in the overnight pass: once a night, at 256 rows, a regular
+    /// user's backlog grew without bound and decay judged chunks without the
+    /// reinforcement still waiting for them. Soft-fails: an error stops this
+    /// drain and the next tick resumes it. Returns `(grounded, reinforced)`.
+    pub async fn drain_outbox_fully(&self, now: &str) -> (usize, usize) {
+        /// Upper bound on batches per call, so one call stays short.
+        const MAX_BATCHES: usize = 64;
+        let (mut grounded, mut reinforced) = (0usize, 0usize);
+        for _ in 0..MAX_BATCHES {
+            match self.drain_outbox(now).await {
+                Ok((0, 0)) => {
+                    if self.db.next_outbox_batch(1).await.map_or(true, |b| b.is_empty()) {
+                        break;
+                    }
+                }
+                Ok((g, r)) => {
+                    grounded += g;
+                    reinforced += r;
+                }
+                Err(e) => {
+                    tracing::warn!("maintenance: outbox drain failed ({e})");
+                    break;
+                }
+            }
+        }
+        (grounded, reinforced)
     }
 
     /// Drain the reinforcement outbox (plan §6.2): apply grounding and

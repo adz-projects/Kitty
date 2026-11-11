@@ -54,6 +54,35 @@ pub struct Db {
     /// interleave, and so the abandoned-transaction rollback (see
     /// [`TxnGuard`]) always finishes before the next transaction begins.
     txn_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Names nested transactions' savepoints uniquely.
+    savepoints: std::sync::atomic::AtomicU64,
+    /// Read-only connections for reads outside a transaction (see
+    /// [`Db::read_pool`]). The same pool as `pool` for an in-memory database,
+    /// where a second connection would be a different, empty database.
+    reader: SqlitePool,
+}
+
+tokio::task_local! {
+    /// The `Db`s (by [`Db::id`]) whose transaction the current task is
+    /// inside. A write made from inside one runs on its connection without
+    /// taking `txn_lock` (which that transaction already holds); every other
+    /// write takes the lock (see [`Db::write`]).
+    static IN_TXN: Vec<usize>;
+}
+
+/// The pool, plus the transaction lock while a write outside any
+/// transaction runs (see [`Db::write`]). Derefs to the pool, so a write reads
+/// `.execute(&*self.write().await)`.
+pub struct WriteGuard<'a> {
+    pool: &'a SqlitePool,
+    _lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = SqlitePool;
+    fn deref(&self) -> &SqlitePool {
+        self.pool
+    }
 }
 
 /// Rolls back a transaction whose future was dropped before it finished.
@@ -139,9 +168,28 @@ impl Db {
         let pool_options = SqlitePoolOptions::new().min_connections(1).max_connections(1);
         let pool = pool_options.connect_with(options).await?;
         Self::init(&pool).await?;
+        // Readers alongside the one writer (WAL allows that), so a turn's
+        // recall no longer queues behind whatever statement or transaction a
+        // background pass has on the write connection.
+        let reader = if is_memory {
+            pool.clone()
+        } else {
+            let reader_options = SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .foreign_keys(true)
+                .busy_timeout(Duration::from_millis(5000));
+            SqlitePoolOptions::new()
+                .min_connections(0)
+                .max_connections(2)
+                .connect_with(reader_options)
+                .await?
+        };
         Ok(Self {
             pool,
             txn_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            savepoints: std::sync::atomic::AtomicU64::new(0),
+            reader,
         })
     }
 
@@ -172,12 +220,54 @@ impl Db {
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(\
              chunk_id TEXT PRIMARY KEY, embedding float[{dim}])"
         );
-        sqlx::query(&sql).execute(self.pool()).await?;
+        sqlx::query(&sql).execute(&*self.write().await).await?;
         Ok(())
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Where a read goes: the read-only pool, or the write connection when
+    /// this task is inside its own transaction (whose uncommitted writes only
+    /// that connection can see).
+    pub fn read_pool(&self) -> &SqlitePool {
+        if self.in_txn() {
+            &self.pool
+        } else {
+            &self.reader
+        }
+    }
+
+    /// This `Db`'s identity for [`IN_TXN`].
+    fn id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.txn_lock) as usize
+    }
+
+    /// Whether the current task is inside this `Db`'s transaction.
+    fn in_txn(&self) -> bool {
+        IN_TXN
+            .try_with(|ids| ids.contains(&self.id()))
+            .unwrap_or(false)
+    }
+
+    /// Where every write goes. Outside a transaction it holds `txn_lock` for
+    /// the statement, so a write can never run between another task's
+    /// `BEGIN` and its `COMMIT`/`ROLLBACK` on the shared connection (and be
+    /// rolled back with it after it was reported done). Inside this task's
+    /// own transaction it is just the pool. Keep the guard a temporary of
+    /// the statement (`.execute(&*self.write().await).await`), never in a
+    /// binding that lives across other writes.
+    pub async fn write(&self) -> WriteGuard<'_> {
+        let lock = if self.in_txn() {
+            None
+        } else {
+            Some(self.txn_lock.clone().lock_owned().await)
+        };
+        WriteGuard {
+            pool: &self.pool,
+            _lock: lock,
+        }
     }
 
     /// Raw `BEGIN`/`COMMIT`/`ROLLBACK` over the pool. Correct *because* the
@@ -219,7 +309,7 @@ impl Db {
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(sqlx::query_scalar("SELECT value FROM app_settings WHERE key = ?")
             .bind(key)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?)
     }
 
@@ -232,7 +322,7 @@ impl Db {
         )
         .bind(key)
         .bind(value)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -244,7 +334,7 @@ impl Db {
             "SELECT key, value FROM app_settings WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
         )
         .bind(like)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -252,7 +342,7 @@ impl Db {
     pub async fn delete_setting(&self, key: &str) -> Result<()> {
         sqlx::query("DELETE FROM app_settings WHERE key = ?")
             .bind(key)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -270,7 +360,7 @@ impl Db {
              WHERE c.status = 'active' AND c.embedding_model = ?",
         )
         .bind(model)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         let mut sum: Vec<f64> = Vec::new();
         let mut n: usize = 0;
@@ -304,7 +394,7 @@ impl Db {
         Ok(sqlx::query_scalar(
             "SELECT DISTINCT embedding_model FROM chunks WHERE status = 'active'",
         )
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?)
     }
 
@@ -315,22 +405,24 @@ impl Db {
         &self,
         chunk_ids: &[String],
     ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
-        if chunk_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
+        // In batches: one `IN (...)` per id hit SQLite's bound-parameter
+        // limit (32,766) once the pool grew that large, and recall failed.
+        const BATCH: usize = 500;
+        let mut out = std::collections::HashMap::with_capacity(chunk_ids.len());
+        for ids in chunk_ids.chunks(BATCH) {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "SELECT chunk_id, embedding FROM chunks_vec WHERE chunk_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, (String, Vec<u8>)>(&sql);
+            for id in ids {
+                q = q.bind(id);
+            }
+            for (id, bytes) in q.fetch_all(self.read_pool()).await? {
+                out.insert(id, decode_embedding(&bytes));
+            }
         }
-        let placeholders = vec!["?"; chunk_ids.len()].join(", ");
-        let sql = format!(
-            "SELECT chunk_id, embedding FROM chunks_vec WHERE chunk_id IN ({placeholders})"
-        );
-        let mut q = sqlx::query_as::<_, (String, Vec<u8>)>(&sql);
-        for id in chunk_ids {
-            q = q.bind(id);
-        }
-        let rows = q.fetch_all(self.pool()).await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, bytes)| (id, decode_embedding(&bytes)))
-            .collect())
+        Ok(out)
     }
 
     /// The Stage 4 extraction watermark: the highest chunk rowid this
@@ -356,7 +448,7 @@ impl Db {
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             )
             .bind(rowid.to_string())
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         }
         Ok(())
@@ -375,7 +467,7 @@ impl Db {
         .bind(session_id)
         .bind(paused)
         .bind(now)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -387,9 +479,47 @@ impl Db {
         let paused: Option<bool> =
             sqlx::query_scalar("SELECT paused FROM session_pause WHERE session_id = ?")
                 .bind(session_id)
-                .fetch_optional(self.pool())
+                .fetch_optional(self.read_pool())
                 .await?;
         Ok(paused.unwrap_or(false))
+    }
+
+    /// Forget what one deleted chat left waiting: its captured documents not
+    /// yet processed, its candidates still waiting for their topic to recur,
+    /// its search-demand rows and its pause flag, so nothing from a deleted
+    /// chat is promoted into memory on a later night. Facts already promoted
+    /// stay: they are cross-chat memory by design. Returns the number of
+    /// captures and candidates removed.
+    pub async fn forget_session(&self, session_id: &str) -> Result<u64> {
+        let pool = self.pool().clone();
+        let sid = session_id.to_string();
+        self.run_in_transaction(|| async move {
+            let mut removed = sqlx::query(
+                "DELETE FROM candidates WHERE session_id = ? AND status = 'waiting'",
+            )
+            .bind(&sid)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            removed += sqlx::query(
+                "DELETE FROM captures WHERE session_id = ? AND status != 'processed' \
+                 AND capture_id NOT IN (SELECT capture_id FROM candidates)",
+            )
+            .bind(&sid)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            sqlx::query("DELETE FROM demand_queries WHERE session_id = ?")
+                .bind(&sid)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM session_pause WHERE session_id = ?")
+                .bind(&sid)
+                .execute(&pool)
+                .await?;
+            Ok(removed)
+        })
+        .await
     }
 
     /// Run `f` inside a `BEGIN`/`COMMIT` transaction, rolling back on any
@@ -402,6 +532,24 @@ impl Db {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        if self.in_txn() {
+            // Nested inside this task's own transaction: a savepoint, so an
+            // inner failure undoes only its own part and the outer
+            // transaction carries on (or fails) as a whole.
+            let n = self
+                .savepoints
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("sp_{n}");
+            sqlx::query(&format!("SAVEPOINT {name}")).execute(self.pool()).await?;
+            let result = f().await;
+            if result.is_err() {
+                let _ = sqlx::query(&format!("ROLLBACK TO {name}"))
+                    .execute(&*self.write().await)
+                    .await;
+            }
+            let _ = sqlx::query(&format!("RELEASE {name}")).execute(self.pool()).await;
+            return result;
+        }
         let lock = self.txn_lock.clone().lock_owned().await;
         // Armed before `BEGIN`: a drop while `BEGIN` is in flight still rolls
         // back (harmlessly, if it never ran).
@@ -414,7 +562,9 @@ impl Db {
             guard.armed = false;
             return Err(e);
         }
-        let result = match f().await {
+        let mut ids = IN_TXN.try_with(|v| v.clone()).unwrap_or_default();
+        ids.push(self.id());
+        let result = match IN_TXN.scope(ids, f()).await {
             Ok(value) => match self.commit_txn().await {
                 Ok(()) => Ok(value),
                 // A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction
@@ -525,4 +675,38 @@ pub fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    /// A file-backed database reads through its read-only pool: committed
+    /// writes are visible there, and a transaction still reads its own.
+    #[tokio::test]
+    async fn the_read_pool_sees_committed_writes_and_a_transaction_its_own() {
+        let dir = std::env::temp_dir().join(format!(
+            "reader-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db = Db::open(path.to_str().unwrap()).await.unwrap();
+        db.set_setting("a", "1").await.unwrap();
+        assert_eq!(db.get_setting("a").await.unwrap().as_deref(), Some("1"));
+        db.run_in_transaction(|| async {
+            db.set_setting("b", "2").await?;
+            assert_eq!(db.get_setting("b").await?.as_deref(), Some("2"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.get_setting("b").await.unwrap().as_deref(), Some("2"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

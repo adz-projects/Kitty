@@ -84,7 +84,7 @@ impl Db {
         .bind(a.flagged_at_exchange)
         .bind(a.created_at)
         .bind(a.updated_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -93,10 +93,10 @@ impl Db {
         let rows = if let Some(s) = state {
             sqlx::query("SELECT * FROM assumptions WHERE state = ?")
                 .bind(s.as_str())
-                .fetch_all(self.pool())
+                .fetch_all(self.read_pool())
                 .await?
         } else {
-            sqlx::query("SELECT * FROM assumptions").fetch_all(self.pool()).await?
+            sqlx::query("SELECT * FROM assumptions").fetch_all(self.read_pool()).await?
         };
         rows.iter().map(row_to_assumption).collect::<sqlx::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -109,7 +109,7 @@ impl Db {
             "SELECT * FROM assumptions WHERE state IN ('scheduled', 'surfaced') \
              ORDER BY flagged_at_exchange ASC",
         )
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         rows.iter().map(row_to_assumption).collect::<sqlx::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -121,7 +121,7 @@ impl Db {
             .bind(state.as_str())
             .bind(Utc::now())
             .bind(id)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }
@@ -129,7 +129,7 @@ impl Db {
     pub async fn get_assumption(&self, id: &str) -> Result<Option<Assumption>> {
         let row = sqlx::query("SELECT * FROM assumptions WHERE id = ?")
             .bind(id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?;
         row.as_ref().map(row_to_assumption).transpose().map_err(Into::into)
     }
@@ -141,7 +141,7 @@ impl Db {
     pub async fn get_assumption_for_belief(&self, belief_id: &str) -> Result<Option<Assumption>> {
         let row = sqlx::query("SELECT * FROM assumptions WHERE belief_id = ? LIMIT 1")
             .bind(belief_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await?;
         row.as_ref().map(row_to_assumption).transpose().map_err(Into::into)
     }
@@ -154,7 +154,7 @@ impl Db {
             "SELECT * FROM assumptions WHERE belief_id = ? AND state IN ('scheduled', 'surfaced') LIMIT 1",
         )
         .bind(belief_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?;
         row.as_ref().map(row_to_assumption).transpose().map_err(Into::into)
     }

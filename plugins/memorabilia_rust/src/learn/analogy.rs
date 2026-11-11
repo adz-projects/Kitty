@@ -73,7 +73,7 @@ impl Engine {
              WHERE p.status = 'active' AND a.node_id IS NULL ORDER BY p.created_at, p.node_id LIMIT ?",
         )
         .bind(self.config.analogy_claims_per_pass as i64)
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.read_pool())
         .await?;
         let mut done = Vec::new();
         for batch in pending.chunks(ABSTRACT_BATCH) {
@@ -120,7 +120,7 @@ impl Engine {
                 .bind(text)
                 .bind(&tag)
                 .bind(encode_embedding(&vec))
-                .execute(self.db.pool())
+                .execute(&*self.db.write().await)
                 .await?;
                 done.push(node.clone());
                 out.abstracted += 1;
@@ -136,7 +136,7 @@ impl Engine {
             "SELECT a.node_id, a.abstract, a.embedding_model, a.embedding FROM claim_abstracts a \
              JOIN propositions p ON p.node_id = a.node_id WHERE p.status = 'active' ORDER BY a.node_id",
         )
-        .fetch_all(self.db.pool())
+        .fetch_all(self.db.read_pool())
         .await?;
         let abstracts: HashMap<String, (String, String, Vec<f32>)> = rows
             .into_iter()
@@ -255,7 +255,7 @@ impl Engine {
                     sqlx::query("INSERT OR REPLACE INTO edge_rationales (edge_id, rationale) VALUES (?, ?)")
                         .bind(&edge.edge_id)
                         .bind(&why)
-                        .execute(self.db.pool())
+                        .execute(&*self.db.write().await)
                         .await?;
                     out.edges += 1;
                 }
@@ -283,7 +283,7 @@ impl Engine {
         )
         .bind(from)
         .bind(to)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(self.db.read_pool())
         .await
         .ok()
         .flatten()

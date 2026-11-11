@@ -50,7 +50,7 @@ impl Db {
         .bind(s.permanent)
         .bind(s.expires_at)
         .bind(s.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -76,7 +76,7 @@ impl Db {
         )
         .bind(text_hash)
         .bind(now)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?;
         Ok(active > 0)
     }
@@ -99,7 +99,7 @@ impl Db {
              WHERE permanent = 1 OR (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(now)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
@@ -109,7 +109,7 @@ impl Db {
             "SELECT COUNT(*) FROM suppressions WHERE text_hash = ? AND permanent = 1",
         )
         .bind(text_hash)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?
             > 0)
     }
@@ -118,7 +118,7 @@ impl Db {
     pub async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64> {
         let res = sqlx::query("DELETE FROM suppressions WHERE permanent = 0 AND expires_at IS NOT NULL AND expires_at <= ?")
             .bind(now)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(res.rows_affected())
     }
@@ -239,7 +239,7 @@ impl Db {
                 sqlx::query("INSERT OR IGNORE INTO forget_tombstones (text_hash, created_at) VALUES (?, ?)")
                     .bind(&text_hash)
                     .bind(now)
-                    .execute(self.pool())
+                    .execute(&*self.write().await)
                     .await?;
                 self.audit("forget", Some(&format!("permanent: {}", belief.text))).await.ok();
             }
@@ -261,16 +261,16 @@ impl Db {
                 self.delete_belief(&belief.id).await?;
                 sqlx::query("DELETE FROM observations WHERE belief_id = ?")
                     .bind(&belief.id)
-                    .execute(self.pool())
+                    .execute(&*self.write().await)
                     .await?;
                 sqlx::query("DELETE FROM assumptions WHERE belief_id = ?")
                     .bind(&belief.id)
-                    .execute(self.pool())
+                    .execute(&*self.write().await)
                     .await?;
                 sqlx::query("INSERT OR IGNORE INTO forget_tombstones (text_hash, created_at) VALUES (?, ?)")
                     .bind(&text_hash)
                     .bind(now)
-                    .execute(self.pool())
+                    .execute(&*self.write().await)
                     .await?;
                 self.audit("forget", Some(&format!("hard_delete: {}", belief.text))).await.ok();
             }

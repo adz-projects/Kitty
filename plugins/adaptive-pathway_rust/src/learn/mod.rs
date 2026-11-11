@@ -178,7 +178,9 @@ pub async fn extract_and_record<S: StructuredChat>(
     // matching the plan's "exchanges_at_flag = <global exchange counter>"
     // framing: ~20 *learn-worthy* exchanges, not calendar time or raw turn
     // count. Best-effort -- a failed bump must never fail the learn pass.
-    let _ = db.bump_global_exchange().await;
+    // Bumped where the pass lands (with its watermark), not here: an
+    // interrupted pass is re-run over the same range, and bumping up front
+    // advanced the clock twice for one exchange.
 
     // Build the chunk: use the given one, else read rows (watermark, through]
     // from the host db, dropping role='system', tool-masking, truncating.
@@ -188,6 +190,7 @@ pub async fn extract_and_record<S: StructuredChat>(
     };
     if chunk.trim().is_empty() {
         // Nothing learnable; still advance the watermark so we don't rescan.
+        let _ = db.bump_global_exchange().await;
         db.advance_learned_rowid(req.session_id, req.through_rowid).await?;
         return Ok(LearnOutcome::default());
     }
@@ -199,6 +202,7 @@ pub async fn extract_and_record<S: StructuredChat>(
     // not extractions.
     if let Some(gate) = engine.gate() {
         if let Some(p) = gate.skip_learning(&chunk).await {
+            let _ = db.bump_global_exchange().await;
             db.advance_learned_rowid(req.session_id, req.through_rowid).await?;
             let detail = format!("session={} through={} p={p:.2}", req.session_id, req.through_rowid);
             let _ = db.audit("learn_gated", Some(&detail)).await;
@@ -258,12 +262,9 @@ pub async fn extract_and_record<S: StructuredChat>(
         .unwrap_or_default();
     let observations: Vec<Value> = observations.into_iter().take(5).collect();
 
-    // Process observations -> beliefs in one transaction. Counted as they're
-    // actually processed below, not from the raw parsed length -- an
-    // empty-statement entry is skipped (`continue`, never routed to a
-    // belief), so counting before that filter over-reported by however many
-    // entries were skipped.
-    let mut outcome = LearnOutcome::default();
+    // Observations are counted as they're actually processed below, not from
+    // the raw parsed length -- an empty-statement entry is skipped (never
+    // routed to a belief), so counting before that filter over-reported.
 
     // One batch id shared by every observation this pass produces. These came
     // out of a single stretch of conversation and are jointly meaningful --
@@ -280,12 +281,30 @@ pub async fn extract_and_record<S: StructuredChat>(
     // cheaper to keep correct than two.
     let batch_id = crate::store::audit::uuid_string();
 
+    // Everything slow happens first, outside the transaction: one embedding
+    // per observation and per correction. Then the whole pass is written in
+    // one transaction (observations, test results, corrections, the exchange
+    // clock and the watermark), so a pass interrupted by the next turn lands
+    // whole or not at all. Committed per observation with the watermark last,
+    // a re-run merged the observations already recorded a second time.
+    struct Prepared {
+        obs: Value,
+        statement: String,
+        embedding: Vec<f32>,
+        embedding_model: String,
+        provenance: Provenance,
+        layer: Layer,
+        domain: Option<String>,
+        evidence: Option<String>,
+        contradicts: Option<String>,
+        kind: crate::store::beliefs::BeliefKind,
+    }
+    let mut prepared: Vec<Prepared> = Vec::new();
     for obs in &observations {
         let statement = obs.get("statement").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if statement.trim().is_empty() {
             continue;
         }
-        outcome.observations += 1;
         let provenance = Provenance::parse(
             obs.get("provenance").and_then(|p| p.as_str()).unwrap_or("single_observation"),
         );
@@ -300,49 +319,58 @@ pub async fn extract_and_record<S: StructuredChat>(
         // downstream (an empty-string domain would otherwise behave like a
         // real, if useless, domain tag).
         let non_empty = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(str::to_string);
-        let domain = non_empty(obs.get("domain").and_then(|d| d.as_str()));
-        let evidence = non_empty(obs.get("evidence").and_then(|e| e.as_str()));
-        let contradicts = non_empty(obs.get("contradicts").and_then(|c| c.as_str()));
-
         let (embedding, semantic) = engine.embed.embed_with_space(&statement).await;
-        let now = chrono::Utc::now();
         // Tag with the embedding space ACTUALLY used — a lexical hash-fallback
         // vector must not be labeled as the semantic model (it would join the
         // same recall/merge pool as real embeddings and compare garbage, and
         // never be flagged stale by `list_stale_embedding_beliefs`).
         let embedding_model = if semantic {
-            engine.cfg.embedding.ollama_model.as_str()
+            engine.cfg.embedding.ollama_model.clone()
         } else {
-            crate::config::HASH_EMBED_MODEL
+            crate::config::HASH_EMBED_MODEL.to_string()
         };
-        let kind = crate::store::beliefs::BeliefKind::parse(
-            obs.get("kind").and_then(|k| k.as_str()).unwrap_or("context"),
-        );
-        let landed = crate::belief::synthesis::route_observation_with(
-            db,
-            &statement,
-            &embedding,
+        prepared.push(Prepared {
+            obs: obs.clone(),
+            domain: non_empty(obs.get("domain").and_then(|d| d.as_str())),
+            evidence: non_empty(obs.get("evidence").and_then(|e| e.as_str())),
+            contradicts: non_empty(obs.get("contradicts").and_then(|c| c.as_str())),
+            kind: crate::store::beliefs::BeliefKind::parse(
+                obs.get("kind").and_then(|k| k.as_str()).unwrap_or("context"),
+            ),
+            statement,
+            embedding,
             embedding_model,
             provenance,
             layer,
-            domain.as_deref(),
-            evidence.as_deref(),
-            contradicts.as_deref(),
-            Some(req.session_id.to_string()),
-            Some(batch_id.as_str()),
-            now,
-            kind,
-        )
-        .await?;
-        if let Some(id) = landed {
-            record_relations(db, &id, obs).await;
+        });
+    }
+
+    // Process corrections (forget(wrong) semantics). Skip empty/whitespace
+    // corrections (audit #116): every text-resolution step downstream
+    // matches on `contains`, and `""` is a substring of *every* belief — a
+    // junk `[""]` correction would otherwise tombstone the first belief in
+    // the table. `forget_by_text`'s cosine fallback needs a real embedding
+    // in the same space as the stored beliefs (a correction that paraphrased
+    // the KNOWN BELIEFS line rather than quoting it would otherwise silently
+    // fail to resolve).
+    let mut corrections: Vec<(String, Vec<f32>)> = Vec::new();
+    for c in parsed
+        .get("corrections")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        if let Some(text) = c.as_str().filter(|t| !t.trim().is_empty()) {
+            let embedding = engine.embed.embed(text).await;
+            corrections.push((text.to_string(), embedding));
         }
     }
 
     // Judge the assumption tests this chat had in flight.
+    let mut tests: Vec<(String, Option<String>, String)> = Vec::new();
     if let Some(results) = parsed.get("test_results").and_then(|r| r.as_array()) {
         for r in results {
-            let (Some(text), Some(outcome)) = (
+            let (Some(text), Some(result)) = (
                 r.get("assumption").and_then(|v| v.as_str()),
                 r.get("outcome").and_then(|v| v.as_str()),
             ) else {
@@ -358,57 +386,68 @@ pub async fn extract_and_record<S: StructuredChat>(
             else {
                 continue;
             };
-            apply_test_result(db, req.session_id, assumption_id, belief_id.as_deref(), outcome).await;
+            tests.push((assumption_id.clone(), belief_id.clone(), result.to_string()));
         }
     }
 
-    // Process corrections (forget(wrong) semantics).
-    let corrections = parsed
-        .get("corrections")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for c in corrections {
-        if let Some(text) = c.as_str() {
-            // Skip empty/whitespace corrections (audit #116): every
-            // text-resolution step downstream of here matches on `contains`,
-            // and `""` is a substring of *every* belief — a junk `[""]`
-            // correction would otherwise tombstone the first belief in the
-            // table.
-            if text.trim().is_empty() {
-                continue;
+    let session_id = req.session_id;
+    let through = req.through_rowid;
+    let outcome = db
+        .run_in_transaction(|| async {
+            let mut outcome = LearnOutcome::default();
+            let now = chrono::Utc::now();
+            for p in &prepared {
+                outcome.observations += 1;
+                let landed = crate::belief::synthesis::route_observation_with(
+                    db,
+                    &p.statement,
+                    &p.embedding,
+                    &p.embedding_model,
+                    p.provenance,
+                    p.layer,
+                    p.domain.as_deref(),
+                    p.evidence.as_deref(),
+                    p.contradicts.as_deref(),
+                    Some(session_id.to_string()),
+                    Some(batch_id.as_str()),
+                    now,
+                    p.kind,
+                )
+                .await?;
+                if let Some(id) = landed {
+                    record_relations(db, &id, &p.obs).await;
+                }
             }
-            // `forget_by_text`'s cosine fallback needs a real embedding in
-            // the same space as the stored beliefs -- the exact/substring
-            // resolution steps ahead of it don't need one, but a correction
-            // that doesn't textually match anything (the model paraphrased
-            // the KNOWN BELIEFS line rather than quoting it) would
-            // otherwise silently fail to resolve.
-            let embedding = engine.embed.embed(text).await;
-            if db
-                .forget_by_text(text, &embedding, &[], crate::store::suppressions::SuppressReason::Wrong)
-                .await
-                .is_ok()
-            {
-                outcome.corrections += 1;
+            for (assumption_id, belief_id, result) in &tests {
+                apply_test_result(db, session_id, assumption_id, belief_id.as_deref(), result).await;
             }
-        }
-    }
-
-    // Advance the watermark forward only (MAX guard).
-    db.advance_learned_rowid(req.session_id, req.through_rowid).await?;
-    db.audit(
-        match trigger {
-            LearnTrigger::TurnEnd => "learn_turn_end",
-            LearnTrigger::Compaction => "learn_compaction",
-            LearnTrigger::IdleClose => "learn_idle_close",
-        },
-        Some(&format!(
-            "session={} through={} observations={}",
-            req.session_id, req.through_rowid, outcome.observations
-        )),
-    )
-    .await?;
+            for (text, embedding) in &corrections {
+                if db
+                    .forget_by_text(text, embedding, &[], crate::store::suppressions::SuppressReason::Wrong)
+                    .await
+                    .is_ok()
+                {
+                    outcome.corrections += 1;
+                }
+            }
+            let _ = db.bump_global_exchange().await;
+            // Advance the watermark forward only (MAX guard).
+            db.advance_learned_rowid(session_id, through).await?;
+            db.audit(
+                match trigger {
+                    LearnTrigger::TurnEnd => "learn_turn_end",
+                    LearnTrigger::Compaction => "learn_compaction",
+                    LearnTrigger::IdleClose => "learn_idle_close",
+                },
+                Some(&format!(
+                    "session={session_id} through={through} observations={}",
+                    outcome.observations
+                )),
+            )
+            .await?;
+            Ok(outcome)
+        })
+        .await?;
     Ok(outcome)
 }
 

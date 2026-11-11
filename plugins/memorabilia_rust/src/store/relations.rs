@@ -39,7 +39,7 @@ impl Db {
         .bind(node_id)
         .bind(model)
         .bind(encode_embedding(v))
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -52,7 +52,7 @@ impl Db {
              WHERE v.embedding_model = ? AND p.status = 'active' ORDER BY v.node_id",
         )
         .bind(model)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         Ok(rows.into_iter().map(|(id, b)| (id, decode_embedding(&b))).collect())
     }
@@ -73,7 +73,7 @@ impl Db {
         .bind(r.strength.clamp(0.0, 1.0))
         .bind(&r.reason)
         .bind(&r.opened_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?
         .rows_affected()
             > 0)
@@ -87,7 +87,7 @@ impl Db {
         )
         .bind(node_id)
         .bind(node_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await?;
         Ok(rows.into_iter().map(to_relation).collect())
     }
@@ -100,7 +100,7 @@ impl Db {
              WHERE closed_at IS NULL AND kind = 'supersedes' AND to_node = ? ORDER BY opened_at DESC LIMIT 1",
         )
         .bind(node_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?;
         Ok(row.map(to_relation))
     }
@@ -113,7 +113,7 @@ impl Db {
         )
         .bind(node_id)
         .bind(node_id)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?)
     }
 }

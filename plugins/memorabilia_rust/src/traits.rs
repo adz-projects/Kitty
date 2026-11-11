@@ -103,6 +103,23 @@ pub trait VectorIndex: Send + Sync {
         k: usize,
     ) -> Result<Vec<(String, f32)>, String>;
 
+    /// [`Self::search`], with each hit's stored vector when the index can
+    /// return it in the same read (so a caller re-scoring the hits need not
+    /// fetch them again). `None` where it cannot.
+    async fn search_with_vectors(
+        &self,
+        query: &[f32],
+        model: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f32, Option<Vec<f32>>)>, String> {
+        Ok(self
+            .search(query, model, k)
+            .await?
+            .into_iter()
+            .map(|(id, cos)| (id, cos, None))
+            .collect())
+    }
+
     /// Chunk ids whose vectors were produced by `model` — used by the
     /// `reembed_stale` heavy pass to find lexical-fallback rows once the
     /// semantic service has recovered (plan §3.3 / §11).

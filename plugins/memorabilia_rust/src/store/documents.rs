@@ -42,7 +42,7 @@ impl Db {
         .bind(d.intent_factor)
         .bind(d.chunk_count)
         .bind(&d.created_at)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -52,7 +52,7 @@ impl Db {
             "SELECT * FROM documents WHERE document_hash = ?",
         )
         .bind(document_hash)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?)
     }
 
@@ -67,7 +67,7 @@ impl Db {
         sqlx::query("UPDATE documents SET chunk_count = ? WHERE document_hash = ?")
             .bind(chunk_count)
             .bind(document_hash)
-            .execute(self.pool())
+            .execute(&*self.write().await)
             .await?;
         Ok(())
     }

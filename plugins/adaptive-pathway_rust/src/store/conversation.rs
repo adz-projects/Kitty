@@ -36,7 +36,7 @@ impl Db {
              created_at, updated_at FROM conversation_state WHERE session_id = ?",
         )
         .bind(session_id)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await?;
         Ok(row.map(|r| ConversationState {
             session_id: r.session_id,
@@ -54,7 +54,7 @@ impl Db {
             "INSERT OR IGNORE INTO conversation_state (session_id) VALUES (?)",
         )
         .bind(session_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -76,7 +76,7 @@ impl Db {
         .bind(paused)
         .bind(Utc::now())
         .bind(session_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -86,7 +86,7 @@ impl Db {
         let paused: bool =
             sqlx::query_scalar("SELECT paused FROM conversation_state WHERE session_id = ?")
                 .bind(session_id)
-                .fetch_one(self.pool())
+                .fetch_one(self.read_pool())
                 .await?;
         Ok(paused)
     }
@@ -99,11 +99,11 @@ impl Db {
         )
         .bind(Utc::now())
         .bind(session_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(sqlx::query_scalar("SELECT exchange_count FROM conversation_state WHERE session_id = ?")
             .bind(session_id)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await?)
     }
 
@@ -114,8 +114,19 @@ impl Db {
             "SELECT last_learned_rowid FROM conversation_state WHERE session_id = ?",
         )
         .bind(session_id)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await?)
+    }
+
+    /// Every session's learn watermark, in one read (a session with no row
+    /// has learned nothing: 0). Read-only, unlike [`Self::last_learned_rowid`],
+    /// which creates the row.
+    pub async fn all_learned_rowids(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT session_id, last_learned_rowid FROM conversation_state")
+                .fetch_all(self.read_pool())
+                .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Write the learn watermark only forward (`MAX()` guard prevents the
@@ -129,7 +140,7 @@ impl Db {
         .bind(through)
         .bind(Utc::now())
         .bind(session_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
@@ -143,7 +154,7 @@ impl Db {
         .bind(json)
         .bind(Utc::now())
         .bind(session_id)
-        .execute(self.pool())
+        .execute(&*self.write().await)
         .await?;
         Ok(())
     }
