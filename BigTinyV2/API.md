@@ -56,7 +56,7 @@ Never a silently wrong-shaped call.
 | Route | Notes |
 |---|---|
 | `POST /api/chat/` | `{cwd?, mode?, name?, provider?, model?}` to `{session_id}` |
-| `GET /api/chat/` | `?limit&offset`; `total` is scoped to you |
+| `GET /api/chat/` | `?limit&offset`; `total` is scoped to you; `?slim=true` leaves out each row's `memory_slots` (2.5.0) |
 | `GET /api/chat/{id}` | one session's row, the shape of a `GET /api/chat/` entry; delegates included (2.5.0) |
 | `PATCH /api/chat/{id}` | rename |
 | `DELETE /api/chat/{id}` | 404 if it matched nothing; also forgets what the memory engines kept for that chat alone (2.5.0) |
@@ -317,6 +317,17 @@ distinguishes a choice from an inherited default.
 `PUT /api/apps/me/plugins/{plugin}` `{enabled}`; `DELETE` returns to the daemon
 default. Disabling closes any live instance, so it costs nothing rather than
 merely hiding tools.
+
+## Automatic approval (2.5.0)
+
+`GET /api/apps/me/approval-policy` → `{policy | null}`. `PUT` `{auto_allow,
+shell_sensitive_pattern?}` (400 on a pattern that does not compile); `DELETE`
+removes it. With `auto_allow`, a tool call that would otherwise pause under the
+default `always_ask` policy (no stored rule, no pattern decided it, not
+escalated by containment) runs without pausing when every path it names is
+inside the session's allowed folders, its shell command does not match
+`shell_sensitive_pattern`, and the app's decision-model shell screen (if on)
+does not flag it. Anything else pauses as before.
 
 ## Decision model
 

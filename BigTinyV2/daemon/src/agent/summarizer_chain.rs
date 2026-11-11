@@ -81,6 +81,8 @@ pub struct SummarizerChain {
     local: Option<Arc<dyn StructuredChat + Send + Sync>>,
     router: Arc<ProviderRouter>,
     cfg: SummarizerConfig,
+    /// The local summarizer's context window, when there is one.
+    local_window: Option<i32>,
 }
 
 impl SummarizerChain {
@@ -89,7 +91,26 @@ impl SummarizerChain {
         router: Arc<ProviderRouter>,
         cfg: SummarizerConfig,
     ) -> Self {
-        Self { local, router, cfg }
+        Self {
+            local,
+            router,
+            cfg,
+            local_window: None,
+        }
+    }
+
+    /// Record the local summarizer's context window, so a pass can size its
+    /// prompts to it (see `local_window`).
+    pub fn with_local_window(mut self, window: Option<i32>) -> Self {
+        self.local_window = window.filter(|_| self.local.is_some());
+        self
+    }
+
+    /// The local summarizer's context window, if one is configured: work
+    /// sized to the chat model's (larger) window would never fit it, and every
+    /// such call would go to the provider instead.
+    pub fn local_window(&self) -> Option<i32> {
+        self.local_window
     }
 
     /// Try the local engine, if one is configured. `None` means "not available
@@ -125,6 +146,20 @@ impl SummarizerChain {
         messages: Vec<Value>,
         schema: &Value,
     ) -> Result<Value, String> {
+        self.via_router_opts(provider_id, model, messages, schema, true).await
+    }
+
+    /// [`Self::via_router`]; `preemptible` = false for work that must not
+    /// yield to a chat (a forced compaction, which is what lets an overflowed
+    /// chat fit again).
+    async fn via_router_opts(
+        &self,
+        provider_id: &str,
+        model: Option<String>,
+        messages: Vec<Value>,
+        schema: &Value,
+        preemptible: bool,
+    ) -> Result<Value, String> {
         let mut prompted = messages;
         prompted.push(json!({
             "role": "user",
@@ -152,7 +187,18 @@ impl SummarizerChain {
         // only bounds gaps between bytes, and the provider's
         // total-stream-duration cap is long — neither may pin the compaction
         // or learn task for the full window, so this is a hard wall-clock cap.
-        let outcome = tokio::time::timeout(SUMMARIZER_OVERALL_TIMEOUT, async {
+        // A slot of its own on a server with several, so background work does
+        // not evict a chat's cached prompt.
+        let id_slot = self.router.parallel_slots(provider_id).filter(|&n| n > 1).map(|n| {
+            crate::provider::slots::assign_slot(
+                provider_id,
+                crate::provider::slots::BACKGROUND_SLOT_KEY,
+                n as usize,
+            )
+        });
+        let mut preempt = self.router.preempt_signal(provider_id);
+        preempt.mark_unchanged();
+        let request = tokio::time::timeout(SUMMARIZER_OVERALL_TIMEOUT, async {
             let stream = self
                 .router
                 .chat_completion(
@@ -161,7 +207,7 @@ impl SummarizerChain {
                     None,
                     sampling,
                     model,
-                    None,
+                    id_slot,
                     crate::provider::queue::DAEMON_LANE,
                     crate::provider::queue::Priority::Background,
                     &crate::provider::schema::ResponseSpec::text(),
@@ -169,8 +215,19 @@ impl SummarizerChain {
                 .await
                 .map_err(|e| format!("summarizer fallback call to '{provider_id}' failed: {e}"))?;
             collect_text(stream).await
-        })
-        .await;
+        });
+        let outcome = if preemptible {
+            tokio::select! {
+                o = request => o,
+                _ = preempt.changed() => {
+                    return Err(format!(
+                        "summarizer call to '{provider_id}' yielded its slot to a chat"
+                    ));
+                }
+            }
+        } else {
+            request.await
+        };
 
         let text = match outcome {
             Ok(Ok(t)) => t,
@@ -209,6 +266,20 @@ impl SummarizerChain {
         messages: Vec<Value>,
         schema: &Value,
     ) -> Result<Value, String> {
+        self.structured_chat_for_session_opts(provider_id, model, messages, schema, true)
+            .await
+    }
+
+    /// [`Self::structured_chat_for_session`]; `preemptible` = false keeps the
+    /// provider leg from yielding its slot to a chat (see `via_router_opts`).
+    pub async fn structured_chat_for_session_opts(
+        &self,
+        provider_id: Option<&str>,
+        model: Option<String>,
+        messages: Vec<Value>,
+        schema: &Value,
+        preemptible: bool,
+    ) -> Result<Value, String> {
         if let Some(v) = self.try_local(&messages, schema).await {
             return Ok(v);
         }
@@ -217,7 +288,7 @@ impl SummarizerChain {
         }
         let provider_id = provider_id
             .ok_or_else(|| "no provider available for the summarizer fallback".to_string())?;
-        self.via_router(provider_id, model, messages, schema).await
+        self.via_router_opts(provider_id, model, messages, schema, preemptible).await
     }
 
     /// For a pass that belongs to an app but no one session (memorabilia

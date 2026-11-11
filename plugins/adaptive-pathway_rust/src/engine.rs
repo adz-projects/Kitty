@@ -323,14 +323,23 @@ impl PathwayEngine {
                     .then_with(|| a.belief.id.cmp(&b.belief.id))
             })
             .map(|s| s.belief.id.clone());
-        TurnSignals {
-            worth_testing: self.worth_testing_line(session_id, user_message, selected).await,
-            unsure: self.unsure_line(session_id, selected, candidates).await,
-            check: match &top_belief_id {
-                Some(id) => self.check_yourself_line(session_id, id).await,
-                None => None,
+        // Four independent lookups, made together.
+        let (worth_testing, unsure, check, tension) = tokio::join!(
+            self.worth_testing_line(session_id, user_message, selected),
+            self.unsure_line(session_id, selected, candidates),
+            async {
+                match &top_belief_id {
+                    Some(id) => self.check_yourself_line(session_id, id).await,
+                    None => None,
+                }
             },
-            tension: self.tension_line(selected, candidates).await,
+            self.tension_line(selected, candidates),
+        );
+        TurnSignals {
+            worth_testing,
+            unsure,
+            check,
+            tension,
             challenge: challenge_for(selected),
         }
     }
@@ -371,22 +380,22 @@ impl PathwayEngine {
         user_message: &str,
         previous_user_message: Option<&str>,
     ) -> Option<(Vec<crate::belief::SelectedBelief>, Vec<crate::store::beliefs::Belief>)> {
-        if self.is_paused(session_id).await.unwrap_or(false) {
+        // Independent reads, so together (the read pool serves them side by
+        // side) rather than one after another on the turn's critical path.
+        let (paused, candidates, suppressed) = tokio::join!(
+            self.is_paused(session_id),
+            self.db
+                .list_recall_candidates(session_id, &self.cfg.embedding.ollama_model),
+            self.db.active_suppressed_text_hashes(chrono::Utc::now()),
+        );
+        if paused.unwrap_or(false) {
             return None;
         }
-        let candidates = self
-            .db
-            .list_recall_candidates(session_id, &self.cfg.embedding.ollama_model)
-            .await
-            .ok()?;
+        let candidates = candidates.ok()?;
         if candidates.is_empty() {
             return None;
         }
-        let suppressed = self
-            .db
-            .active_suppressed_text_hashes(chrono::Utc::now())
-            .await
-            .unwrap_or_default();
+        let suppressed = suppressed.unwrap_or_default();
         let candidates = crate::belief::filter_suppressed(candidates, &suppressed);
         if candidates.is_empty() {
             return None;
@@ -425,23 +434,37 @@ impl PathwayEngine {
         };
         let predicted_query = trajectory_predict(&query, &previous_query, &self.cfg.trajectory);
         let query_domain = crate::domains::infer_query_domain(&candidates, &predicted_query);
-        let cooccurrence = self.cooccurrence_adjacency(&candidates).await;
-        let relevance = self
-            .judge_relevance(session_id, user_message, &candidates, &predicted_query, query_domain.as_deref())
-            .await;
+        let space = self.cfg.embedding.ollama_model.clone();
+        // The co-occurrence edges, the decision model's relevance judgement
+        // (a network call) and the floor snapshot do not depend on each
+        // other: asked together.
+        let (cooccurrence, relevance, ewma) = tokio::join!(
+            self.cooccurrence_adjacency(&candidates),
+            self.judge_relevance(
+                session_id,
+                user_message,
+                &candidates,
+                &predicted_query,
+                query_domain.as_deref()
+            ),
+            async {
+                if semantic {
+                    crate::recall::cut_log::snapshot(&self.db, &space).await
+                } else {
+                    None
+                }
+            },
+        );
 
         // Self-tuning floor: raise the configured `min_cosine` toward the
         // snapshot of where relevance usually cuts in this embedding space
         // (minus slack). The snapshot only moves in the nightly pass
         // (`recall::cut_log`), so it cannot shift between two recalls of the
         // same turn. Semantic query only; cold leaves the hard floor.
-        let space = self.cfg.embedding.ollama_model.clone();
         let mut turn_cfg = self.cfg.clone();
-        if semantic {
-            if let Some(ewma) = crate::recall::cut_log::snapshot(&self.db, &space).await {
-                turn_cfg.recall.min_cosine =
-                    self.cfg.recall.min_cosine.max(ewma - self.cfg.recall.ewma_slack);
-            }
+        if let Some(ewma) = ewma {
+            turn_cfg.recall.min_cosine =
+                self.cfg.recall.min_cosine.max(ewma - self.cfg.recall.ewma_slack);
         }
 
         let (selected, cut) = crate::recall::select_beliefs_relevant_with_cut(
@@ -456,13 +479,6 @@ impl PathwayEngine {
         // Log this turn's effective cut for tonight's fold (semantic turns
         // only). Logging does not change the snapshot recall reads.
         // Best-effort -- a settings write must never fail recall.
-        if semantic {
-            if let Some(cut) = cut {
-                if let Err(e) = crate::recall::cut_log::log(&self.db, &space, cut).await {
-                    tracing::debug!("pathway: could not log the recall cut: {e}");
-                }
-            }
-        }
         // Recorded, in display order (weight desc, id asc: what
         // `render_knows` prints), so what recall injected can be read from
         // disk, and `record_turn_end` knows this turn's top belief.
@@ -475,7 +491,20 @@ impl PathwayEngine {
                 .then_with(|| a.belief.id.cmp(&b.belief.id))
         });
         let ids: Vec<String> = ordered.iter().map(|s| s.belief.id.clone()).collect();
-        if let Err(e) = self.db.set_last_recall_ids(session_id, &ids).await {
+        // The turn's two writes (the cut for tonight's fold, on semantic
+        // turns; the recalled ids) in one transaction: one lock, one commit.
+        let logged = self
+            .db
+            .run_in_transaction(|| async {
+                if let (true, Some(cut)) = (semantic, cut) {
+                    if let Err(e) = crate::recall::cut_log::log(&self.db, &space, cut).await {
+                        tracing::debug!("pathway: could not log the recall cut: {e}");
+                    }
+                }
+                self.db.set_last_recall_ids(session_id, &ids).await
+            })
+            .await;
+        if let Err(e) = logged {
             tracing::debug!("pathway: could not record recall ids for {session_id}: {e}");
         }
         if selected.is_empty() {

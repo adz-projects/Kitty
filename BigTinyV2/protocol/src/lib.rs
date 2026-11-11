@@ -17,6 +17,7 @@
 
 pub mod discovery;
 pub mod events;
+pub mod systemone;
 
 pub use events::{serialize_sse, SSEEvent, SSEEventType};
 

@@ -21,16 +21,18 @@ use serde_json::{json, Map, Value};
 
 use super::backend::{DeciderBackend, DeciderError, ProbeResult};
 use super::{Answer, Answers, Question};
+use bigtiny2_protocol::systemone as wire;
+use bigtiny2_protocol::systemone::{argmax, as_prob, named_probs};
 
 /// Self-hosted System One (llama-server): the base URL is a server root and
 /// the route `/v1/systemone` is appended.
-pub const DIALECT: &str = "systemone";
+pub const DIALECT: &str = wire::DIALECT;
 
 /// Hosted System One (a gateway, aggregator, or Cloudflare Workers AI): the
 /// configured URL is the full endpoint and is POSTed to as-is, with an optional
 /// `Authorization: Bearer <api_key>` and an optional `model` id in the body.
 /// Answers may come back at the top level or wrapped under `result` (Cloudflare).
-pub const DIALECT_URL: &str = "systemone-url";
+pub const DIALECT_URL: &str = wire::DIALECT_URL;
 
 /// A ceiling for one request. Callers impose their own, much shorter budgets
 /// with `tokio::time::timeout`; this only stops a wedged socket from living
@@ -78,13 +80,13 @@ impl SystemOne {
         model: Option<String>,
         append_route: bool,
     ) -> Self {
-        let clean = url.trim().trim_end_matches('/');
-        let (base, endpoint) = if append_route {
-            let base = clean.trim_end_matches("/v1/systemone").trim_end_matches('/').to_string();
-            let endpoint = format!("{base}/v1/systemone");
-            (base, endpoint)
+        // The wire format lives in `bigtiny2_protocol::systemone`, shared with
+        // kitty-web's page check so the two cannot drift.
+        let endpoint = wire::endpoint(url, append_route);
+        let base = if append_route {
+            wire::base_url(url)
         } else {
-            (clean.to_string(), clean.to_string())
+            endpoint.clone()
         };
         Self {
             base,
@@ -160,11 +162,7 @@ pub fn request_body(state: &str, questions: &[(String, Question)], model: Option
         };
         qs.insert(name.clone(), v);
     }
-    let mut body = json!({ "state": state, "questions": qs });
-    if let Some(m) = model {
-        body["model"] = Value::String(m.to_string());
-    }
-    body
+    wire::request_body(state, qs, model)
 }
 
 /// Parse a response body against the questions that were asked. Answers may sit
@@ -172,10 +170,7 @@ pub fn request_body(state: &str, questions: &[(String, Question)], model: Option
 /// (Cloudflare Workers AI's REST envelope `{"result": {"answers": ...}}`).
 pub fn parse_answers(body: &Value, questions: &[(String, Question)]) -> Answers {
     let mut out = Answers::new();
-    let answers = body
-        .get("answers")
-        .or_else(|| body.get("result").and_then(|r| r.get("answers")));
-    let Some(answers) = answers.and_then(Value::as_object) else {
+    let Some(answers) = wire::answers(body) else {
         return out;
     };
     for (name, q) in questions {
@@ -189,39 +184,18 @@ pub fn parse_answers(body: &Value, questions: &[(String, Question)]) -> Answers 
     out
 }
 
-fn as_prob(v: &Value) -> Option<f32> {
-    v.as_f64()
-        .map(|p| p as f32)
-        .filter(|p| p.is_finite())
-        .map(|p| p.clamp(0.0, 1.0))
-}
-
 fn parse_one(raw: &Value, q: &Question) -> Option<Answer> {
     match q {
         Question::YesNo { .. } => {
-            let p = as_prob(raw)
-                .or_else(|| raw.get("noul").and_then(as_prob))
-                .or_else(|| raw.get("probability").and_then(as_prob))?;
+            let p = wire::parse_yes(raw)?;
             Some(Answer {
                 yes: Some(p),
                 ..Answer::default()
             })
         }
         Question::Choice { options, .. } => {
-            let probabilities = named_probs(raw.get("probabilities"), options.iter().map(|o| &o.0));
-            let choice = raw
-                .get("choice")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| argmax(&probabilities).map(|i| probabilities[i].0.clone()))?;
-            // The chosen option's own probability when there is one: the
-            // server's `confidence` is a separate calibration score, not
-            // P(choice) (d1 answers billing at P 0.984, confidence 0.976).
-            let confidence = probabilities
-                .iter()
-                .find(|(k, _)| *k == choice)
-                .map(|(_, p)| *p)
-                .or_else(|| raw.get("confidence").and_then(as_prob));
+            let names: Vec<String> = options.iter().map(|o| o.0.clone()).collect();
+            let (choice, confidence, probabilities) = wire::parse_choice(raw, &names)?;
             Some(Answer {
                 choice: Some(choice),
                 confidence,
@@ -262,32 +236,6 @@ fn parse_one(raw: &Value, q: &Question) -> Option<Answer> {
             })
         }
     }
-}
-
-/// Probabilities as `(name, p)` in the order of `names`, from either a map
-/// keyed by name or an array in that order. Empty when neither fits.
-fn named_probs<'a>(
-    v: Option<&Value>,
-    names: impl Iterator<Item = &'a String> + Clone,
-) -> Vec<(String, f32)> {
-    match v {
-        Some(Value::Object(m)) => names
-            .filter_map(|n| m.get(n).and_then(as_prob).map(|p| (n.clone(), p)))
-            .collect(),
-        Some(Value::Array(a)) => names
-            .zip(a.iter())
-            .filter_map(|(n, p)| as_prob(p).map(|p| (n.clone(), p)))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn argmax(probs: &[(String, f32)]) -> Option<usize> {
-    probs
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-        .map(|(i, _)| i)
 }
 
 #[async_trait]

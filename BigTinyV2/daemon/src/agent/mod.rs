@@ -1,3 +1,4 @@
+pub mod approval_policy;
 pub mod compaction;
 pub mod context;
 pub(crate) mod json_extract;
@@ -120,6 +121,8 @@ pub struct Agent {
     /// user of one — the loop, compaction, the memory hosts, the routes — can
     /// already reach the agent.
     decider: Arc<crate::decider::DeciderHub>,
+    /// Per-app automatic approval policies (`approval_policy`).
+    approval_policies: Arc<approval_policy::ApprovalPolicies>,
 }
 
 /// Removes the turn's `tasks` entry when the turn task ends — normally *or*
@@ -193,6 +196,7 @@ impl Agent {
         memorabilia: Arc<crate::plugins::MemorabiliaHost>,
     ) -> Self {
         let db_for_decider = db.clone();
+        let db_for_policies = db.clone();
         Self {
             db,
             router,
@@ -211,7 +215,13 @@ impl Agent {
             background_tasks: Arc::new(DashMap::new()),
             app_events: Arc::new(crate::server::app_events::AppEvents::new()),
             decider: Arc::new(crate::decider::DeciderHub::new(db_for_decider)),
+            approval_policies: Arc::new(approval_policy::ApprovalPolicies::new(db_for_policies)),
         }
+    }
+
+    /// The per-app automatic approval policies.
+    pub fn approval_policies(&self) -> &Arc<approval_policy::ApprovalPolicies> {
+        &self.approval_policies
     }
 
     /// The per-app decision models (`crate::decider`).
@@ -292,6 +302,7 @@ impl Agent {
         )
         .with_app_events(self.app_events.clone())
         .with_decider(self.decider.clone())
+        .with_approval_policies(self.approval_policies.clone())
     }
 
     /// Run one turn for `session_id` in the background, streaming events over

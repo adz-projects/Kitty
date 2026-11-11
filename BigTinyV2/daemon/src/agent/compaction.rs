@@ -1598,16 +1598,18 @@ async fn run_compaction_inner(
         summarizer_cfg.reserve_exchanges,
         (context_length as f64 * token_cfg.compaction_target_ratio) as i32,
     );
-    let candidate_rows: Vec<Value> = values
+    // Rows come in rowid order, so the candidates are a prefix: borrowed,
+    // not copied (the region can hold large tool outputs).
+    let candidate_len = values
         .iter()
-        .filter(|v| {
+        .take_while(|v| {
             v.get("rowid")
                 .and_then(|r| r.as_i64())
                 .map(|r| r < reserve_floor)
                 .unwrap_or(false)
         })
-        .cloned()
-        .collect();
+        .count();
+    let candidate_rows: &[Value] = &values[..candidate_len];
 
     if candidate_rows.is_empty() {
         // Everything still live is inside the reserve floor: the recent turns
@@ -1663,7 +1665,7 @@ async fn run_compaction_inner(
         return Err(CompactionSkip::BelowThreshold);
     }
 
-    let mut candidate_exchanges = group_into_exchanges(&candidate_rows);
+    let mut candidate_exchanges = group_into_exchanges(candidate_rows);
 
     // The decision model, when the app has one with `compaction` on, rates
     // each exchange: confident filler is left out of the summarizer prompt
@@ -1712,7 +1714,13 @@ async fn run_compaction_inner(
     let fold_budget = {
         let overhead =
             count_messages_tokens(&build_summarizer_prompt(existing_slots.as_ref(), &[]));
-        let budget = context_length
+        // With a local summarizer (Windows), chunks are sized to its own
+        // window, which is usually smaller than the chat model's: sized to
+        // the chat model's, a chunk never fit and the local leg was skipped.
+        let window = summarizer
+            .local_window()
+            .map_or(context_length, |w| w.min(context_length));
+        let budget = window
             .saturating_sub(overhead)
             .saturating_sub(SUMMARIZER_REPLY_RESERVE)
             .saturating_sub(SUMMARIZER_PROMPT_MARGIN);
@@ -1730,7 +1738,8 @@ async fn run_compaction_inner(
     let mut current_tokens: i64 = 0;
     let mut remaining_tokens = foldable_tokens;
 
-    for (i, exchange) in candidate_exchanges.iter().enumerate() {
+    // Exchanges are moved into chunks, not copied again.
+    for (i, exchange) in candidate_exchanges.into_iter().enumerate() {
         let exchange_tokens: i64 = exchange
             .iter()
             .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
@@ -1738,7 +1747,7 @@ async fn run_compaction_inner(
         // A dropped exchange rides along so the watermark passes it, but adds
         // nothing to the prompt, so it costs the chunk nothing.
         if dropped[i] {
-            current.extend(exchange.clone());
+            current.extend(exchange);
             remaining_tokens -= exchange_tokens;
             if remaining_tokens <= low_water as i64 {
                 break;
@@ -1754,7 +1763,7 @@ async fn run_compaction_inner(
             chunks.push(std::mem::take(&mut current));
             current_tokens = 0;
         }
-        current.extend(exchange.clone());
+        current.extend(exchange);
         current_tokens += exchange_tokens;
         remaining_tokens -= exchange_tokens;
 
@@ -1792,11 +1801,14 @@ async fn run_compaction_inner(
             let masked = apply_tool_mask(chunk, reserve_floor, token_cfg);
             let prompt = build_summarizer_prompt(Some(&merged), &masked);
             match summarizer
-                .structured_chat_for_session(
+                // A forced pass (the chat overflowed) never yields its slot:
+                // it is what lets the chat's next message fit.
+                .structured_chat_for_session_opts(
                     provider_id,
                     provider_model.clone(),
                     prompt,
                     &MEMORY_SLOTS_SCHEMA,
+                    !force,
                 )
                 .await
             {

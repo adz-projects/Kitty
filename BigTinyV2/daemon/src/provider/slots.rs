@@ -163,3 +163,58 @@ mod tests {
         );
     }
 }
+
+/// Which llama-server slot each chat uses, per provider: `(session, last
+/// used)` per slot.
+type SlotTable = std::collections::HashMap<String, Vec<Option<(String, std::time::Instant)>>>;
+
+fn slot_table() -> &'static std::sync::Mutex<SlotTable> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<SlotTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(SlotTable::new()))
+}
+
+/// The server slot for this chat's request: the slot it used last while it
+/// still holds it, else a free slot, else the least recently used one.
+/// Assigned by `hash(session) mod slots`, two active chats collided one time
+/// in four on a four-slot server, each turn of one evicting the other's
+/// cached prompt while other slots sat idle.
+pub fn assign_slot(provider_id: &str, session_id: &str, slots: usize) -> i32 {
+    let mut table = slot_table().lock().unwrap_or_else(|p| p.into_inner());
+    let entries = table.entry(provider_id.to_string()).or_default();
+    entries.resize(slots, None);
+    let now = std::time::Instant::now();
+    let pick = entries
+        .iter()
+        .position(|e| e.as_ref().is_some_and(|(s, _)| s == session_id))
+        .or_else(|| entries.iter().position(Option::is_none))
+        .unwrap_or_else(|| {
+            entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.as_ref().map(|(_, t)| *t))
+                .map_or(0, |(i, _)| i)
+        });
+    entries[pick] = Some((session_id.to_string(), now));
+    pick as i32
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::assign_slot;
+
+    #[test]
+    fn chats_get_distinct_slots_and_keep_them() {
+        let p = "slot-test-provider";
+        let a = assign_slot(p, "a", 2);
+        let b = assign_slot(p, "b", 2);
+        assert_ne!(a, b);
+        assert_eq!(assign_slot(p, "a", 2), a, "a chat keeps its slot");
+        // A third chat takes the least recently used slot (b's).
+        assert_eq!(assign_slot(p, "c", 2), b);
+    }
+}
+
+/// The slot key background summarizer calls (titles, learning, compaction,
+/// extraction) share: on a server with more than one slot they get a slot of
+/// their own instead of evicting a chat's cached prompt.
+pub const BACKGROUND_SLOT_KEY: &str = "__background__";

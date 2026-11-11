@@ -3,6 +3,7 @@ pub mod config;
 pub mod discovery;
 pub mod crypto;
 pub mod decider;
+pub mod embed_cache;
 pub mod env_contract;
 pub mod error;
 pub mod hitl;
@@ -178,6 +179,11 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
             );
         }
 
+        // One cache in front of the model for both memory engines.
+        let embedder = embedder.map(|e| {
+            Arc::new(embed_cache::SharedEmbedCache::new(e))
+                as Arc<dyn adaptive_pathway::embed::SemanticEmbedder>
+        });
         (ap_config, embedder)
     };
 
@@ -221,11 +227,14 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         }
     }
 
-    let summarizer = Arc::new(SummarizerChain::new(
-        local_summarizer,
-        router.clone(),
-        config.summarizer.clone(),
-    ));
+    #[cfg(all(windows, feature = "litert-engine"))]
+    let local_window = Some(litert::summarizer::LOCAL_WINDOW_TOKENS);
+    #[cfg(not(all(windows, feature = "litert-engine")))]
+    let local_window: Option<i32> = None;
+    let summarizer = Arc::new(
+        SummarizerChain::new(local_summarizer, router.clone(), config.summarizer.clone())
+            .with_local_window(local_window),
+    );
 
     // One background sweep per *live* engine, owned by the host. V1 spawned a
     // single loop here because there was a single engine; carrying that

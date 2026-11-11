@@ -517,56 +517,6 @@ const ABORTED_FOR_STEP_BUDGET: &str =
 /// `std::hash::DefaultHasher` — its output isn't stable across Rust
 /// versions/releases, which would defeat the point of a *stable* per-session
 /// slot assignment.
-/// Which llama-server slot each chat uses, per provider: `(session, last
-/// used)` per slot.
-type SlotTable = std::collections::HashMap<String, Vec<Option<(String, std::time::Instant)>>>;
-
-fn slot_table() -> &'static std::sync::Mutex<SlotTable> {
-    static TABLE: std::sync::OnceLock<std::sync::Mutex<SlotTable>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| std::sync::Mutex::new(SlotTable::new()))
-}
-
-/// The server slot for this chat's request: the slot it used last while it
-/// still holds it, else a free slot, else the least recently used one.
-/// Assigned by `hash(session) mod slots`, two active chats collided one time
-/// in four on a four-slot server, each turn of one evicting the other's
-/// cached prompt while other slots sat idle.
-fn assign_slot(provider_id: &str, session_id: &str, slots: usize) -> i32 {
-    let mut table = slot_table().lock().unwrap_or_else(|p| p.into_inner());
-    let entries = table.entry(provider_id.to_string()).or_default();
-    entries.resize(slots, None);
-    let now = std::time::Instant::now();
-    let pick = entries
-        .iter()
-        .position(|e| e.as_ref().is_some_and(|(s, _)| s == session_id))
-        .or_else(|| entries.iter().position(Option::is_none))
-        .unwrap_or_else(|| {
-            entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.as_ref().map(|(_, t)| *t))
-                .map_or(0, |(i, _)| i)
-        });
-    entries[pick] = Some((session_id.to_string(), now));
-    pick as i32
-}
-
-#[cfg(test)]
-mod slot_tests {
-    use super::assign_slot;
-
-    #[test]
-    fn chats_get_distinct_slots_and_keep_them() {
-        let p = "slot-test-provider";
-        let a = assign_slot(p, "a", 2);
-        let b = assign_slot(p, "b", 2);
-        assert_ne!(a, b);
-        assert_eq!(assign_slot(p, "a", 2), a, "a chat keeps its slot");
-        // A third chat takes the least recently used slot (b's).
-        assert_eq!(assign_slot(p, "c", 2), b);
-    }
-}
-
 #[allow(dead_code)]
 fn fnv1a64(s: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -1492,6 +1442,9 @@ mod derive_title_tests {
     }
 }
 
+/// A session's `(id, owner app, that app's default provider)`, cached per turn.
+type ScopeEntry = (String, Option<String>, Option<String>);
+
 /// Core agent loop: manages LLM turns, tool execution, HITL, and compaction.
 pub struct AgentLoop {
     /// Used only to resolve which app owns the session being run, and
@@ -1582,6 +1535,15 @@ pub struct AgentLoop {
     /// Per-app decision models (`crate::decider`). `None` in loops built
     /// without an `Agent` (some tests), which behave as if no app had one.
     decider: Option<Arc<crate::decider::DeciderHub>>,
+    /// Per-app automatic approval (`agent::approval_policy`).
+    approval_policies: Option<Arc<crate::agent::approval_policy::ApprovalPolicies>>,
+    /// The session's owner and that app's default provider, read once per
+    /// turn (a loop is built per turn): they were looked up five times or
+    /// more on every turn. `(session_id, owner, app default)`.
+    scope_cache: std::sync::Mutex<Option<ScopeEntry>>,
+    /// The previous user message, read once per turn for both memory
+    /// engines' recalls (see `previous_user_message`).
+    previous_user_cache: tokio::sync::OnceCell<Option<String>>,
     /// This turn's tool gate, when the app has tool gating on. Set in
     /// `run_inner`; read at dispatch (the safety valve, and recording a group
     /// whose hidden tool was called anyway) and at each step (a group loaded
@@ -1694,8 +1656,43 @@ impl AgentLoop {
             app_events: None,
             hitl_timeout: HITL_APPROVAL_TIMEOUT,
             decider: None,
+            approval_policies: None,
+            scope_cache: std::sync::Mutex::new(None),
+            previous_user_cache: tokio::sync::OnceCell::new(),
             gate: None,
             memorabilia_shown: None,
+        }
+    }
+
+    /// Give this loop the per-app automatic approval policies.
+    pub fn with_approval_policies(
+        mut self,
+        policies: Arc<crate::agent::approval_policy::ApprovalPolicies>,
+    ) -> Self {
+        self.approval_policies = Some(policies);
+        self
+    }
+
+    /// Whether `caller_app`'s policy approves this call without a pause:
+    /// its paths are inside the session's folders, its command is not one
+    /// the app calls sensitive, and the decision model's shell screen (when
+    /// the app has it on) does not flag it.
+    async fn auto_approved(&self, caller_app: &str, args: &Value, allowed_dirs: &[String]) -> bool {
+        let Some(policies) = &self.approval_policies else {
+            return false;
+        };
+        let Some(policy) = policies.for_app(caller_app).await else {
+            return false;
+        };
+        match policy.allows(args, allowed_dirs) {
+            None => false,
+            Some(None) => true,
+            Some(Some(command)) => match &self.decider {
+                Some(hub) => !crate::decider::shell_screen::screen(hub, caller_app, command)
+                    .await
+                    .is_some_and(|v| v.flagged),
+                None => true,
+            },
         }
     }
 
@@ -1799,10 +1796,7 @@ impl AgentLoop {
         // refuses it as outside its own home, and the model is left unable to
         // open a file the user just attached. See `mcp::kitty_grants`.
         if let (Some(app_id), false) = (
-            crate::storage::sessions::owner_of(&self.pool, session_id)
-                .await
-                .ok()
-                .flatten(),
+            self.app_scope(session_id).await.0,
             self.cache_dir.is_empty(),
         ) {
             crate::mcp::kitty_grants::publish(
@@ -1834,11 +1828,7 @@ impl AgentLoop {
         // server and so yields the shared pool alone -- a scheduled run on an
         // unexpected session keeps working with shared tools rather than
         // either failing or seeing everyone's.
-        let tool_scope = crate::storage::sessions::owner_of(&self.pool, session_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let tool_scope = self.app_scope(session_id).await.0.unwrap_or_default();
         let mut active_tools: Vec<ToolDefinition> = self.mcp.list_tools_for_app(&tool_scope);
 
         // Per-run narrowing, on top of the per-app scope above. A specialist
@@ -1984,6 +1974,7 @@ impl AgentLoop {
         // Independent lookups, so they run together: one after another, each
         // with its own budget, they could hold the request back several
         // seconds before it was sent.
+        let recall_started = std::time::Instant::now();
         let ((ap_hints, thought_seed, challenge), gate, mem_recalled, preflight_recalled) =
             tokio::join!(recall, gate, mem, preflight);
         if let Some(gate) = gate {
@@ -2002,7 +1993,15 @@ impl AgentLoop {
         // is grounded in something the user actually read. Waits for
         // Pathway's answer, so it cannot join the lookups above.
         let counter = match (&challenge, delegate) {
-            (Some(stance), false) => self.memorabilia_counterpoint(session_id, stance).await,
+            // What is left of the same recall budget, not a fresh one: the
+            // lookups above already spent their part of it. A short floor
+            // still lets a quick lookup through.
+            (Some(stance), false) => {
+                let left = Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS)
+                    .saturating_sub(recall_started.elapsed())
+                    .max(Duration::from_millis(250));
+                self.memorabilia_counterpoint(session_id, stance, left).await
+            }
             _ => None,
         };
         let ap_hints = [ap_hints, mem_hints, counter]
@@ -2392,16 +2391,34 @@ impl AgentLoop {
     }
 
     async fn app_scope(&self, session_id: &str) -> (Option<String>, Option<String>) {
-        let Ok(Some(app_id)) = crate::storage::sessions::owner_of(&self.pool, session_id).await
-        else {
-            return (None, None);
-        };
-        let default = crate::storage::apps::get_app(&self.pool, &app_id)
+        if let Some((sid, owner, default)) = self
+            .scope_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            if sid == session_id {
+                return (owner.clone(), default.clone());
+            }
+        }
+        let owner = crate::storage::sessions::owner_of(&self.pool, session_id)
             .await
             .ok()
-            .flatten()
-            .and_then(|a| a.default_provider_id);
-        (Some(app_id), default)
+            .flatten();
+        let default = match &owner {
+            Some(app_id) => crate::storage::apps::get_app(&self.pool, app_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|a| a.default_provider_id),
+            None => None,
+        };
+        // Only a found owner is remembered: a lookup that failed is retried.
+        if owner.is_some() {
+            *self.scope_cache.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some((session_id.to_string(), owner.clone(), default.clone()));
+        }
+        (owner, default)
     }
 
     /// Resolve a provider for this turn, scoped to the session's owning app.
@@ -3403,7 +3420,7 @@ impl AgentLoop {
                     .router
                     .parallel_slots(&provider_id)
                     .filter(|&n| n > 0)
-                    .map(|n| assign_slot(&provider_id, session_id, n as usize));
+                    .map(|n| crate::provider::slots::assign_slot(&provider_id, session_id, n as usize));
                 // Same reasoning as `id_slot` above: sampling is per-provider
                 // (a self-hosted endpoint gets a repetition-safe floor, a
                 // hosted one gets none — see `provider::sampling`), so it
@@ -4511,6 +4528,15 @@ impl AgentLoop {
     /// The latest stored user message of `session_id`, as text: during turn
     /// start, before the new message is saved, that is the previous one.
     async fn previous_user_message(&self, session_id: &str) -> Option<String> {
+        // Both recalls ask, at the same moment; one read serves them (a loop
+        // serves one session's turn).
+        self.previous_user_cache
+            .get_or_init(|| self.read_previous_user_message(session_id))
+            .await
+            .clone()
+    }
+
+    async fn read_previous_user_message(&self, session_id: &str) -> Option<String> {
         let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT content, content_format FROM messages              WHERE session_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
         )
@@ -4560,7 +4586,12 @@ impl AgentLoop {
     /// A documented counter-view to `stance` from this app's Memorabilia, as
     /// a block section, or `None` when it holds none (the model then gives
     /// the other side from its own knowledge, as `[Worth challenging]` asks).
-    async fn memorabilia_counterpoint(&self, session_id: &str, stance: &str) -> Option<String> {
+    async fn memorabilia_counterpoint(
+        &self,
+        session_id: &str,
+        stance: &str,
+        budget: Duration,
+    ) -> Option<String> {
         let engine_owned = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
             None => None,
@@ -4569,10 +4600,7 @@ impl AgentLoop {
         if engine.is_paused(session_id).await.unwrap_or(false) {
             return None;
         }
-        let view = tokio::time::timeout(
-            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
-            engine.counterpoint(stance),
-        )
+        let view = tokio::time::timeout(budget, engine.counterpoint(stance))
         .await
         .ok()
         .flatten()?;
@@ -5314,11 +5342,7 @@ impl AgentLoop {
         // private rules and no app's private servers -- so such a call gets
         // the shared pool and full approval prompts, rather than either
         // failing outright or inheriting someone else's consent.
-        let caller_app = crate::storage::sessions::owner_of(&self.pool, session_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let caller_app = self.app_scope(session_id).await.0.unwrap_or_default();
 
         // Resolve the HITL decision without holding the shared mutex across
         // `check_tool_call`'s DB rule query: `check_tool_call_with_rules` is
@@ -5413,7 +5437,23 @@ impl AgentLoop {
             );
         }
 
-        if decision.action == "needs_approval" && !preauthorized_for_unattended_run {
+        // The app's own "safe call" rule, applied here rather than by a round
+        // trip through the app (see `agent::approval_policy`). Same narrow
+        // eligibility as above: only the absence of any decision.
+        let auto_approved = decision.action == "needs_approval"
+            && !preauthorized_for_unattended_run
+            && decision.from_default_policy
+            && !escalated_by_containment
+            && self.auto_approved(&caller_app, &tool_args, allowed_dirs).await;
+        if auto_approved {
+            if let Some(action_id) = decision.pending_action_id.as_deref() {
+                let mut hitl = self.hitl.lock().await;
+                hitl.remove_pending(action_id);
+            }
+            tracing::debug!(session_id, tool_name, "approved by the app's policy");
+        }
+
+        if decision.action == "needs_approval" && !preauthorized_for_unattended_run && !auto_approved {
             let action_id = decision.pending_action_id.clone().unwrap_or_default();
 
             // No approver exists for this run, so there is nothing to wait for.

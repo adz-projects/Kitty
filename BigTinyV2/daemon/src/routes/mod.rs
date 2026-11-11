@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod apps;
 pub mod chat;
+pub mod approval_policy;
 pub mod decider;
 pub mod embeddings;
 pub mod events;
@@ -110,6 +111,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/apps/me/plugins/{plugin}",
             axum::routing::put(plugins::set).delete(plugins::clear),
+        )
+        .route(
+            "/api/apps/me/approval-policy",
+            get(approval_policy::get)
+                .put(approval_policy::put)
+                .delete(approval_policy::clear),
         )
         .route(
             "/api/apps/me/decider",

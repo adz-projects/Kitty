@@ -135,6 +135,11 @@ pub struct ListQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
+    /// Leave out each row's `memory_slots` (a chat's whole compaction
+    /// memory), which a list view does not show. Opt-in, so a client that
+    /// reads them from the list keeps getting them.
+    #[serde(default)]
+    pub slim: Option<bool>,
 }
 
 pub async fn list_sessions(
@@ -149,7 +154,19 @@ pub async fn list_sessions(
     let limit = query.limit.unwrap_or(50).clamp(0, 500);
     let offset = query.offset.unwrap_or(0).max(0);
     match sessions::list_sessions_page_for_app(&state.db, &identity.app_id, limit, offset).await {
-        Ok((rows, total)) => Json(json!({"sessions": rows, "total": total})).into_response(),
+        Ok((rows, total)) => {
+            let mut sessions = json!(rows);
+            if query.slim.unwrap_or(false) {
+                if let Some(list) = sessions.as_array_mut() {
+                    for row in list {
+                        if let Some(o) = row.as_object_mut() {
+                            o.remove("memory_slots");
+                        }
+                    }
+                }
+            }
+            Json(json!({"sessions": sessions, "total": total})).into_response()
+        }
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

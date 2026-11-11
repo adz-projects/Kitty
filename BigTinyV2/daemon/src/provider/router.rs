@@ -174,13 +174,42 @@ pub struct ProviderRouter {
     /// `cache_control`) — see `prompt_determinism.md`. Cloned into every
     /// registered provider the same way `tailscale` is.
     cache: CacheConfig,
+    /// Per provider, bumped whenever an interactive request is about to go
+    /// to a one-slot server: preemptible background calls in flight there
+    /// watch it and give the slot up (see [`Self::preempt_signal`]).
+    preempt: DashMap<String, tokio::sync::watch::Sender<u64>>,
 }
 
 impl ProviderRouter {
+    /// A receiver that changes when an interactive request needs this
+    /// provider's only slot. Background work that can be re-run later (titles,
+    /// learning, routine compaction, extraction) selects on it and drops its
+    /// request, which closes the connection and frees the slot; otherwise a
+    /// summarizer call for another chat could hold the slot for minutes while
+    /// the user waited.
+    pub fn preempt_signal(&self, provider_id: &str) -> tokio::sync::watch::Receiver<u64> {
+        self.preempt
+            .entry(provider_id.to_string())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    /// Tell preemptible background calls on `provider_id` to yield, when the
+    /// provider serves one request at a time.
+    fn signal_interactive(&self, provider_id: &str) {
+        if self.parallel_slots(provider_id) != Some(1) {
+            return;
+        }
+        if let Some(tx) = self.preempt.get(provider_id) {
+            tx.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+
     pub fn new(cache: CacheConfig) -> Self {
         Self {
             providers: DashMap::new(),
             queues: DashMap::new(),
+            preempt: DashMap::new(),
             tailscale: Arc::new(TailscaleClient::new()),
             cache,
         }
@@ -1009,6 +1038,9 @@ impl ProviderRouter {
         // through here — the tool loop, its retry/failover attempts, and the
         // three fire-and-forget turn-end tasks — so the queue is enforced in
         // one place rather than relying on each of them to remember.
+        if priority == Priority::Interactive {
+            self.signal_interactive(provider_id);
+        }
         let permit = self
             .queue_for(provider_id, concurrency)
             .acquire(app_id, priority)
@@ -1090,6 +1122,34 @@ impl Default for ProviderRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L2: only a one-slot provider's background calls are told to yield.
+    #[test]
+    fn an_interactive_request_preempts_background_work_on_a_one_slot_server_only() {
+        let router = ProviderRouter::default();
+        router.register_openai(
+            "one",
+            ProviderConfig {
+                parallel_slots: Some(1),
+                ..Default::default()
+            },
+        );
+        router.register_openai(
+            "four",
+            ProviderConfig {
+                parallel_slots: Some(4),
+                ..Default::default()
+            },
+        );
+        let mut one = router.preempt_signal("one");
+        let mut four = router.preempt_signal("four");
+        router.signal_interactive("one");
+        router.signal_interactive("four");
+        assert!(one.has_changed().unwrap());
+        assert!(!four.has_changed().unwrap());
+        one.mark_unchanged();
+        four.mark_unchanged();
+    }
 
     #[test]
     fn parallel_slots_reflects_the_registered_providers_own_config() {
