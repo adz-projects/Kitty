@@ -1507,3 +1507,33 @@ memorabilia had extracted propositions from 27 of 1,141 chunks, the last on
   `/api/memorabilia/stats` adds `extraction {pending, last_extracted_at,
   last_failure_at, last_failure}`. Both Health panels show them and say when
   work has waited 24 hours with nothing done (`settings/memoryHealth.ts`).
+
+## Audit fixes (1.0.7, engine 2.5.0)
+
+A read-through audit (`AUDIT_2026-11-10.md`) found about seventy bugs and
+inefficiencies; this release fixes most of them. The file's section 8 lists
+each item as fixed or not done, with the reason.
+
+**Engine API, 2.5.0** (all additive except the decider GET):
+- `GET /api/chat/{id}`: one session's row, delegates included. Kitty reads a
+  chat's metadata through it and falls back to paging the list on an older
+  engine.
+- `GET /api/chat/{id}/history?tool_call_id=`: one tool result.
+- `POST /api/chat/{id}/compact` with nothing folded adds `skip` (a code).
+- `session_title` is also published on `GET /api/apps/me/events`.
+- `DELETE /api/chat/{id}` also forgets the chat's own Pathway conversation
+  beliefs and state and Memorabilia's unpromoted captures.
+- `GET /api/apps/me/decider` no longer returns API keys: `api_key_set` and
+  `api_key_fingerprint` instead. Keys are sealed at rest. Kitty compares
+  fingerprints; another app that read a key back must do the same.
+
+**Memory engines**: writes outside a transaction take the transaction lock
+and nested transactions are savepoints, so a rollback can't undo another
+task's write; a learn pass commits in one transaction; reads outside a
+transaction use a read-only pool; Pathway's recall candidates are cached
+against a trigger-maintained counter (migration 008).
+
+**Compaction** recovers from overflow: a larger summarizer reply budget with
+truncated-JSON recovery, per-chunk commits under a drop-guarded lock, and
+forced passes that survive the next turn. Kitty reopens the chat when the
+engine's own pass lands.
