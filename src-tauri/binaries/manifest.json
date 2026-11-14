@@ -1,6 +1,6 @@
 {
-  "bigtiny": "409899fa1c8732467c4ea27166f452180daf4efd3fc2ebc6de5bfa9fbfd7dbb1",
-  "kitty-tools": "5a539ed6fbf2ef06741db3b001fd039a5e75af4e4293677afce2582332878cfa",
-  "kitty-wasm": "489cd7fffb8556b0f4218eee21542e78c73cb50ffe8dd240535bb2905f43020b",
-  "kitty-web": "beb4260fd5f888129832dd5863580bb70b7841288954b046112a59a8d284563a"
+  "bigtiny": "dc4cf2b4bb0ac399e9ba1a14409b271e8acf57b1ea235d4dde9314930a3e16ab",
+  "kitty-tools": "c373c596a8d76047ab3a832441d28fffc53f9837ae3a220624736afbb1587d8c",
+  "kitty-wasm": "d6fcdfcf822ae69372beed358b10726f85fdebf89f0f4f46776bc2bc38fdec93",
+  "kitty-web": "96ebf501f1ccacf9e52ffcdba9450e6bb154d15d92c6db6530b82021641533dd"
 }

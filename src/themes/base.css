@@ -736,16 +736,6 @@ button:disabled {
   margin: 4px 0;
   font-size: var(--fs-sm);
 }
-.tool-result-iframe {
-  display: block;
-  width: 100%;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  margin: 4px 0;
-  background: var(--surface);
-  transition: height 120ms ease-out;
-}
-
 /* Inline visualization result (diagram/table/chart) — same shell as
    .code-block so it reads as "rendered content", not a debugging aside. */
 .viz-card {
@@ -766,9 +756,16 @@ button:disabled {
   padding: 8px;
   background: var(--surface);
 }
-.viz-card-body .tool-result-iframe {
-  margin: 0;
-  border: none;
+/* Host of a figure's shadow root (lib/viz.ts; styled inside by
+   themes/viz.css). A figure wider than the column scrolls sideways here
+   rather than shrinking past legibility. `contain` keeps anything in the
+   figure's markup from being positioned outside this box. */
+.viz-card-body .viz-inline {
+  display: block;
+  padding: 8px 10px 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  contain: layout paint;
 }
 .viz-card-body pre {
   margin: 0;

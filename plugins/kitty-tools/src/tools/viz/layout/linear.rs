@@ -1,6 +1,6 @@
 //! `single_lane` — a straight sequential process, A -> B -> C. Wraps to
 //! additional rows instead of growing width without bound, since
-//! `assets/wrapper.html` scales the SVG to fill the iframe's width: an
+//! the chat scales an over-wide SVG down to fit its column: an
 //! 880px-wide diagram scales down cleanly, but a several-thousand-pixel-wide
 //! one renders its text down to a few illegible pixels. This is the direct
 //! fix for the old fixed `viewBox="0 0 880 220"`, which silently clipped
@@ -8,11 +8,14 @@
 
 use crate::tools::viz::layout::{draw_node, size_node, NodeVisual, GAP_X, GAP_Y, MIN_NODE_H};
 use crate::tools::viz::model::{Step, StepType};
-use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
+use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TOP_PAD};
 
 /// Content width budget per row before starting a new one.
-const ROW_MAX_W: f32 = 1100.0;
-const LEFT_X: f32 = 20.0;
+/// The width of the chat column, so a sequence wraps to a new row at its
+/// natural size instead of being scaled down to fit one long row.
+const ROW_MAX_W: f32 = 660.0;
+/// Stroke clearance only: diagrams sit flush left under their title.
+const LEFT_X: f32 = 2.0;
 
 struct Placed {
     x: f32,
@@ -59,7 +62,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
             current_row = row_of[i];
             x = LEFT_X;
         }
-        let row_top = TITLE_BAND + current_row as f32 * (row_h + GAP_Y);
+        let row_top = TOP_PAD + current_row as f32 * (row_h + GAP_Y);
         let node_top = row_top + (row_h - n.h) / 2.0;
         placed.push(Placed {
             x,
@@ -78,30 +81,22 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         let a = &placed[i];
         let b = &placed[i + 1];
         let ay = a.y + a.h / 2.0;
-        let by = b.y + b.h / 2.0;
         if a.row == b.row {
+            let by = b.y + b.h / 2.0;
             canvas.line(a.x + a.w, ay, b.x, by, "flow-path");
         } else {
-            // Serpentine connector: loop right past the wider of the two rows'
-            // content, then back down/left into the next row's first node.
-            let turn_x = (a.x + a.w).max(b.x) + 24.0;
+            // Row wrap, drawn square: out to the right of the row, down into
+            // the gutter between the rows, back across, and into the TOP of
+            // the next row's first node.
+            let ax = a.x + a.w;
+            let turn_x = ax + 16.0;
+            let gutter_y = b.y - (row_h - b.h) / 2.0 - GAP_Y / 2.0;
+            let bx = b.x + b.w / 2.0;
             let d = format!(
-                "M {:.1},{:.1} C {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}",
-                a.x + a.w,
-                ay,
-                turn_x,
-                ay,
-                turn_x,
-                by,
-                b.x,
-                by
+                "M {ax:.1},{ay:.1} L {turn_x:.1},{ay:.1} L {turn_x:.1},{gutter_y:.1} L {bx:.1},{gutter_y:.1} L {bx:.1},{:.1}",
+                b.y
             );
-            let bbox = (
-                a.x + a.w,
-                ay.min(by),
-                (turn_x - (a.x + a.w)).max(0.0),
-                (ay - by).abs(),
-            );
+            let bbox = (bx.min(ax), ay, turn_x - bx.min(ax), (b.y - ay).abs());
             canvas.path(&d, "flow-path", bbox);
         }
     }

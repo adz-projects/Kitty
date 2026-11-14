@@ -26,4 +26,6 @@
   --warn-bg: rgba(211, 171, 98, 0.11);
   --danger-bg: rgba(217, 140, 126, 0.11);
   --danger: #d98c7e;
+  /* Figures (themes/viz.css): the one colour beside ink and paper. */
+  --viz-accent: #f0705a;
 }

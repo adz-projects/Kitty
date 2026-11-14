@@ -300,7 +300,7 @@ fn long_flowchart_labels_stay_inside_their_node_boxes() {
     let html = html_of(&out);
 
     // Reuse the display-dpi-independent estimator the layout itself uses.
-    const NODE_FONT_PX: f32 = 12.5;
+    const NODE_FONT_PX: f32 = 13.0;
     let mut scan_from = 0;
     let mut text_count = 0;
     while let Some(rel) = html[scan_from..].find("<text ") {

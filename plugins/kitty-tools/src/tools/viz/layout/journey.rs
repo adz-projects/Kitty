@@ -11,11 +11,11 @@
 
 use crate::tools::viz::layout::NODE_FONT_PX;
 use crate::tools::viz::model::Step;
-use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
+use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TOP_PAD};
 use crate::tools::viz::text;
 
 const LEFT_GUTTER: f32 = 100.0;
-const MIN_COL_W: f32 = 160.0;
+const MIN_COL_W: f32 = 132.0;
 const STAGE_BAND_H: f32 = 50.0;
 const ACTION_BAND_H: f32 = 70.0;
 const SENTIMENT_BAND_H: f32 = 130.0;
@@ -24,15 +24,17 @@ const PAIN_BAND_H: f32 = 80.0;
 pub fn render(steps: &[Step]) -> (String, f32, f32) {
     let n = steps.len();
     // A journey can't wrap to extra rows (the horizontal axis is the stage
-    // order), so fit `MAX_CONTENT_W_WIDE` by capping the column width; stage
+    // order), so aim for `COMFORT_W` by capping the column width; stage
     // labels wrap to two lines to survive the cap. If even `MIN_COL_W` won't
     // fit, the centralized width check returns `VIZ_TOO_WIDE`.
     let natural_col = steps
         .iter()
-        .map(|s| text::measure_px(&s.text, NODE_FONT_PX) + 24.0)
+        .enumerate()
+        // Measured as drawn, with its "N. " prefix, so a label that fits its
+        // natural column is never wrapped by the prefix alone.
+        .map(|(i, s)| text::measure_px(&format!("{}. {}", i + 1, s.text), NODE_FONT_PX) + 24.0)
         .fold(MIN_COL_W, f32::max);
-    let budget_col =
-        (crate::tools::viz::layout::MAX_CONTENT_W_WIDE - LEFT_GUTTER) / n.max(1) as f32;
+    let budget_col = (crate::tools::viz::layout::COMFORT_W - LEFT_GUTTER) / n.max(1) as f32;
     let col_w = natural_col.min(budget_col.max(MIN_COL_W));
 
     let has_action = steps
@@ -43,7 +45,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         .iter()
         .any(|s| s.pain.as_deref().is_some_and(|t| !t.trim().is_empty()));
 
-    let stage_top = TITLE_BAND;
+    let stage_top = TOP_PAD;
     let action_top = stage_top + STAGE_BAND_H;
     let sentiment_top = action_top + if has_action { ACTION_BAND_H } else { 0.0 };
     let pain_top = sentiment_top + if has_sentiment { SENTIMENT_BAND_H } else { 0.0 };

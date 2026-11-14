@@ -535,6 +535,45 @@ for the whole daemon (`MCPServerManager::servers`), so the main agent and every
   spliced with the body content. `escape::render_template` does a single
   pass over the template instead.
 
+## Figures render inline, themed (replaces the iframe)
+
+- **Envelope**: `render_config` is now `{target: "inline", kind, title}` and
+  `html_payload` is a `<figure class="viz viz-{kind}">` *fragment* (caption +
+  SVG or table), a few KB, where it was a whole HTML document of ~60 KB with a
+  baked palette and a resize script. Kitty still renders the old
+  `target: "iframe"` documents held by saved chats, through the same path
+  (`parseVizPayload`, `sanitizeViz`).
+- **Why**: the sandboxed iframe was the cause of both standing complaints. Its
+  height came from a postMessage handshake that raced the SVG's layout
+  (frames too short, or of no height), and a frame cannot inherit the theme.
+  Mounted in a shadow root in the chat, a figure needs no sizing step — the
+  SVG carries its natural `width`/`height` and is scaled down, never up, to
+  the column — and takes its colours from the theme's custom properties.
+- **Sanitizing** is now Kitty's job (`dompurify`, `src/lib/viz.ts`): scripts,
+  links, embeds, forms, `foreignObject`, `use` and SMIL are forbidden; only
+  Mermaid may keep a stylesheet, and not one that references anything outside
+  the fragment. The app CSP is the backstop. The sanitizer tests run under
+  `jsdom`, because DOMPurify is a silent no-op under `happy-dom`.
+- **Chart layout rewritten** (`layout/chart.rs`) as a stack of bands that each
+  own their part of the canvas, which is what fixes labels landing on the
+  axes: category labels hang from the top of their band (a two-line label was
+  centred on its anchor and climbed onto the x-axis), the value-axis title has
+  its own row (it shared a baseline with the tallest bar's value label), and
+  the title is an HTML caption (it was SVG text clipped by a narrow canvas).
+  Labels that cannot fit are turned 45° with their room reserved, or — value
+  labels — dropped for the whole chart. One number format per chart, with
+  thousands separators and M/B abbreviation.
+- **Budgets**: layouts now aim for `COMFORT_W` (660px, the chat column) and
+  are accepted up to `MAX_CONTENT_W` (960; 1300 for swimlane/journey), down
+  from 1100/1500, since a figure is no longer stretched or shrunk to the card.
+- **Style**: `src/themes/viz.css` — a grotesque (Helvetica/Arial, the face the
+  width table in `viz/text.rs` is built from), flush-left captions under a
+  heavy rule, hairlines, square corners, ink and paper plus one red
+  (`--viz-accent`), hatching for further series, ruled tables. Decision nodes
+  are diamonds (were triangles) and connectors run square.
+- **Mermaid** is rendered with Mermaid's `base` theme and sentinel colours
+  that `mermaid.rs` rewrites to `var(--vz-*)`, so it follows the theme too.
+
 ## Diagram foolproofing + `generate_accessible_mermaid`
 
 - **No-overlap guarantees** (`plugins/kitty-tools/src/tools/viz/`): a

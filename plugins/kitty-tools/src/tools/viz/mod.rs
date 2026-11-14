@@ -6,10 +6,26 @@
 //!
 //! Every user-supplied string reaches SVG/HTML markup only through
 //! `render::svg`/`render::table`'s escaping primitives — this file (and every
-//! layout module) never `format!`s raw user text into markup directly. That
-//! replaces this module's old "explicitly not fixed: no HTML escaping"
-//! policy, which relied on the sandboxed iframe's opaque origin as the only
-//! backstop; the guarantee now lives in the render API surface itself.
+//! layout module) never `format!`s raw user text into markup directly.
+//!
+//! # What the payload is
+//!
+//! A **fragment**, not a document: `<figure class="viz viz-{kind}">` holding a
+//! `<figcaption>` title and the SVG or table. The host (Kitty's
+//! `VisualizationCard`) sanitizes it and mounts it *inline* in the chat, in a
+//! shadow root with its own stylesheet (`src/themes/viz.css`).
+//!
+//! It used to be a standalone HTML document for a sandboxed iframe, with the
+//! palette baked into a `<style>` block and a script that measured the body
+//! and posted its height to the host. Both halves of that were the product's
+//! standing complaints: the frame's height handshake raced the SVG's layout
+//! (frames too short, or zero), and a frame cannot inherit the app's theme (a
+//! white slab in a dark chat). Inline, there is no frame to size and the
+//! theme's custom properties simply inherit.
+//!
+//! So the markup here carries **class names only** — no colours, no fonts, no
+//! `<style>`, no scripts. `class_font_px` in `render::svg` and the constants in
+//! `layout` mirror the stylesheet's font sizes; nothing else is shared.
 
 pub use kitty_doc::tools::viz::escape;
 pub mod layout;
@@ -21,51 +37,42 @@ pub mod text;
 use crate::envelope::error_response;
 use serde_json::{json, Map, Value};
 
-const WRAPPER: &str = include_str!("assets/wrapper.html");
-const DEFS: &str = include_str!("assets/defs.svg");
+/// Arrowhead for diagram connectors. `refX="10"` puts the tip exactly on the
+/// path's end point, i.e. on the edge of the node it points at.
+const DIAGRAM_DEFS: &str = r#"<defs><marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1.5 L 10 5 L 0 8.5 z" class="arrow-head"/></marker></defs>"#;
 
-/// Wrap a body fragment in the standalone iframe document. `content_dims` is
-/// the SVG canvas `(width, height)` for diagram/chart payloads, which the
-/// wrapper's resize script uses to size the SVG deterministically (see
-/// `wrapper.html` trap #3); `None` for HTML tables, which the script measures
-/// directly. The numeric tokens are plain integers (not user text), so no
-/// escaping is needed for them.
-fn wrap_in_standalone_html_sized(
-    title: &str,
-    body_content: &str,
-    content_dims: Option<(f32, f32)>,
-) -> String {
-    // `TITLE` lands in the RCDATA `<title>…</title>` context, so it must be
-    // HTML-escaped (`<`, `>`, `&`; quotes are inert there) — otherwise a
-    // title like `</title><script>…` would close the element and execute.
-    // `BODY` is already-escaped SVG/HTML from the renderers and must NOT be
-    // double-escaped, so it passes through verbatim.
-    let escaped_title = escape::escape_text(title);
-    let (cw, ch) = match content_dims {
-        Some((w, h)) => (format!("{w:.0}"), format!("{h:.0}")),
-        None => (String::new(), String::new()),
+/// Engraver's fills for chart series: line, dot and cross hatching, so series
+/// stay distinguishable without colour. Ink and paper come from the host
+/// stylesheet via the `pat-*` classes.
+const CHART_DEFS: &str = r#"<defs><pattern id="hatch-a" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="5" height="5" class="pat-bg"/><line x1="0" y1="0" x2="0" y2="5" class="pat-line"/></pattern><pattern id="hatch-b" width="5" height="5" patternUnits="userSpaceOnUse"><rect width="5" height="5" class="pat-bg"/><circle cx="2.5" cy="2.5" r="1.1" class="pat-dot"/></pattern><pattern id="hatch-c" width="6" height="6" patternUnits="userSpaceOnUse"><rect width="6" height="6" class="pat-bg"/><path d="M0,0 L6,6 M6,0 L0,6" class="pat-cross"/></pattern></defs>"#;
+
+/// Wraps rendered content in the figure the host mounts: a flush-left caption
+/// (HTML, so a long title wraps instead of being clipped by a narrow canvas —
+/// it used to be SVG text centred on the drawing) above the content. `kind` is
+/// one of `chart`, `diagram`, `table`, `mermaid`.
+pub(crate) fn figure(kind: &str, title: &str, content: &str) -> String {
+    let caption = if title.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<figcaption class="viz-title">{}</figcaption>"#,
+            escape::escape_text(title)
+        )
     };
-    escape::render_template(
-        WRAPPER,
-        &[
-            ("TITLE", &escaped_title),
-            ("BODY", body_content),
-            ("CONTENT_W", &cw),
-            ("CONTENT_H", &ch),
-        ],
-    )
+    format!(r#"<figure class="viz viz-{kind}">{caption}{content}</figure>"#)
 }
 
-fn wrap_in_standalone_html(title: &str, body_content: &str) -> String {
-    wrap_in_standalone_html_sized(title, body_content, None)
-}
-
-fn success_payload(title: &str, html_payload: &str, warnings: &[String]) -> String {
+pub(crate) fn success_payload(
+    kind: &str,
+    title: &str,
+    html_payload: &str,
+    warnings: &[String],
+) -> String {
     let mut payload = Map::new();
     payload.insert("status".to_string(), json!("success"));
     payload.insert(
         "render_config".to_string(),
-        json!({"target": "iframe", "title": title, "sandbox": "allow-scripts"}),
+        json!({"target": "inline", "kind": kind, "title": title}),
     );
     payload.insert("html_payload".to_string(), json!(html_payload));
     if !warnings.is_empty() {
@@ -83,9 +90,8 @@ pub fn generate_accessible_table(
     if let Err(e) = model::validate_table(headers, rows) {
         return e;
     }
-    let fragment = render::table::render(title, headers, rows, summary);
-    let standalone = wrap_in_standalone_html(title, &fragment);
-    success_payload(title, &standalone, &[])
+    let table = render::table::render(title, headers, rows, summary);
+    success_payload("table", title, &figure("table", title, &table), &[])
 }
 
 pub fn generate_accessible_svg(
@@ -109,7 +115,7 @@ pub fn generate_accessible_svg(
 
     // Readability budget: layouts compress to fit, but anything still over
     // (e.g. an un-compressible swimlane/journey past their tighter node caps)
-    // would render illegibly small when the iframe scales it to its own width —
+    // would render illegibly small once the chat scales it down to its column —
     // better a helpful error than an unreadable diagram.
     let budget = match validated.diagram_type {
         model::DiagramType::Swimlane | model::DiagramType::JourneyMap => layout::MAX_CONTENT_W_WIDE,
@@ -125,15 +131,19 @@ pub fn generate_accessible_svg(
     }
 
     let svg = render::svg::document(
-        DEFS,
+        DIAGRAM_DEFS,
         &validated.title,
         &validated.description,
         width,
         height,
         &body,
     );
-    let standalone = wrap_in_standalone_html_sized(&validated.title, &svg, Some((width, height)));
-    success_payload(&validated.title, &standalone, &validated.warnings)
+    success_payload(
+        "diagram",
+        &validated.title,
+        &figure("diagram", &validated.title, &svg),
+        &validated.warnings,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,7 +162,7 @@ pub fn generate_accessible_chart(
 
     let (body, width, height) =
         layout::chart::render(chart_type, &categories, &series, x_label, y_label);
-    let svg = render::svg::document(DEFS, title, description, width, height, &body);
+    let svg = render::svg::document(CHART_DEFS, title, description, width, height, &body);
 
     // A hidden data table alongside the SVG gives screen readers the exact
     // numbers a chart otherwise only conveys visually (bar height, line
@@ -171,9 +181,8 @@ pub fn generate_accessible_chart(
         .collect();
     let sr_table = render::table::render_sr_only(title, &table_headers, &table_rows);
 
-    let combined = format!("{svg}\n{sr_table}");
-    let standalone = wrap_in_standalone_html_sized(title, &combined, Some((width, height)));
-    success_payload(title, &standalone, &[])
+    let combined = format!("{svg}{sr_table}");
+    success_payload("chart", title, &figure("chart", title, &combined), &[])
 }
 
 #[cfg(test)]
@@ -186,7 +195,8 @@ mod tests {
         let s = generate_accessible_table("T", &["A".to_string()], &[vec![json!(1)]], None);
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["status"], "success");
-        assert_eq!(v["render_config"]["target"], "iframe");
+        assert_eq!(v["render_config"]["target"], "inline");
+        assert_eq!(v["render_config"]["kind"], "table");
         assert!(v["html_payload"].as_str().unwrap().contains("<table"));
     }
 
@@ -240,33 +250,12 @@ mod tests {
     }
 
     #[test]
-    fn title_containing_body_token_does_not_splice_body_content() {
-        // Historical bug: `.replace("__TITLE__", t).replace("__BODY__", b)`
-        // would let a title containing the literal "__BODY__" get re-scanned
-        // by the second replace. `render_template` fixes this by construction.
-        let steps = vec![Step {
-            text: "Alpha".to_string(),
-            ..Default::default()
-        }];
-        let s =
-            generate_accessible_svg(DiagramType::SingleLane, "evil __BODY__ literal", "D", steps);
-        let v: Value = serde_json::from_str(&s).unwrap();
-        let html = v["html_payload"].as_str().unwrap();
-        assert!(html.contains("evil __BODY__ literal"));
-        assert!(
-            html.contains("Alpha"),
-            "the real body must still be present, not replaced by the title's literal token"
-        );
-    }
-
-    #[test]
-    fn title_containing_closing_tag_cannot_inject_script() {
-        // Historical XSS: the title was interpolated into the wrapper unescaped
-        // (`<title>__TITLE__</title>`), so a `</title><script>…` title escaped
-        // the element and executed — the `script-src 'unsafe-inline'` CSP made
-        // it worse. The title is now HTML-escaped before substitution.
+    fn title_cannot_break_out_of_the_caption() {
+        // Historical XSS: the title was once interpolated into the wrapper
+        // document unescaped. It is now the figure's caption and must arrive
+        // there as text.
         let s = generate_accessible_table(
-            "</title><script>alert(1)</script>",
+            "</figcaption><script>alert(1)</script>",
             &["A".to_string()],
             &[vec![json!(1)]],
             None,
@@ -274,13 +263,108 @@ mod tests {
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["status"], "success");
         let html = v["html_payload"].as_str().unwrap();
-        assert!(
-            !html.contains("</title><script"),
-            "title must not break out of the element: {html}"
+        assert!(!html.contains("<script"), "title must stay text: {html}");
+        assert!(html.contains("&lt;/figcaption&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    /// The payload is mounted inline in the app's own document, so it must be
+    /// inert and unstyled: a fragment, with no script, no stylesheet and no
+    /// colour of its own (the host themes it by class name).
+    #[test]
+    fn every_payload_is_an_inert_unstyled_fragment() {
+        let steps = vec![
+            Step {
+                id: Some("a".to_string()),
+                text: "Alpha".to_string(),
+                step_type: model::StepType::Start,
+                next: vec!["b".to_string()],
+                ..Default::default()
+            },
+            Step {
+                id: Some("b".to_string()),
+                text: "Beta?".to_string(),
+                step_type: model::StepType::Decision,
+                subtitle: Some("Check".to_string()),
+                ..Default::default()
+            },
+        ];
+        let series = vec![
+            ChartSeries {
+                name: "One".to_string(),
+                values: vec![1.0, -2.0],
+            },
+            ChartSeries {
+                name: "Two".to_string(),
+                values: vec![3.0, 4.0],
+            },
+        ];
+        let cats = vec!["Q1".to_string(), "Q2".to_string()];
+        let mut payloads = vec![
+            generate_accessible_table("T", &["A".to_string()], &[vec![json!(1)]], Some("S")),
+            generate_accessible_svg(DiagramType::Flowchart, "T", "D", steps),
+        ];
+        for chart_type in [
+            ChartType::Bar,
+            ChartType::GroupedBar,
+            ChartType::Line,
+            ChartType::HorizontalBar,
+        ] {
+            payloads.push(generate_accessible_chart(
+                chart_type,
+                "T",
+                "D",
+                cats.clone(),
+                series.clone(),
+                Some("x"),
+                Some("y"),
+            ));
+        }
+        for p in payloads {
+            let v: Value = serde_json::from_str(&p).unwrap();
+            assert_eq!(v["status"], "success", "{p}");
+            let html = v["html_payload"].as_str().unwrap();
+            assert!(html.starts_with("<figure class=\"viz viz-"), "{html}");
+            assert!(html.ends_with("</figure>"));
+            // The only `#` allowed is a reference to the fragment's own defs.
+            let scrubbed = html.to_lowercase().replace("url(#", "url(");
+            for banned in [
+                "<script", "<style", "<html", "<body", " style=", "#", "rgb(",
+            ] {
+                assert!(
+                    !scrubbed.contains(banned),
+                    "payload must not contain {banned:?}: {html}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn svg_carries_its_natural_size_so_the_host_never_has_to_measure() {
+        let s = generate_accessible_chart(
+            ChartType::Bar,
+            "T",
+            "D",
+            vec!["A".to_string()],
+            vec![ChartSeries {
+                name: "S".to_string(),
+                values: vec![1.0],
+            }],
+            None,
+            None,
         );
-        assert!(
-            html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
-            "title should appear HTML-escaped: {html}"
-        );
+        let v: Value = serde_json::from_str(&s).unwrap();
+        let html = v["html_payload"].as_str().unwrap();
+        let tag = &html[html.find("<svg").unwrap()..];
+        let tag = &tag[..tag.find('>').unwrap()];
+        let get = |name: &str| -> String {
+            tag.split(&format!(r#" {name}=""#))
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (w, h) = (get("width"), get("height"));
+        assert!(w.parse::<f32>().unwrap() > 0.0 && h.parse::<f32>().unwrap() > 0.0);
+        assert_eq!(get("viewBox"), format!("0 0 {w} {h}"));
     }
 }

@@ -11,11 +11,11 @@
 use std::collections::HashMap;
 
 use crate::tools::viz::layout::{
-    draw_node, size_node_capped, NodeVisual, GAP_X, MAX_CONTENT_W_WIDE, MAX_NODE_W, MIN_LAYER_GAP,
+    draw_node, size_node_capped, NodeVisual, COMFORT_W, GAP_X, MAX_NODE_W, MIN_LAYER_GAP,
     MIN_NODE_W,
 };
 use crate::tools::viz::model::{Step, StepType};
-use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
+use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TOP_PAD};
 use crate::tools::viz::text;
 
 const LEFT_MARGIN: f32 = 12.0;
@@ -57,7 +57,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         .fold(MIN_GUTTER, f32::max);
 
     // Readability compression: a swimlane can't wrap to extra rows without
-    // destroying lane semantics, so fit `MAX_CONTENT_W_WIDE` by tightening the
+    // destroying lane semantics, so fit `COMFORT_W` by tightening the
     // inter-node gap first, then shrinking the node-width cap. Past the cap
     // floor the centralized check in `viz/mod.rs` returns `VIZ_TOO_WIDE`.
     let mut cap = MAX_NODE_W;
@@ -71,7 +71,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
             + LEFT_MARGIN
             + sized.iter().map(|s| s.w).sum::<f32>()
             + gap * (n as f32 - 1.0).max(0.0);
-        if total <= MAX_CONTENT_W_WIDE {
+        if total <= COMFORT_W {
             break;
         }
         if gap > MIN_LAYER_GAP + 1.0 {
@@ -79,8 +79,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
             continue;
         }
         let nodes_sum: f32 = sized.iter().map(|s| s.w).sum();
-        cap = (cap
-            * (MAX_CONTENT_W_WIDE - gutter - LEFT_MARGIN - MIN_LAYER_GAP * (n as f32 - 1.0))
+        cap = (cap * (COMFORT_W - gutter - LEFT_MARGIN - MIN_LAYER_GAP * (n as f32 - 1.0))
             / nodes_sum)
             .clamp(MIN_NODE_W, MAX_NODE_W);
         sized = steps
@@ -95,7 +94,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         band_h[k] = band_h[k].max(sized[i].h + BAND_PAD + LANE_HEADER_H);
     }
     let mut band_top = vec![0.0f32; lanes_order.len()];
-    let mut acc = TITLE_BAND;
+    let mut acc = TOP_PAD;
     for k in 0..lanes_order.len() {
         band_top[k] = acc;
         acc += band_h[k];

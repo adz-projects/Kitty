@@ -1,5 +1,6 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useLayoutEffect, useMemo, useRef } from 'react';
 import type { ToolCall } from '@/stores/chatStore';
+import { mountViz, parseVizPayload, standaloneVizDocument } from '@/lib/viz';
 
 function stringify(v: unknown): string {
   if (v == null) return '';
@@ -11,124 +12,12 @@ function stringify(v: unknown): string {
   }
 }
 
-/** Shape produced by MCP tools that want their result rendered as an iframe
-    instead of raw JSON/text — currently `kitty-tools`'s
-    `generate_accessible_table`/`generate_accessible_svg`/
-    `generate_accessible_chart` tools (see `plugins/kitty-tools/src/tools/viz/
-    mod.rs`'s `success_payload`, which builds the `render_config` +
-    `html_payload` fields). Parsed defensively: any tool result that doesn't
-    match this exact shape falls back to plain text below. */
-interface IframeRenderPayload {
-  title?: string;
-  /** The iframe `sandbox` token list is FIXED here, not taken from the tool
-      payload — a crafted or buggy tool could otherwise pass `allow-scripts
-      allow-same-origin` (treating the srcDoc as same-origin with the app) or
-      `allow-top-navigation` (steering the whole window). `allow-scripts` alone
-      keeps the visualization's own JS working while it stays fully opaque. */
-  sandbox: string;
-  html: string;
-}
-
-function parseIframePayload(output: unknown): IframeRenderPayload | null {
-  if (typeof output !== 'string') return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(output);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== 'object' || parsed === null) return null;
-  const obj = parsed as Record<string, unknown>;
-  const renderConfig = obj.render_config;
-  if (typeof renderConfig !== 'object' || renderConfig === null) return null;
-  const rc = renderConfig as Record<string, unknown>;
-  if (rc.target !== 'iframe') return null;
-  const html = obj.html_payload;
-  if (typeof html !== 'string' || !html.trim()) return null;
-  return {
-    title: typeof rc.title === 'string' ? rc.title : undefined,
-    sandbox: 'allow-scripts',
-    html,
-  };
-}
-
 const VIZ_LABELS: Record<string, string> = {
   generate_accessible_svg: 'Diagram',
   generate_accessible_table: 'Table',
   generate_accessible_chart: 'Chart',
   generate_accessible_mermaid: 'Mermaid',
 };
-
-/** Sandboxed iframe rendering a tool-produced standalone HTML document
-    (`srcDoc`), auto-sized via the `mcp-iframe-resize` postMessage the
-    document posts on load/resize (see `wrap_in_standalone_html` in
-    `plugins/kitty-tools/src/tools/viz/mod.rs`, and the resize script baked
-    into `assets/wrapper.html`). Only trusts resize messages that actually
-    originate from this iframe's own content window.
-
-    The listener goes on in a *layout* effect, not a passive one: React runs
-    passive effects after paint, which can land after the srcDoc document has
-    already loaded and posted its height — losing the only message that would
-    ever grow the card past the placeholder height. Layout effects run in the
-    same commit as the DOM insert, before the iframe's document can load.
-
-    Belt and braces on top of that, since the wrapper script ships inside the
-    `kitty-tools` sidecar and an installed build may predate it: ask the
-    document to re-measure on our own `load`, and again whenever the iframe's
-    width changes (the visualization SVG is width-driven, so its height moves
-    with it). */
-function ToolResultIframe({ payload }: { payload: IframeRenderPayload }) {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [height, setHeight] = useState(120);
-
-  useLayoutEffect(() => {
-    function onMessage(e: MessageEvent) {
-      if (e.source !== iframeRef.current?.contentWindow) return;
-      const data = e.data as { type?: string; height?: number } | null;
-      if (data?.type === 'mcp-iframe-resize' && typeof data.height === 'number') {
-        // Ceiling raised from 4000 (item 4): the content side now sizes SVGs
-        // deterministically from their true aspect ratio, so a tall-but-narrow
-        // diagram/chart legitimately reports > 4000px and would otherwise be
-        // clipped by the old clamp (the frame has overflow-y hidden).
-        setHeight(Math.max(40, Math.min(data.height, 12000)));
-      }
-    }
-    window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  }, []);
-
-  const requestMeasure = () => {
-    iframeRef.current?.contentWindow?.postMessage({ type: 'mcp-iframe-measure' }, '*');
-  };
-
-  useEffect(() => {
-    const el = iframeRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    // Width only — reacting to our own height changes would just echo the
-    // resize we were told to make.
-    let lastWidth = el.clientWidth;
-    const ro = new ResizeObserver(() => {
-      const w = iframeRef.current?.clientWidth ?? lastWidth;
-      if (w === lastWidth) return;
-      lastWidth = w;
-      requestMeasure();
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  return (
-    <iframe
-      ref={iframeRef}
-      className="tool-result-iframe"
-      title={payload.title ?? 'Tool visualization'}
-      srcDoc={payload.html}
-      sandbox={payload.sandbox}
-      onLoad={requestMeasure}
-      style={{ height }}
-    />
-  );
-}
 
 // Pending blob-URL revokes from `openInNewWindow`, tracked so they can be
 // cancelled at teardown (multiple visualization cards → several 30s timers
@@ -151,6 +40,7 @@ if (typeof window !== 'undefined') {
 }
 
 function openInNewWindow(html: string) {
+  if (!html) return;
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
   window.open(url, '_blank');
   // Revoked after a delay rather than immediately — the new tab needs the
@@ -158,7 +48,7 @@ function openInNewWindow(html: string) {
   revokeLater(url);
 }
 
-/** A viz tool didn't hand back a parseable iframe envelope. Distinguish the
+/** A viz tool didn't hand back a parseable envelope. Distinguish the
     actionable "payload was cut off" case (truncation marker) from a harder
     failure, so we never dump a giant raw JSON blob for what should be a
     diagram. */
@@ -173,9 +63,14 @@ function truncationMessage(output: unknown): string | null {
     same way a fenced code block is: always mounted, no expand click needed.
     Distinct from `ToolCallCard` (which stays collapsed-by-default for every
     other tool) because a diagram/table/chart *is* the answer the user asked
-    for, not a debugging aside. */
+    for, not a debugging aside.
+
+    The figure is mounted in a shadow root on a plain element of the chat —
+    see `lib/viz.ts` for why that replaced the sandboxed iframe. The mount
+    happens in a layout effect, so the figure is in the first painted frame at
+    its final size: nothing is measured and nothing resizes afterwards. */
 export const VisualizationCard = memo(function VisualizationCard({ call }: { call: ToolCall }) {
-  const payload = useMemo(() => parseIframePayload(call.output), [call.output]);
+  const payload = useMemo(() => parseVizPayload(call.output), [call.output]);
   const truncMsg = useMemo(
     () => (payload ? null : truncationMessage(call.output)),
     [payload, call.output]
@@ -187,18 +82,32 @@ export const VisualizationCard = memo(function VisualizationCard({ call }: { cal
   const label = (call.toolName && VIZ_LABELS[call.toolName]) || call.title || 'Visualization';
   const isSettled = call.status !== 'pending' && call.status !== 'running';
 
+  const hostRef = useRef<HTMLDivElement>(null);
+  const html = payload?.html;
+  useLayoutEffect(() => {
+    if (hostRef.current && html) mountViz(hostRef.current, html);
+  }, [html]);
+
   return (
     <div className="viz-card">
       <div className="viz-card-head">
         <span className="code-lang">{label}</span>
         <div className="code-actions">
           {payload && (
-            <button onClick={() => openInNewWindow(payload.html)}>Open in new window</button>
+            <button
+              onClick={() => {
+                if (hostRef.current) {
+                  openInNewWindow(standaloneVizDocument(hostRef.current, payload.title ?? label));
+                }
+              }}
+            >
+              Open in new window
+            </button>
           )}
         </div>
       </div>
       <div className="viz-card-body">
-        {payload && <ToolResultIframe payload={payload} />}
+        {payload && <div ref={hostRef} className="viz-inline" />}
         {truncMsg && <div className="muted viz-truncated">{truncMsg}</div>}
         {!payload && !truncMsg && outputText && (
           <pre className={call.status === 'failed' ? 'viz-error' : undefined}>{outputText}</pre>

@@ -11,12 +11,15 @@ use crate::tools::viz::text;
 /// Space reserved on the right/bottom of every diagram beyond the furthest
 /// content actually drawn.
 pub const CANVAS_MARGIN: f32 = 20.0;
-/// Vertical space reserved at the top of every diagram for the title text that
-/// `document()` draws; layout modules place their own content at or below this
-/// y-coordinate.
-pub const TITLE_BAND: f32 = 55.0;
+/// Clear space above the first drawn element. The title is no longer drawn
+/// inside the SVG (it is an HTML `<figcaption>` — see `viz::figure` — so it can
+/// wrap instead of being clipped by a narrow canvas); this is only breathing
+/// room, and layout modules place their content at or below this y-coordinate.
+pub const TOP_PAD: f32 = 6.0;
 
-/// Font size (px) for each CSS class, mirroring `assets/defs.svg`. Used by the
+/// Font size (px) for each CSS class, mirroring the host stylesheet
+/// (`src/themes/viz.css` in the app — the markup carries class names only, no
+/// colours or sizes, so the two must be kept in step). Used by the
 /// text primitives so they can fold their *measured* extent into `Bounds` —
 /// the old code only recorded the text anchor point, so a label wider than the
 /// box/container it sat in was invisible to the layout's width/height budget,
@@ -25,21 +28,19 @@ pub const TITLE_BAND: f32 = 55.0;
 /// truth and no caller churn.
 pub fn class_font_px(class: &str) -> f32 {
     match class {
-        "title-text" => 18.0,
-        "node-text" => 12.5,
-        "pain-text" => 10.5,
-        "badge-meta" => 8.5,
+        "node-text" | "node-text inverse" => 13.0,
+        "pain-text" => 11.5,
+        "badge-meta" => 9.5,
         "tag-text-light" | "tag-text-dark" => 10.0,
-        "lane-header" => 11.0,
-        "axis-label" | "axis-label-end" => 10.5,
-        "axis-title" | "axis-title-center" => 11.0,
-        "value-label" | "value-label-start" => 9.5,
-        "legend-text" => 11.0,
-        _ => 12.5,
+        "lane-header" => 10.5,
+        "tick-label" | "tick-label-mid" | "cat-label" | "cat-label-start" | "cat-label-rot"
+        | "axis-title" | "legend-text" => 11.5,
+        "value-label" | "value-label-start" | "value-label-end" => 11.0,
+        _ => 13.0,
     }
 }
 
-/// SVG `text-anchor` for each label class, mirroring `assets/defs.svg`. Most
+/// SVG `text-anchor` for each label class, mirroring the host stylesheet. Most
 /// label classes are `middle`; a handful are `start` (axis titles, legend,
 /// right-aligned value labels, lane headers) or `end` (right-aligned tick
 /// labels). Used by [`include_text`] so `Bounds` records the true bottom-right
@@ -56,8 +57,10 @@ enum TextAnchor {
 
 fn class_text_anchor(class: &str) -> TextAnchor {
     match class {
-        "axis-title" | "legend-text" | "value-label-start" | "lane-header" => TextAnchor::Start,
-        "axis-label-end" => TextAnchor::End,
+        "axis-title" | "legend-text" | "value-label-start" | "cat-label-start" | "lane-header" => {
+            TextAnchor::Start
+        }
+        "tick-label" | "value-label-end" | "cat-label-rot" => TextAnchor::End,
         _ => TextAnchor::Middle,
     }
 }
@@ -77,6 +80,33 @@ fn include_text(bounds: &mut Bounds, x: f32, y: f32, content: &str, font_size: f
         TextAnchor::End => x,
     };
     bounds.include_rect(right - w, y - half_h, w, 2.0 * half_h);
+}
+
+/// Connectors carry their arrowhead as a `marker-end` *attribute* rather than
+/// through the stylesheet: a `url(#id)` in an attribute resolves in the
+/// element's own tree, wherever the host mounts the fragment.
+fn arrow_marker(class: &str) -> &'static str {
+    if class == "flow-path" {
+        r##" marker-end="url(#arrow)""##
+    } else {
+        ""
+    }
+}
+
+/// Likewise the hatched chart series (`bar-2`, `bar-4`, `bar-5`) reference
+/// their `<pattern>` by attribute. The solid series are filled by the
+/// stylesheet, which therefore must not set `fill` on these three.
+fn pattern_fill(class: &str) -> &'static str {
+    let has = |token: &str| class.split(' ').any(|t| t == token);
+    if has("bar-2") {
+        r##" fill="url(#hatch-a)""##
+    } else if has("bar-4") {
+        r##" fill="url(#hatch-b)""##
+    } else if has("bar-5") {
+        r##" fill="url(#hatch-c)""##
+    } else {
+        ""
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -141,8 +171,9 @@ impl SvgCanvas {
 
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, class: &str) {
         self.bounds.include_rect(x, y, w, h);
+        let fill = pattern_fill(class);
         self.body.push_str(&format!(
-            r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" class="{class}"/>"#
+            r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" class="{class}"{fill}/>"#
         ));
         self.body.push('\n');
     }
@@ -262,10 +293,55 @@ impl SvgCanvas {
         self.body.push('\n');
     }
 
+    /// Multi-line label whose FIRST baseline sits at `y`, each further line
+    /// stepping down by `line_h`. Unlike `text_lines` (which centres the block
+    /// on `y` and so grows upward as lines are added) this can only ever grow
+    /// downward — what an axis label hanging below a rule needs, so that a
+    /// second line never climbs back onto the axis.
+    pub fn text_lines_top(&mut self, x: f32, y: f32, class: &str, lines: &[String], line_h: f32) {
+        if lines.is_empty() {
+            return;
+        }
+        let font_px = class_font_px(class);
+        let mut tspans = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            include_text(
+                &mut self.bounds,
+                x,
+                y + i as f32 * line_h,
+                line,
+                font_px,
+                class,
+            );
+            let dy = if i == 0 { 0.0 } else { line_h };
+            tspans.push_str(&format!(
+                r#"<tspan x="{x:.1}" dy="{dy:.1}">{}</tspan>"#,
+                escape_text(line)
+            ));
+        }
+        self.body.push_str(&format!(
+            r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#
+        ));
+        self.body.push('\n');
+    }
+
+    /// A single line rotated `degrees` about its own anchor point. The caller
+    /// accounts for the rotated extent itself (see `layout::chart`), so only
+    /// the anchor is folded into `Bounds`.
+    pub fn text_rotated(&mut self, x: f32, y: f32, class: &str, content: &str, degrees: f32) {
+        self.bounds.include_point(x, y);
+        self.body.push_str(&format!(
+            r#"<text x="{x:.1}" y="{y:.1}" class="{class}" transform="rotate({degrees:.0} {x:.1} {y:.1})">{}</text>"#,
+            escape_text(content)
+        ));
+        self.body.push('\n');
+    }
+
     pub fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, class: &str) {
         self.bounds.include_point(x1.max(x2), y1.max(y2));
+        let marker = arrow_marker(class);
         self.body.push_str(&format!(
-            r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" class="{class}"/>"#
+            r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" class="{class}"{marker}/>"#
         ));
         self.body.push('\n');
     }
@@ -291,8 +367,9 @@ impl SvgCanvas {
     pub fn path(&mut self, d: &str, class: &str, bbox: (f32, f32, f32, f32)) {
         let (x, y, w, h) = bbox;
         self.bounds.include_rect(x, y, w, h);
+        let marker = arrow_marker(class);
         self.body
-            .push_str(&format!(r#"<path d="{d}" class="{class}"/>"#));
+            .push_str(&format!(r#"<path d="{d}" class="{class}"{marker}/>"#));
         self.body.push('\n');
     }
 
@@ -306,7 +383,7 @@ impl SvgCanvas {
 
     /// Appends a pre-built fragment verbatim without touching bounds or
     /// escaping. Only ever used for the shared, static, trusted `<defs>`
-    /// fragment provided by `assets/defs.svg` — never for anything derived
+    /// `<defs>` fragments in `viz/mod.rs` — never for anything derived
     /// from a tool caller's input.
     pub fn raw_trusted_defs(&mut self, s: &str) {
         self.body.push_str(s);
@@ -318,10 +395,14 @@ impl SvgCanvas {
     }
 }
 
-/// Wraps a laid-out body fragment into a complete, standalone `<svg>`
-/// document: the shared `<defs>`, a full-canvas background rect, the title
-/// bar, and `<title>`/`<desc>` for screen readers. `width`/`height` should
+/// Wraps a laid-out body fragment into a complete `<svg>` element: the shared
+/// `<defs>` plus `<title>`/`<desc>` for screen readers. `width`/`height` should
 /// already include `CANVAS_MARGIN`.
+///
+/// The element carries its natural pixel size (`width`/`height` alongside the
+/// `viewBox`) so the host can show it 1:1 — type stays the size it was laid out
+/// at — and derive its aspect ratio without measuring anything. It carries no
+/// colours, fonts or background: the host stylesheet themes it by class name.
 pub fn document(
     defs: &str,
     title: &str,
@@ -333,20 +414,13 @@ pub fn document(
     let title_attr = escape_attr(title);
     let title_text = escape_text(title);
     let desc_text = escape_text(description);
-    let cx = width / 2.0;
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0} {height:.0}" width="100%" role="img" aria-label="{title_attr}">
-    <title>{title_text}</title>
-    <desc>{desc_text}</desc>
-    {defs}
-
-    <rect width="100%" height="100%" class="canvas-bg"/>
-    <text x="{cx:.1}" y="35" class="title-text">{title_text}</text>
-    {body}
-</svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0} {height:.0}" width="{width:.0}" height="{height:.0}" class="viz-svg" role="img" aria-label="{title_attr}">
+<title>{title_text}</title>
+<desc>{desc_text}</desc>
+{defs}
+{body}</svg>"#
     )
-    .trim()
-    .to_string()
 }
 
 #[cfg(test)]
@@ -445,7 +519,7 @@ mod tests {
         // not `x + w/2`. It must not inflate `Bounds` past `x`.
         let s = "right-aligned tick label";
         let mut c = SvgCanvas::new();
-        c.text_line(0.0, 0.0, "axis-label-end", s);
+        c.text_line(0.0, 0.0, "tick-label", s);
         let bounds = c.bounds();
         assert!(
             bounds.width() <= 0.01,

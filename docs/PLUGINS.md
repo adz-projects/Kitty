@@ -304,13 +304,24 @@ still over is rejected (`VIZ_TOO_WIDE`) rather than rendered illegibly small.
 headers clear of nodes, budget respected).
 
 `generate_accessible_mermaid` (added alongside) does **not** share those
-layout guarantees: Mermaid has no Rust renderer, so the vendored Mermaid.js
-runtime (`plugins/kitty-tools/src/tools/viz/assets/mermaid.min.js`, MIT — see
-`mermaid.LICENSE`) is inlined into each result's HTML payload and rendered
-client-side in the sandboxed iframe. Its "foolproof" contract is *guaranteed
-degradation, never a blank frame*: the server rejects empty/oversized
-sources, and a parse/render error shows the raw source in an error card. Cost:
-about 3 MB per Mermaid result (the JS library rides along in the payload).
+layout guarantees: its layout is Mermaid's, rendered server-side to a static
+SVG by the Merman crate (`viz/mermaid.rs`); no JavaScript ships in a result.
+Its "foolproof" contract is *guaranteed degradation, never a blank frame*: the
+server rejects empty/oversized sources, and a parse/render failure returns an
+error envelope.
+
+**How a figure reaches the screen.** Each of the four tools returns a
+`<figure>` fragment — class names only, no colours, fonts, styles or scripts —
+in the `html_payload` of an envelope whose `render_config.target` is
+`inline`. Kitty sanitizes it (DOMPurify, with every scripting, linking,
+embedding and form element forbidden) and mounts it in a shadow root in the
+chat itself (`src/lib/viz.ts`, `VisualizationCard`), styled by
+`src/themes/viz.css`, whose colours are the theme's (`--viz-*`, documented in
+`src/themes/README.md`). Mermaid is the one exception to "class names only":
+it is rendered with a palette of sentinel colours that `mermaid.rs` rewrites to
+the same theme properties. Font sizes are the single thing shared between the
+two sides: the layout code measures text at the sizes `viz.css` sets, so the
+two change together (`class_font_px`, the constants in `layout/`).
 
 **Tauri validates every `externalBin` entry exists on disk at build time —
 even for a plain `cargo build`, not just packaging.** The real binaries are

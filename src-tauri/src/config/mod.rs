@@ -258,8 +258,8 @@ pub struct Config {
     /// advertised by the combined `kitty-tools` server — no longer its own
     /// process (`visualizations` is retired). On by default — like
     /// `wasm_math_mcp_enabled`, it's a safe, broadly useful, credential-free
-    /// tool (accessible HTML tables/SVG diagrams rendered client-side in an
-    /// iframe). Drives kitty-tools's `KITTY_VIZ_ENABLED` env var.
+    /// tool (accessible HTML tables/SVG diagrams, rendered inline in the
+    /// chat). Drives kitty-tools's `KITTY_VIZ_ENABLED` env var.
     #[serde(default = "default_true")]
     pub visualizations_enabled: bool,
     /// Whether the bundled `kitty-tools` server (see `plugins/kitty-tools/`)

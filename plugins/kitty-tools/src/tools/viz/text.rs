@@ -2,12 +2,16 @@
 //!
 //! No font is embedded. A font crate (`fontdue`/`ab_glyph`) would need a bundled
 //! font file (300KB-1MB) in an exe that is frozen and shipped as an `externalBin`,
-//! and the precision it buys is illusory anyway: the iframe renders with whatever
-//! `system-ui` resolves to on the *user's* machine (Segoe UI Variable on Windows,
-//! SF Pro on macOS), not the font we'd embed. A static advance-width table (from
-//! Helvetica's public AFM metrics, which track Segoe UI/SF Pro/Roboto for Latin
-//! glyphs at UI sizes within a few percent) plus a safety margin gets the thing
-//! that actually matters — no node clipping its own label — without that cost.
+//! and the precision it buys is illusory anyway: the host renders with a font
+//! from the *user's* machine, not one we'd embed. A static advance-width table
+//! from Helvetica's public AFM metrics gets the thing that actually matters — no
+//! node clipping its own label — without that cost.
+//!
+//! The host stylesheet (`src/themes/viz.css` in the app) asks for exactly that
+//! family: Helvetica, then Arial, which was drawn to Helvetica's widths. On
+//! Windows and macOS a measured width is therefore the rendered width; the
+//! safety margin covers the bold weights and the platforms (Android's Roboto)
+//! where the face is only close.
 
 use std::collections::VecDeque;
 

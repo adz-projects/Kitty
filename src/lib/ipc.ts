@@ -510,7 +510,7 @@ export const ipc = {
   getKittyWasmEnabled: () => invoke<boolean>('get_kitty_wasm_enabled'),
   setKittyWasmEnabled: (enabled: boolean) => invoke<void>('set_kitty_wasm_enabled', { enabled }),
   // Whether the accessible tables/SVG diagrams tools are advertised by the
-  // combined kitty-tools server (renders its results in an iframe in chat) —
+  // combined kitty-tools server (its results render inline in chat) —
   // on by default, no credentials. Toggling this alone doesn't restart a
   // separate process; it flips an env var on kitty-tools's registration.
   getVisualizationsEnabled: () => invoke<boolean>('get_visualizations_enabled'),

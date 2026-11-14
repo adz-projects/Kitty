@@ -17,38 +17,52 @@ pub const MIN_NODE_W: f32 = 110.0;
 pub const MAX_NODE_W: f32 = 220.0;
 pub const PAD_X: f32 = 14.0;
 pub const PAD_Y: f32 = 12.0;
-/// Matches the 12.5px `.node-text` rule in `assets/defs.svg`.
-pub const NODE_FONT_PX: f32 = 12.5;
-pub const LINE_H: f32 = 15.0;
-/// Matches the 8.5px `.badge-meta` rule in `assets/defs.svg`.
-pub const BADGE_FONT_PX: f32 = 8.5;
+/// Matches the 13px `.node-text` rule in the host stylesheet
+/// (`src/themes/viz.css` in the app).
+pub const NODE_FONT_PX: f32 = 13.0;
+pub const LINE_H: f32 = 16.0;
+/// Matches the 9.5px `.badge-meta` rule in the host stylesheet.
+pub const BADGE_FONT_PX: f32 = 9.5;
 pub const MAX_LINES: usize = 3;
 pub const MIN_NODE_H: f32 = 40.0;
 pub const GAP_X: f32 = 32.0;
 pub const GAP_Y: f32 = 56.0;
 
-/// Decision (triangle) nodes: a triangle narrows to a point at its apex, so it
-/// offers far less label room than its bounding box implies. These constants
-/// keep the label inside the widest (lower) band of the triangle by wrapping
-/// narrower, bottom-anchoring the block, and reserving enough height that the
-/// topmost line still sits where the triangle is wide enough. `0.60` label
-/// width vs. `~0.675` available at the top line (see `size_decision`) leaves a
-/// built-in margin so the `textLength` backstop never has to squeeze text.
-pub const DECISION_MIN_W: f32 = 150.0;
-pub const DECISION_MIN_H: f32 = 120.0;
+/// Decision nodes are diamonds: a diamond is only as wide as its box at the
+/// middle and narrows to a point above and below, so it offers far less label
+/// room than its bounding box implies. The label is wrapped to `0.60` of the
+/// width and set as a block centred `DECISION_LABEL_DROP` below the middle
+/// (leaving the upper half for the caption); with two lines the block's outer
+/// edge is ~0.57 of the height from a vertex, so the `textLength` backstop
+/// never has to squeeze text. `layout::tests` asserts that arithmetic directly.
+pub const DECISION_MIN_W: f32 = 160.0;
+pub const DECISION_MIN_H: f32 = 112.0;
 pub const DECISION_LABEL_FRAC: f32 = 0.60;
-pub const DECISION_BADGE_FRAC: f32 = 0.22;
-pub const DECISION_BASE_MARGIN: f32 = 18.0;
+pub const DECISION_BADGE_FRAC: f32 = 0.30;
+/// How far below the diamond's middle the label block is centred when the
+/// node also carries a caption.
+pub const DECISION_LABEL_DROP: f32 = 6.0;
+/// Caption baseline, as a fraction of the height from the top vertex.
+pub const DECISION_BADGE_AT: f32 = 0.29;
 
-/// Readability budget: the chat iframe renders these SVGs at ~its own width
-/// (`svg { width:100% }` in `assets/wrapper.html`), so any diagram wider than
-/// this shrinks its text below legible size. Layouts must fit within the budget
-/// (wrapping rows, compressing gaps, reducing node widths) or the caller gets a
-/// `VIZ_TOO_WIDE` error instead of an unreadable render. Swimlane/journey can't
-/// wrap without destroying their semantics, so they get a slightly larger
-/// budget and rely on `VIZ_TOO_WIDE` past it.
-pub const MAX_CONTENT_W: f32 = 1100.0;
-pub const MAX_CONTENT_W_WIDE: f32 = 1500.0;
+/// Readability budget: the chat shows these SVGs at their natural size and
+/// only ever scales them down (never up) to fit its column, so any diagram much
+/// wider than this shrinks its text below legible size. Layouts must fit within
+/// the budget (wrapping rows, compressing gaps, reducing node widths) or the
+/// caller gets a `VIZ_TOO_WIDE` error instead of an unreadable render.
+/// Swimlane/journey can't wrap without destroying their semantics, so they get
+/// a slightly larger budget and rely on `VIZ_TOO_WIDE` past it.
+/// 960px shown in a ~670px chat column is a 0.7 scale: 13px type at ~9px,
+/// the smallest that still reads. The host scrolls sideways past that scale
+/// rather than shrinking further (`MIN_SCALE` in the app's `lib/viz.ts`).
+pub const MAX_CONTENT_W: f32 = 960.0;
+pub const MAX_CONTENT_W_WIDE: f32 = 1300.0;
+/// The width layouts *aim* for: the chat column, where a figure is shown at
+/// its natural size. Compression (tighter gaps, narrower nodes with wrapped
+/// labels) starts here rather than at the budgets above, because a taller
+/// diagram at full size reads better than a wider one scaled down. A diagram
+/// that cannot be compressed this far is still accepted up to its budget.
+pub const COMFORT_W: f32 = 660.0;
 /// Minimum inter-node gap during horizontal compression (below this a layer is
 /// too dense and node widths get reduced instead).
 pub const MIN_LAYER_GAP: f32 = 12.0;
@@ -169,9 +183,11 @@ pub struct NodeVisual<'a> {
 }
 
 /// Draws one node at absolute top-left `(x, y)` with size `(w, h)`. Shape
-/// follows `visual.step_type`: "start"/"end" get the pill terminator,
-/// "decision" gets the triangular gate shape (matching the crate's original
-/// visual language for gate nodes), everything else gets the plain box.
+/// follows `visual.step_type`: "start"/"end" get the solid terminator (class
+/// `pill`, with its label in the `inverse` text class), "decision" gets a
+/// diamond whose four vertices are the midpoints of the box's sides -- so the
+/// connectors every layout already aims at those midpoints land on a vertex --
+/// and everything else gets the plain box.
 /// `visual.lines` are already-wrapped label text from `size_node`;
 /// `visual.badge` (only meaningful on a "decision" node — see the schema doc
 /// comment on `subtitle`) is a short caption drawn above the label.
@@ -179,29 +195,32 @@ pub fn draw_node(canvas: &mut SvgCanvas, x: f32, y: f32, w: f32, h: f32, visual:
     let cx = x + w / 2.0;
     match visual.step_type {
         StepType::Decision => {
-            canvas.polygon(&[(cx, y), (x + w, y + h), (x, y + h)], "node-triangle");
+            let cy = y + h / 2.0;
+            canvas.polygon(
+                &[(cx, y), (x + w, cy), (cx, y + h), (x, cy)],
+                "node-diamond",
+            );
             if let Some(b) = visual.badge {
-                // Badge just below the apex, where the triangle is wide enough
-                // for a short caption; `text_line_fit` clamps it to the
-                // available band so it can never spill past the slanted edges.
+                // Caption in the upper half, where the diamond is already
+                // wider than the caption's band; `text_line_fit` clamps it so
+                // it can never spill past the slanted edges.
                 canvas.text_line_fit(
                     cx,
-                    y + h * 0.26,
+                    y + h * DECISION_BADGE_AT,
                     "badge-meta",
                     b,
                     BADGE_FONT_PX,
                     DECISION_BADGE_FRAC * w,
                 );
             }
-            // Bottom-anchored label: the block is centered so its last line
-            // sits DECISION_BASE_MARGIN above the base, keeping every line in
-            // the triangle's wide lower band. `size_decision` guaranteed each
-            // line fits that band, so the textLength backstop stays idle.
-            let n = visual.lines.len() as f32;
-            let block_center = (y + h - DECISION_BASE_MARGIN) - (n - 1.0) * LINE_H / 2.0;
+            let drop = if visual.badge.is_some() {
+                DECISION_LABEL_DROP
+            } else {
+                0.0
+            };
             canvas.text_lines_fit(
                 cx,
-                block_center,
+                cy + drop,
                 "node-text",
                 visual.lines,
                 LINE_H,
@@ -214,7 +233,7 @@ pub fn draw_node(canvas: &mut SvgCanvas, x: f32, y: f32, w: f32, h: f32, visual:
             canvas.text_lines_fit(
                 cx,
                 y + h / 2.0,
-                "node-text",
+                "node-text inverse",
                 visual.lines,
                 LINE_H,
                 NODE_FONT_PX,
@@ -284,12 +303,14 @@ mod tests {
     }
 
     #[test]
-    fn every_decision_label_line_fits_the_triangle_band() {
-        // Constructional guarantee behind the decision-triangle fix: labels wrap
-        // at 0.60*w, and the bottom-anchored block's top line sits at
-        // t = (h - DECISION_BASE_MARGIN - (n-1)*LINE_H)/h where the triangle
-        // offers t*w of width. Assert both directly so a constant drift fails
-        // loudly instead of silently re-introducing apex spill.
+    fn every_decision_label_line_fits_inside_the_diamond() {
+        // Constructional guarantee behind the diamond: labels wrap at 0.60*w,
+        // and a diamond's width at vertical distance d from its middle is
+        // w * (1 - 2d/h). The label block is centred DECISION_LABEL_DROP below
+        // the middle, so the baseline of its outermost line is half the block
+        // height (less the descender room) plus that drop away. Assert both
+        // directly so a constant drift fails loudly instead of silently
+        // letting text cross the slanted edges.
         for label in [
             "Payment approved?",
             "Are all credentials valid before we proceed to the next step?",
@@ -297,21 +318,29 @@ mod tests {
             "x".repeat(60).as_str(),
         ] {
             let n = size_node(label, Some("GATE"));
-            let block_clearance = DECISION_BASE_MARGIN + (n.lines.len() as f32 - 1.0) * LINE_H;
-            let top_line_t = (n.h - block_clearance) / n.h;
-            let available = top_line_t * n.w;
+            let lines = n.lines.len() as f32;
+            let furthest = (lines - 1.0) * LINE_H / 2.0 + NODE_FONT_PX * 0.4 + DECISION_LABEL_DROP;
+            let available = n.w * (1.0 - 2.0 * furthest / n.h);
             for line in &n.lines {
                 let w = text::measure_px(line, NODE_FONT_PX);
                 assert!(
-                    w <= 0.60 * n.w + 0.5,
-                    "{label:?}: line {line:?} ({w:.1}px) exceeds the 0.60 wrap budget ({:.1}px)",
-                    0.60 * n.w
+                    w <= DECISION_LABEL_FRAC * n.w + 0.5,
+                    "{label:?}: line {line:?} ({w:.1}px) exceeds the wrap budget ({:.1}px)",
+                    DECISION_LABEL_FRAC * n.w
                 );
                 assert!(
                     w <= available + 0.5,
-                    "{label:?}: line {line:?} ({w:.1}px) exceeds the {available:.1}px available at the block's top line"
+                    "{label:?}: line {line:?} ({w:.1}px) exceeds the {available:.1}px the diamond offers at the block's edge"
                 );
             }
+            // The caption must clear the top of the label block.
+            let caption_base = n.h * DECISION_BADGE_AT;
+            let label_top =
+                n.h / 2.0 + DECISION_LABEL_DROP - (lines - 1.0) * LINE_H / 2.0 - NODE_FONT_PX * 0.4;
+            assert!(
+                caption_base <= label_top,
+                "{label:?}: caption (baseline {caption_base:.1}) sits on the label (top {label_top:.1})"
+            );
         }
     }
 }

@@ -480,7 +480,7 @@ pub struct AccessibleSvgRequest {
     /// text/subtitle/sentiment/pain).
     pub diagram_type: VizDiagramType,
 
-    /// Title drawn at the top of the diagram and used as the iframe title.
+    /// Title shown above the diagram.
     pub title: String,
 
     /// One or two sentences describing the diagram for screen-reader users.
@@ -532,7 +532,7 @@ pub struct AccessibleChartRequest {
     /// (change over an ordered sequence like months), or "grouped_bar" (2-4
     /// series compared per category).
     pub chart_type: VizChartType,
-    /// Title drawn above the chart and used as the iframe title.
+    /// Title shown above the chart.
     pub title: String,
     /// One or two sentences stating the takeaway for screen-reader users,
     /// e.g. "Revenue grew each quarter, with the largest jump in Q3."
@@ -553,7 +553,7 @@ pub struct AccessibleChartRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AccessibleMermaidRequest {
-    /// Title drawn above the diagram and used as the iframe title.
+    /// Title shown above the diagram.
     pub title: String,
     /// One or two sentences describing the diagram for screen-reader users,
     /// e.g. "The login flow branches on whether the credentials are valid."
@@ -561,9 +561,8 @@ pub struct AccessibleMermaidRequest {
     /// The Mermaid source to render, e.g. "flowchart TD\\nA-->B". Any Mermaid
     /// diagram type is accepted (flowchart, sequenceDiagram, classDiagram,
     /// stateDiagram-v2, erDiagram, gantt, journey, pie, mindmap, gitGraph,
-    /// timeline, and more). Rendered client-side in a sandboxed iframe; if the
-    /// source fails to parse, the tool returns an error card with the raw
-    /// source rather than a blank frame.
+    /// timeline, and more). If the source fails to parse, the tool returns
+    /// an error saying why rather than an empty figure.
     #[schemars(length(min = 1, max = 12000))]
     pub mermaid: String,
 }

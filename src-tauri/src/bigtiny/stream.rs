@@ -41,22 +41,27 @@ use crate::state::AppState;
 const MAX_STRING_BYTES: usize = 100 * 1024;
 
 /// True when `s` is a `kitty-tools` visualization envelope — the
-/// `{ "render_config": { "target": "iframe", … }, "html_payload": … }` shape
-/// `parseIframePayload` (frontend) needs as a *complete, valid* JSON string.
-/// These are never truncated: the payload is the diagram itself, bounded by
-/// the viz builders' source/width budgets, and slicing it mid-document
-/// corrupts the JSON, forcing the raw-`<pre>` (instead of iframe) fallback.
-fn is_iframe_payload(s: &str) -> bool {
+/// `{ "render_config": { "target": "inline", … }, "html_payload": … }` shape
+/// `parseVizPayload` (frontend) needs as a *complete, valid* JSON string.
+/// These are never truncated: the payload is the figure itself, bounded by
+/// the viz builders' source/width budgets, and slicing it mid-markup corrupts
+/// the JSON, forcing the raw-`<pre>` fallback instead of the figure.
+/// `"iframe"` is the target a kitty-tools before inline rendering wrote; a
+/// chat saved by one still holds such results, and they render the same way.
+fn is_viz_payload(s: &str) -> bool {
+    let has_target = |t: &str| {
+        s.contains(&format!("\"target\": \"{t}\"")) || s.contains(&format!("\"target\":\"{t}\""))
+    };
     s.contains("\"render_config\"")
         && s.contains("\"html_payload\"")
-        && (s.contains("\"target\": \"iframe\"") || s.contains("\"target\":\"iframe\""))
+        && (has_target("inline") || has_target("iframe"))
 }
 
 /// Truncate a tool-output string for the webview event payload, marking the
-/// cut — unless it is a viz iframe envelope, which must reach the webview
-/// whole so `JSON.parse` can render it as an iframe.
+/// cut — unless it is a viz envelope, which must reach the webview whole so
+/// `JSON.parse` can render it as a figure.
 pub(crate) fn truncate_for_ui(s: &str) -> String {
-    if is_iframe_payload(s) || s.len() <= MAX_STRING_BYTES {
+    if is_viz_payload(s) || s.len() <= MAX_STRING_BYTES {
         return s.to_string();
     }
     let mut end = MAX_STRING_BYTES;
@@ -1514,10 +1519,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_ui_never_truncates_iframe_payload() {
+    fn truncate_for_ui_never_truncates_viz_payload() {
         // A viz envelope larger than the cap must pass through whole — its
-        // `html_payload` holds a rendered diagram, and `parseIframePayload`
-        // needs the complete JSON string to render it as an iframe.
+        // `html_payload` holds a rendered diagram, and `parseVizPayload`
+        // needs the complete JSON string to render it as a figure.
         let big_svg = format!("<svg>{}</svg>", "x".repeat(MAX_STRING_BYTES * 2));
         // Pretty (spaced) serialization, as `serde_json::to_string_pretty` produces.
         let s = format!(
@@ -1532,6 +1537,11 @@ mod tests {
         );
         let t = truncate_for_ui(&s);
         assert_eq!(t, s);
+        // And so is the current, inline target.
+        let s = format!(
+            "{{\"render_config\":{{\"target\": \"inline\", \"kind\": \"chart\"}},\"html_payload\":\"{big_svg}\"}}"
+        );
+        assert_eq!(truncate_for_ui(&s), s);
 
         // A non-envelope long string is still capped.
         let plain = "y".repeat(MAX_STRING_BYTES * 2);

@@ -36,6 +36,22 @@ apply at runtime with no rebuild.
 | `--selection`   | Text-selection background. Defaults to the system highlight.  |
 | `--ok-bg` / `--warn-bg` / `--danger-bg` | Tinted backgrounds for success, warning and error panels. Default to `--surface-2` or none. |
 
+## Figures
+
+Charts, diagrams and tables the assistant draws are styled by `viz.css`, in
+black and paper plus one accent. They follow the theme through these optional
+properties; without them a figure uses the fallback shown.
+
+| Property       | Meaning                                           | Falls back to   |
+| -------------- | ------------------------------------------------- | --------------- |
+| `--viz-ink`    | Lines, type, solid fills                          | `--text`        |
+| `--viz-paper`  | Shape fills, the ground behind hatching           | `--surface`     |
+| `--viz-rule`   | Grid lines, table hairlines                       | `--border`      |
+| `--viz-muted`  | Tick labels, the grey series                      | `--text-muted`  |
+| `--viz-tint`   | Shaded bands                                      | `--surface-2`   |
+| `--viz-accent` | The second series; emphasis                       | `--danger`      |
+| `--viz-font`   | Typeface. Defaults to Helvetica, then Arial; label widths are measured for those, so a much wider face can crowd labels. | — |
+
 ## Minimal example
 
 ```css

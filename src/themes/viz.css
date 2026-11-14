@@ -1,0 +1,434 @@
+/* Figures — the stylesheet for kitty-tools' charts, diagrams, tables and
+   Mermaid output.
+
+   This file is NOT loaded into the page. `src/lib/viz.ts` adopts it into the
+   shadow root each figure is mounted in, so nothing here can leak into the
+   app and nothing in a figure's markup can restyle the app. The figure markup
+   (plugins/kitty-tools/src/tools/viz) carries class names only; every colour,
+   weight and size is decided here.
+
+   Like base.css this file contains no colour values. Colours come from the
+   theme through six roles, each an optional `--viz-*` property with a
+   fallback to the theme's required properties (themes/README.md).
+
+   The style is the International Typographic ("Swiss") one: a neutral
+   grotesque, flush-left ragged-right, hairline rules instead of boxes and
+   fills, black and paper plus a single red, engraver's hatching to tell
+   series apart, square corners, no shadows, no gradients.
+
+   Font sizes are mirrored in the layout code, which measures text to place
+   it (`class_font_px` in render/svg.rs, the constants in layout/). Change a
+   size here and there together. */
+
+:host,
+.viz-root {
+  --vz-ink: var(--viz-ink, var(--text));
+  --vz-paper: var(--viz-paper, var(--surface));
+  --vz-rule: var(--viz-rule, var(--border));
+  --vz-muted: var(--viz-muted, var(--text-muted));
+  --vz-tint: var(--viz-tint, var(--surface-2));
+  --vz-accent: var(--viz-accent, var(--danger));
+  /* Helvetica where it exists; Arial (its metric twin, and what the layout's
+     width table is built from) on Windows; the platform sans elsewhere. */
+  --vz-font: var(--viz-font, 'Helvetica Neue', Helvetica, Arial, 'Liberation Sans', sans-serif);
+
+  display: block;
+  color: var(--vz-ink);
+  font-family: var(--vz-font);
+  font-size: 13px;
+  line-height: 1.35;
+  font-kerning: normal;
+  text-align: left;
+}
+
+/* ---- Figure and caption ------------------------------------------------- */
+
+.viz {
+  margin: 0;
+  padding-top: 7px;
+  border-top: 2px solid var(--vz-ink);
+}
+.viz-title,
+.mcp-grayscale-table caption {
+  margin: 0 0 12px;
+  max-width: 40em;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.005em;
+  text-align: left;
+  caption-side: top;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- SVG, common ---------------------------------------------------------- */
+
+svg {
+  display: block;
+  overflow: visible;
+}
+.viz-svg text,
+svg.legacy text {
+  font-family: var(--vz-font);
+  fill: var(--vz-ink);
+  stroke: none;
+}
+
+/* ---- Diagrams ------------------------------------------------------------- */
+
+.node-box,
+.node-diamond,
+.node-triangle {
+  fill: var(--vz-paper);
+  stroke: var(--vz-ink);
+  stroke-width: 1px;
+  stroke-linejoin: miter;
+  rx: 0;
+  filter: none;
+}
+.node-box.pill {
+  fill: var(--vz-ink);
+}
+.node-text {
+  font-size: 13px;
+  font-weight: 400;
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+.viz-svg .node-text.inverse {
+  fill: var(--vz-paper);
+  font-weight: 700;
+}
+.viz-svg .badge-meta,
+svg.legacy .badge-meta {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-anchor: middle;
+  fill: var(--vz-muted);
+}
+.flow-path {
+  fill: none;
+  stroke: var(--vz-ink);
+  stroke-width: 1px;
+  stroke-linejoin: miter;
+}
+.arrow-head,
+marker path {
+  fill: var(--vz-ink);
+  stroke: none;
+}
+
+/* Yes / no on a decision's branches: bare type on a paper patch that
+   interrupts the rule, not a badge. */
+.tag-bg-dark,
+.tag-bg-light {
+  fill: var(--vz-paper);
+  stroke: none;
+  rx: 0;
+}
+.tag-text-light,
+.tag-text-dark {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+
+.lane-header {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.lane-divider {
+  stroke: var(--vz-ink);
+  stroke-width: 0.75px;
+}
+.journey-col-shade {
+  fill: var(--vz-tint);
+  opacity: 0.55;
+}
+.curve-line {
+  fill: none;
+  stroke: var(--vz-accent);
+  stroke-width: 1.75px;
+  stroke-linecap: round;
+}
+.curve-dot {
+  fill: var(--vz-paper);
+  stroke: var(--vz-accent);
+  stroke-width: 1.75px;
+}
+.pain-card {
+  fill: none;
+  stroke: var(--vz-rule);
+  stroke-width: 0.75px;
+  rx: 0;
+}
+.pain-text {
+  font-size: 11.5px;
+  text-anchor: middle;
+  dominant-baseline: central;
+}
+
+/* ---- Charts --------------------------------------------------------------- */
+
+.grid-line {
+  stroke: var(--vz-rule);
+  stroke-width: 0.75px;
+}
+.axis-line {
+  stroke: var(--vz-ink);
+  stroke-width: 1.25px;
+}
+.tick-label,
+.tick-label-mid,
+.cat-label,
+.cat-label-start,
+.cat-label-rot,
+.axis-title,
+.legend-text {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.tick-label {
+  text-anchor: end;
+}
+.tick-label-mid,
+.cat-label {
+  text-anchor: middle;
+}
+.cat-label-start,
+.axis-title,
+.legend-text {
+  text-anchor: start;
+}
+.cat-label-rot {
+  text-anchor: end;
+}
+.viz-svg .tick-label,
+.viz-svg .tick-label-mid {
+  fill: var(--vz-muted);
+}
+.axis-title {
+  font-weight: 700;
+}
+
+/* Figures printed on the plot get a paper halo, so a grid rule passing
+   behind one is interrupted rather than struck through it. */
+.viz-svg .value-label,
+.viz-svg .value-label-start,
+.viz-svg .value-label-end {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--vz-paper);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+.value-label {
+  text-anchor: middle;
+}
+.value-label-start {
+  text-anchor: start;
+}
+.value-label-end {
+  text-anchor: end;
+}
+
+/* Series, in order: ink, red, line hatch, grey, dot hatch, cross hatch. The
+   three hatched ones take their fill from a `fill="url(#hatch-…)"` attribute
+   in the markup, so `fill` must not be set on them here. */
+.bar {
+  stroke: none;
+}
+.bar-0 {
+  fill: var(--vz-ink);
+}
+.bar-1 {
+  fill: var(--vz-accent);
+}
+.bar-3 {
+  fill: var(--vz-muted);
+}
+.bar-2,
+.bar-4,
+.bar-5 {
+  stroke: var(--vz-ink);
+  stroke-width: 0.75px;
+}
+.pat-bg {
+  fill: var(--vz-paper);
+}
+.pat-line {
+  stroke: var(--vz-ink);
+  stroke-width: 1.5px;
+}
+.pat-dot {
+  fill: var(--vz-ink);
+}
+.pat-cross {
+  fill: none;
+  stroke: var(--vz-ink);
+  stroke-width: 0.9px;
+}
+
+.series-line {
+  fill: none;
+  stroke: var(--vz-ink);
+  stroke-width: 1.5px;
+  stroke-linejoin: round;
+  stroke-linecap: butt;
+}
+.dash-1,
+.dash-5 {
+  stroke: var(--vz-accent);
+}
+.dash-3 {
+  stroke: var(--vz-muted);
+}
+.dash-2,
+.dash-5 {
+  stroke-dasharray: 6 3;
+}
+.dash-4 {
+  stroke-dasharray: 1.5 3;
+}
+.data-point {
+  fill: var(--vz-ink);
+  stroke: var(--vz-ink);
+  stroke-width: 1.5px;
+}
+.pt-1 {
+  fill: var(--vz-accent);
+  stroke: var(--vz-accent);
+}
+.pt-2,
+.pt-4 {
+  fill: var(--vz-paper);
+}
+.pt-3 {
+  fill: var(--vz-muted);
+  stroke: var(--vz-muted);
+}
+.pt-5 {
+  fill: var(--vz-paper);
+  stroke: var(--vz-accent);
+}
+
+/* ---- Tables --------------------------------------------------------------- */
+
+/* A ruled table: horizontal rules only, a heavy one under the head and at the
+   foot, hairlines between rows, no fills and no vertical rules. Figures range
+   right in tabular numerals. */
+.viz-table-wrap,
+.mcp-table-wrapper {
+  overflow-x: auto;
+}
+.viz-table,
+.mcp-grayscale-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.viz-table th,
+.viz-table td,
+.mcp-grayscale-table th,
+.mcp-grayscale-table td {
+  padding: 6px 20px 6px 0;
+  border-bottom: 0.75px solid var(--vz-rule);
+  text-align: left;
+  vertical-align: top;
+  font-weight: 400;
+}
+.viz-table th:last-child,
+.viz-table td:last-child,
+.mcp-grayscale-table th:last-child,
+.mcp-grayscale-table td:last-child {
+  padding-right: 0;
+}
+.viz-table thead th,
+.mcp-grayscale-table thead th {
+  border-bottom: 1px solid var(--vz-ink);
+  font-size: 11.5px;
+  font-weight: 700;
+  vertical-align: bottom;
+}
+.viz-table tbody th,
+.mcp-grayscale-table tbody th {
+  font-weight: 700;
+}
+.viz-table tbody tr:last-child > *,
+.mcp-grayscale-table tbody tr:last-child > * {
+  border-bottom: 1px solid var(--vz-ink);
+}
+.viz-table .num {
+  text-align: right;
+}
+
+/* ---- Mermaid -------------------------------------------------------------- */
+
+/* Mermaid's own stylesheet rides along inside its SVG, with its palette
+   already rewritten to the roles above (see viz/mermaid.rs). Only what that
+   leaves over is set here. */
+.viz-mermaid svg {
+  font-family: var(--vz-font);
+}
+.viz-mermaid svg rect {
+  rx: 0;
+  ry: 0;
+}
+
+/* ---- Figures stored before the inline renderer ----------------------------- */
+
+/* A chat saved by an older build holds figures as whole HTML documents with
+   their own palette. `mountViz` drops that palette and marks the SVG
+   `legacy`; these rules dress the old class names in the current style. */
+.canvas-bg {
+  fill: none;
+}
+.title-text {
+  font-size: 16px;
+  font-weight: 700;
+  text-anchor: middle;
+}
+.axis-label,
+.axis-title-center {
+  font-size: 10.5px;
+  text-anchor: middle;
+}
+.axis-label-end {
+  font-size: 10.5px;
+  text-anchor: end;
+  dominant-baseline: central;
+}
+svg.legacy .legend-text,
+svg.legacy .value-label-start {
+  dominant-baseline: central;
+}
+svg.legacy .value-label,
+svg.legacy .value-label-start {
+  font-size: 9.5px;
+  font-weight: 700;
+}
+svg.legacy .bar-1,
+svg.legacy .bar-2,
+svg.legacy .bar-3 {
+  fill: var(--vz-muted);
+  stroke: none;
+}
+.legend-swatch {
+  stroke: none;
+}

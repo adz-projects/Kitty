@@ -7,14 +7,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::tools::viz::layout::{
-    draw_node, size_node_capped, NodeVisual, SizedNode, GAP_X, GAP_Y, MAX_CONTENT_W, MAX_NODE_W,
+    draw_node, size_node_capped, NodeVisual, SizedNode, COMFORT_W, GAP_X, GAP_Y, MAX_NODE_W,
     MIN_LAYER_GAP, MIN_NODE_H, MIN_NODE_W,
 };
 use crate::tools::viz::model::{Step, StepType};
-use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
+use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TOP_PAD};
 use crate::tools::viz::text;
 
-const LEFT_X: f32 = 20.0;
+/// Stroke clearance only: diagrams sit flush left under their title.
+const LEFT_X: f32 = 2.0;
 
 fn decision_badge(s: &Step) -> Option<String> {
     if s.step_type != StepType::Decision {
@@ -158,7 +159,7 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
     let layers = order_layers(n, &layer, &edges);
 
     // Readability compression: size nodes (reducing the width cap on each
-    // iteration if needed) until the widest layer fits `MAX_CONTENT_W`.
+    // iteration if needed) until the widest layer fits `COMFORT_W`.
     let mut cap = MAX_NODE_W;
     let mut sized: Vec<SizedNode> = steps
         .iter()
@@ -172,10 +173,10 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
                     + GAP_X * (nodes.len() as f32 - 1.0).max(0.0)
             })
             .fold(0.0_f32, f32::max);
-        if widest <= MAX_CONTENT_W {
+        if widest <= COMFORT_W {
             break;
         }
-        cap = (cap * (MAX_CONTENT_W - MIN_LAYER_GAP * 2.0) / widest).clamp(MIN_NODE_W, MAX_NODE_W);
+        cap = (cap * (COMFORT_W - MIN_LAYER_GAP * 2.0) / widest).clamp(MIN_NODE_W, MAX_NODE_W);
         sized = steps
             .iter()
             .map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap))
@@ -191,7 +192,7 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
                 0.0
             } else {
                 let sum = nodes.iter().map(|&i| sized[i].w).sum::<f32>();
-                ((MAX_CONTENT_W - sum) / (nodes.len() as f32 - 1.0)).clamp(MIN_LAYER_GAP, GAP_X)
+                ((COMFORT_W - sum) / (nodes.len() as f32 - 1.0)).clamp(MIN_LAYER_GAP, GAP_X)
             }
         })
         .collect();
@@ -201,7 +202,7 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         row_h[l] = nodes.iter().map(|&i| sized[i].h).fold(MIN_NODE_H, f32::max);
     }
     let mut row_y = vec![0.0f32; layers.len()];
-    let mut acc = TITLE_BAND;
+    let mut acc = TOP_PAD;
     for l in 0..layers.len() {
         row_y[l] = acc;
         acc += row_h[l] + GAP_Y;
@@ -239,7 +240,9 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         let (x1, y1) = (center_x[u], top_y[u] + sized[u].h);
         let (x2, y2) = (center_x[v], top_y[v]);
         let ymid = (y1 + y2) / 2.0;
-        let d = format!("M {x1:.1},{y1:.1} C {x1:.1},{ymid:.1} {x2:.1},{ymid:.1} {x2:.1},{y2:.1}");
+        // Orthogonal: down to the middle of the gutter, across, down.
+        let d =
+            format!("M {x1:.1},{y1:.1} L {x1:.1},{ymid:.1} L {x2:.1},{ymid:.1} L {x2:.1},{y2:.1}");
         let bbox = (x1.min(x2), y1.min(y2), (x1 - x2).abs(), (y2 - y1).abs());
         canvas.path(&d, "flow-path", bbox);
     }
@@ -259,9 +262,9 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         for (branch_idx, &target) in outgoing.iter().take(2).enumerate() {
             let (x1, y1) = (center_x[i], top_y[i] + sized[i].h);
             let (x2, y2) = (center_x[target], top_y[target]);
-            // The edge curve is `M x1,y1 C x1,ymid x2,ymid x2,y2` with
-            // ymid=(y1+y2)/2, so at its midpoint the curve passes through
-            // exactly ((x1+x2)/2, (y1+y2)/2) -- the vertical middle of the
+            // The edge runs `x1,y1 -> x1,ymid -> x2,ymid -> x2,y2` with
+            // ymid=(y1+y2)/2, so ((x1+x2)/2, ymid) is the middle of its
+            // horizontal run -- the vertical middle of the
             // gutter. Skip-level edges are rejected in validation, so y1..y2
             // spans only this gutter and the tag can never sit on a node.
             // Clamping horizontally keeps it inside the canvas.
@@ -388,7 +391,7 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
     }
 
     // Readability compression: shrink the node-width cap until the widest root
-    // subtree fits `MAX_CONTENT_W` (plus the inter-root spacing).
+    // subtree fits `COMFORT_W` (plus the inter-root spacing).
     let mut cap = MAX_NODE_W;
     let mut sized: Vec<SizedNode> = steps
         .iter()
@@ -403,10 +406,10 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
         let subtree_w = subtree_widths(n, &order, &children, &sized);
         let total: f32 = roots.iter().map(|&r| subtree_w[r]).sum::<f32>()
             + GAP_X * 2.0 * (roots.len() as f32 - 1.0).max(0.0);
-        if total <= MAX_CONTENT_W {
+        if total <= COMFORT_W {
             break;
         }
-        cap = (cap * (MAX_CONTENT_W - 40.0) / total).clamp(MIN_NODE_W, MAX_NODE_W);
+        cap = (cap * (COMFORT_W - 40.0) / total).clamp(MIN_NODE_W, MAX_NODE_W);
         sized = steps
             .iter()
             .map(|s| size_node_capped(&s.text, None, cap))
@@ -420,7 +423,7 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
         row_h[depth[i]] = row_h[depth[i]].max(sized[i].h);
     }
     let mut row_y = vec![0.0f32; max_depth + 1];
-    let mut acc = TITLE_BAND;
+    let mut acc = TOP_PAD;
     for d in 0..=max_depth {
         row_y[d] = acc;
         acc += row_h[d] + GAP_Y;
