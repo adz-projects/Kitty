@@ -11,7 +11,7 @@
 //! policy, which relied on the sandboxed iframe's opaque origin as the only
 //! backstop; the guarantee now lives in the render API surface itself.
 
-pub mod escape;
+pub use kitty_doc::tools::viz::escape;
 pub mod layout;
 pub mod mermaid;
 pub mod model;
@@ -132,8 +132,7 @@ pub fn generate_accessible_svg(
         height,
         &body,
     );
-    let standalone =
-        wrap_in_standalone_html_sized(&validated.title, &svg, Some((width, height)));
+    let standalone = wrap_in_standalone_html_sized(&validated.title, &svg, Some((width, height)));
     success_payload(&validated.title, &standalone, &validated.warnings)
 }
 

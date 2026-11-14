@@ -29,6 +29,9 @@ use super::styles::StyleNames;
 pub struct ParagraphInfo {
     pub text: String,
     pub heading_level: Option<u32>,
+    /// Whole-paragraph bold (from the paragraph's own run properties). Lets
+    /// callers preserve emphasis when converting to markdown.
+    pub is_bold: bool,
 }
 
 #[derive(Default)]
@@ -53,6 +56,7 @@ pub fn extract_paragraphs(document_xml: &[u8], style_names: &StyleNames) -> Vec<
             Some(ParagraphInfo {
                 text,
                 heading_level,
+                is_bold: raw.is_bold,
             })
         })
         .collect()

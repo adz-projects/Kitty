@@ -1,6 +1,6 @@
 [package]
 name = "kitty-tools"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 publish = false
 description = "Word document tools (read/outline/write) — the Rust half of the lean_mcp.py split. See docs/PLUGINS.md."
@@ -20,6 +20,11 @@ name = "kitty-tools"
 path = "src/main.rs"
 
 [dependencies]
+# The document library half of this crate (Word/PDF/Excel/text + cache),
+# split out so non-MCP apps can link it alone. Re-exported at the original
+# paths; behavior is unchanged.
+# No default features: the PDF page renderer is Bacon-only.
+kitty-doc = { path = "../kitty-doc", default-features = false }
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "process", "time"] }
 rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }

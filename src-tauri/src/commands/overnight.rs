@@ -26,16 +26,27 @@ pub struct OvernightView {
 
 #[tauri::command]
 pub async fn get_overnight(app: AppHandle) -> Result<OvernightView, String> {
-    let settings = app.state::<AppState>().config.lock().unwrap().overnight.clone();
+    let settings = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .overnight
+        .clone();
     let supported = !cfg!(target_os = "android");
     let engine = match crate::bigtiny::client::ensure_client(&app) {
-        Ok(c) => c.get_json("/api/apps/me/overnight").await.unwrap_or(Value::Null),
+        Ok(c) => c
+            .get_json("/api/apps/me/overnight")
+            .await
+            .unwrap_or(Value::Null),
         Err(_) => Value::Null,
     };
     let (registered, timers) = if supported {
-        tauri::async_runtime::spawn_blocking(|| (wake_task::is_registered(), wake_task::wake_timers()))
-            .await
-            .unwrap_or_default()
+        tauri::async_runtime::spawn_blocking(|| {
+            (wake_task::is_registered(), wake_task::wake_timers())
+        })
+        .await
+        .unwrap_or_default()
     } else {
         (false, WakeTimers::default())
     };
@@ -135,7 +146,9 @@ pub async fn save_screen_log(
     let client = crate::bigtiny::client::ensure_client(&app)?;
     let limit = limit.unwrap_or(1000).clamp(1, 5000);
     let body = client
-        .get_json(&format!("/api/apps/me/memorabilia/screen-log?limit={limit}"))
+        .get_json(&format!(
+            "/api/apps/me/memorabilia/screen-log?limit={limit}"
+        ))
         .await?;
     if let Some(err) = body.get("error").and_then(Value::as_str) {
         return Err(format!("The memory engine said: {err}"));

@@ -38,9 +38,9 @@ pub fn extract_document_text(path: &Path) -> Result<String, String> {
         "xlsx" | "xlsm" | "xls" | "ods" => excel::extract_excel_text(path),
         // Plain-text families. csv/tsv are also spreadsheet-openable, but a
         // direct decode keeps their raw delimiters intact for chunking.
-        "txt" | "text" | "md" | "markdown" | "rst" | "csv" | "tsv" | "json"
-        | "jsonl" | "ndjson" | "xml" | "yaml" | "yml" | "toml" | "ini" | "log"
-        | "srt" | "vtt" | "html" | "htm" => fs::extract_text_file(path),
+        "txt" | "text" | "md" | "markdown" | "rst" | "csv" | "tsv" | "json" | "jsonl"
+        | "ndjson" | "xml" | "yaml" | "yml" | "toml" | "ini" | "log" | "srt" | "vtt" | "html"
+        | "htm" => fs::extract_text_file(path),
         "" => Err(format!("no file extension on {}", path.display())),
         other => Err(format!("unsupported document type: .{other}")),
     }
@@ -63,10 +63,7 @@ mod tests {
     #[test]
     fn text_and_csv_extract_their_contents() {
         let txt = tmp("note.txt", b"line one\nline two");
-        assert_eq!(
-            extract_document_text(&txt).unwrap(),
-            "line one\nline two"
-        );
+        assert_eq!(extract_document_text(&txt).unwrap(), "line one\nline two");
         let _ = std::fs::remove_file(&txt);
 
         let csv = tmp("data.csv", b"a,b,c\n1,2,3");

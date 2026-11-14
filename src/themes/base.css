@@ -1,6 +1,12 @@
 /* Structural, theme-agnostic layout. MUST NOT contain color values —
    all colors/spacing/typography come from custom properties in theme files. */
 
+/* The reading face: EB Garamond (SIL OFL), bundled from the fontsource
+   package so it renders offline. Themes name it in `--font-serif`; it sets
+   assistant answers and headings, while Montserrat stays on the controls. */
+@import '@fontsource-variable/eb-garamond/wght.css';
+@import '@fontsource-variable/eb-garamond/wght-italic.css';
+
 /* Self-hosted Montserrat (OFL-licensed), bundled so the app renders it
    offline with no runtime fetch to Google Fonts — consistent with the rest
    of the app never phoning out for UI chrome. One variable-weight woff2
@@ -21,6 +27,11 @@
 }
 
 :root {
+  /* Corner radii: `--radius` (from the theme) for cards, dialogs and inputs;
+     `--radius-sm` for buttons, chips and badges. A theme may set
+     `--radius-sm` itself; otherwise it follows `--radius`. Full pills are
+     reserved for on/off toggles. */
+  --radius-sm: calc(var(--radius) * 0.75);
   /* --- Type ramp (docs/ANDROID.md §8.4) ---------------------------------
      Every font-size in this file goes through one of these, and every one is
      in `rem`, so `--font-scale` below moves the whole UI at once. Before this
@@ -142,13 +153,18 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+::selection {
+  background: var(--selection, Highlight);
+  color: var(--text);
+}
+
 button {
   font: inherit;
   cursor: pointer;
   border: 1px solid var(--border);
   background: var(--surface-2);
   color: var(--text);
-  border-radius: calc(var(--radius) / 2);
+  border-radius: var(--radius-sm);
   padding: 6px 12px;
 }
 
@@ -157,15 +173,16 @@ button:hover {
 }
 
 button.primary {
-  background: var(--accent);
+  background: var(--accent-fill, var(--accent));
   color: var(--accent-text);
-  border-color: var(--accent);
+  border-color: var(--accent-fill, var(--accent));
 }
 
 /* Destructive confirm (ConfirmDialog `danger`). */
 button.danger {
   color: var(--danger);
   border-color: var(--danger);
+  background: var(--danger-bg, var(--surface-2));
 }
 
 button:disabled {
@@ -281,9 +298,9 @@ button:disabled {
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  border: 1px solid var(--warn);
-  border-radius: calc(var(--radius) / 2);
-  background: var(--surface-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg, var(--surface-2));
   font-size: var(--fs-md);
 }
 
@@ -389,15 +406,21 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  /* One centred reading column (about 65 characters of answer text) rather
+     than a conversation spread across the whole window. A theme can widen
+     it with `--reading-max-width`. */
+  width: 100%;
+  max-width: var(--reading-max-width, 44rem);
+  margin-inline: auto;
 }
 
+/* The user's own turn: a quiet tinted block in the column, in the UI face,
+   not an accent-filled bubble on the right. */
 .msg-user .bubble {
-  align-self: flex-end;
-  background: var(--accent);
-  color: var(--accent-text);
+  background: var(--surface-2);
+  color: var(--text);
   padding: 8px 12px;
   border-radius: var(--radius);
-  max-width: 85%;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -416,6 +439,18 @@ button:disabled {
   align-self: flex-start;
   max-width: 100%;
 }
+/* Answers are set as prose: the serif reading face, a size up to make up for
+   Garamond's small x-height, and looser leading. Code, tables and controls
+   inside keep their own faces. */
+.msg-assistant .bubble.markdown {
+  font-family: var(--font-serif, inherit);
+  font-size: 1.125em;
+  line-height: var(--reading-line-height, 1.6);
+}
+.msg-assistant .bubble.markdown table,
+.msg-assistant .bubble.markdown .code-block-head {
+  font-family: var(--font-family);
+}
 
 .markdown p:first-child {
   margin-top: 0;
@@ -426,17 +461,17 @@ button:disabled {
 .markdown pre {
   background: var(--surface-2);
   padding: 10px;
-  border-radius: 8px;
+  border-radius: var(--radius);
   overflow: auto;
 }
 .markdown code {
-  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-family: var(--mono, ui-monospace, monospace);
   font-size: var(--fs-sm-plus);
 }
 /* Fenced code block with a Copy/Download header (Round-2 item 12). */
 .code-block {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   overflow: hidden;
   margin: 6px 0;
 }
@@ -457,8 +492,6 @@ button:disabled {
 .code-lang {
   font-size: var(--fs-xs);
   color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 .code-actions {
   display: flex;
@@ -467,7 +500,7 @@ button:disabled {
 .code-actions button {
   font-size: var(--fs-xs);
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 .code-block pre {
   margin: 0;
@@ -476,7 +509,7 @@ button:disabled {
 .markdown :not(pre) > code {
   background: var(--surface-2);
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 .markdown h1,
 .markdown h2,
@@ -485,7 +518,8 @@ button:disabled {
 .markdown h5,
 .markdown h6 {
   margin: 1.1em 0 0.4em;
-  font-weight: 600;
+  font-family: var(--font-serif, inherit);
+  font-weight: 500;
   line-height: 1.3;
 }
 .markdown h1:first-child,
@@ -495,11 +529,6 @@ button:disabled {
 .markdown h5:first-child,
 .markdown h6:first-child {
   margin-top: 0;
-}
-.markdown h1,
-.markdown h2 {
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 0.2em;
 }
 .markdown h1 {
   font-size: 1.5em;
@@ -549,9 +578,9 @@ button:disabled {
   margin-bottom: 0;
 }
 .markdown blockquote {
-  border-left: 3px solid var(--border);
-  padding-left: 10px;
+  padding-left: 1.2em;
   margin: 6px 0;
+  font-style: italic;
   color: var(--text-muted);
 }
 .markdown table {
@@ -685,7 +714,7 @@ button:disabled {
 
 .tool-card {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface-2);
   font-size: var(--fs-sm-plus);
 }
@@ -702,7 +731,7 @@ button:disabled {
 .tool-card pre {
   background: var(--surface);
   padding: 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow: auto;
   margin: 4px 0;
   font-size: var(--fs-sm);
@@ -711,7 +740,7 @@ button:disabled {
   display: block;
   width: 100%;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   margin: 4px 0;
   background: var(--surface);
   transition: height 120ms ease-out;
@@ -721,7 +750,7 @@ button:disabled {
    .code-block so it reads as "rendered content", not a debugging aside. */
 .viz-card {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   overflow: hidden;
   margin: 6px 0;
 }
@@ -745,7 +774,7 @@ button:disabled {
   margin: 0;
   background: var(--surface-2);
   padding: 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow: auto;
   font-size: var(--fs-sm);
 }
@@ -782,8 +811,6 @@ button:disabled {
 .allowed-dirs-heading {
   padding: 2px 6px 6px;
   font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
 .allowed-dirs-row {
@@ -815,7 +842,7 @@ button:disabled {
   gap: 6px;
   padding: 2px 8px;
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
   white-space: nowrap;
   /* The tray is one chip now, whatever the fan-out — `nowrap` keeps it one
@@ -851,7 +878,6 @@ button:disabled {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
-  box-shadow: 0 4px 16px rgb(0 0 0 / 25%);
 }
 .subagent-popover button {
   display: flex;
@@ -859,7 +885,7 @@ button:disabled {
   gap: 6px;
   padding: 6px 8px;
   border: 0;
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: var(--radius-sm);
   background: none;
   color: var(--text);
   font: inherit;
@@ -883,7 +909,7 @@ button:disabled {
   flex: 1;
   resize: none;
   padding: 10px;
-  border-radius: 8px;
+  border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--surface-2);
   color: var(--text);
@@ -915,8 +941,10 @@ button:disabled {
 
 .chat-error {
   color: var(--danger);
+  background: var(--danger-bg, transparent);
+  border-radius: var(--radius-sm);
   font-size: var(--fs-sm-plus);
-  padding: 4px 0;
+  padding: 4px 8px;
 }
 
 /* Chat error card (release-fixes item 27) — a calm, bordered surface card
@@ -929,9 +957,9 @@ button:disabled {
   gap: 6px;
   padding: 10px 12px;
   margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--warn-bg, var(--surface-2));
 }
 .chat-error-card-head {
   display: flex;
@@ -941,7 +969,7 @@ button:disabled {
 }
 .chat-error-card-title {
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: 500;
   color: var(--text);
 }
 .chat-error-card-body {
@@ -987,7 +1015,7 @@ button:disabled {
   gap: 2px;
   padding: 6px 8px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: var(--fs-sm);
 }
 .log-entry-head {
@@ -996,8 +1024,7 @@ button:disabled {
   gap: 8px;
 }
 .log-entry-level {
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  font-weight: 500;
 }
 .log-entry-error .log-entry-level {
   color: var(--danger);
@@ -1047,7 +1074,7 @@ button:disabled {
   color: var(--text-muted);
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   padding: 3px 10px;
   max-width: 60%;
   overflow: hidden;
@@ -1091,7 +1118,7 @@ button:disabled {
   white-space: nowrap;
   text-overflow: ellipsis;
   padding: 3px 4px 3px 10px;
-  border-radius: 999px 0 0 999px;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
   cursor: pointer;
 }
 .pill-folder .pill-reset {
@@ -1101,7 +1128,7 @@ button:disabled {
   font-size: var(--fs-base);
   line-height: 1;
   padding: 3px 9px 3px 3px;
-  border-radius: 0 999px 999px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -1115,7 +1142,7 @@ button:disabled {
   gap: 4px;
   font-size: var(--fs-xs);
   padding: 2px 6px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   border: 1px solid var(--border);
   color: var(--text-muted);
@@ -1209,7 +1236,8 @@ button:disabled {
   }
 }
 .status-badge-warn {
-  border-color: var(--warn);
+  border-color: transparent;
+  background: var(--warn-bg, transparent);
   color: var(--warn);
 }
 /* Icon + plain-text note (e.g. the trust badge under a provider's base URL)
@@ -1248,7 +1276,7 @@ button:disabled {
 .msg-actions button {
   font-size: var(--fs-xs);
   padding: 2px 7px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
 }
 /* Per-message generation info popover (Round-4) — replaces the old
@@ -1324,7 +1352,7 @@ button:disabled {
   margin: 0;
   padding: 8px;
   background: var(--surface);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow: auto;
   font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
   font-size: var(--fs-sm-plus);
@@ -1393,8 +1421,7 @@ button:disabled {
   gap: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--overlay-shadow);
+  border-radius: var(--radius);
   /* Last-resort fallback for `usePopoverPosition`'s `maxHeight`/`maxWidth`
      clamp (a popover taller/wider than the whole viewport, an edge case) —
      the normal case is that repositioning alone keeps it fully on-screen
@@ -1407,14 +1434,14 @@ button:disabled {
   background: transparent;
   text-align: left;
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 .mode-popover button:hover {
   background: var(--surface-2);
 }
 .mode-popover button.active {
   color: var(--accent);
-  font-weight: 600;
+  font-weight: 500;
 }
 /* The provider picker specifically: 20% past the shared floor, because its
    rows carry a trust icon plus a full provider+model name and the generic
@@ -1463,8 +1490,7 @@ button:disabled {
   padding: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--overlay-shadow);
+  border-radius: var(--radius);
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -1510,7 +1536,7 @@ button:disabled {
   font-size: var(--fs-2xs);
   line-height: 1.3;
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   color: var(--text-muted);
   margin-bottom: 3px;
@@ -1521,8 +1547,8 @@ button:disabled {
   color: var(--accent);
 }
 .hint-source-wildcard {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-fill, var(--accent));
+  border-color: var(--accent-fill, var(--accent));
   color: var(--accent-text);
 }
 
@@ -1674,7 +1700,7 @@ button:disabled {
   gap: 6px;
   padding: 5px 10px;
   font-size: var(--fs-sm);
-  font-weight: 600;
+  font-weight: 500;
   background: var(--surface-2);
   border-bottom: 1px solid var(--border);
   cursor: pointer;
@@ -1733,7 +1759,7 @@ button:disabled {
   padding: 1px 6px;
   font-size: var(--fs-md);
   color: var(--text-muted);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   opacity: 0;
 }
 .session-item:hover .session-kebab {
@@ -1746,7 +1772,7 @@ button:disabled {
   flex: 1;
   padding: 6px 8px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--surface-2);
   color: var(--text);
 }
@@ -1772,7 +1798,7 @@ button:disabled {
 }
 .session-item.active {
   background: var(--surface-2);
-  box-shadow: inset 2px 0 0 var(--accent);
+  font-weight: 500;
 }
 .session-item.dragging {
   opacity: 0.5;
@@ -1782,8 +1808,7 @@ button:disabled {
   padding-left: 34px;
 }
 .session-item.selected {
-  background: var(--surface-2);
-  box-shadow: inset 2px 0 0 var(--accent);
+  background: var(--selection, var(--surface-2));
 }
 .session-select-check {
   position: absolute;
@@ -1815,7 +1840,7 @@ button:disabled {
 }
 .session-title {
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1837,7 +1862,7 @@ button:disabled {
 }
 .artifacts-head {
   padding: 12px;
-  font-weight: 600;
+  font-weight: 500;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
@@ -1856,7 +1881,7 @@ button:disabled {
 }
 .artifact-name {
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: 500;
 }
 .artifact-path {
   font-size: var(--fs-xs);
@@ -1899,7 +1924,7 @@ button:disabled {
   font-size: var(--fs-sm);
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   padding: 3px 8px;
 }
 .chip-name {
@@ -1917,7 +1942,7 @@ button:disabled {
 .chip-action {
   font-size: var(--fs-xs);
   padding: 1px 6px;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
 }
 .chip-x {
   border: none;
@@ -1989,7 +2014,7 @@ button:disabled {
   /* Indented relative to the group label above (padding-left 10px) so items
      read as nested under their group, not flush with it. */
   padding: 8px 10px 8px 18px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 .settings-nav button:hover {
   background: var(--surface-2);
@@ -2020,13 +2045,11 @@ button:disabled {
 .settings-nav button.active {
   background: var(--surface-2);
   color: var(--accent);
-  font-weight: 600;
+  font-weight: 500;
 }
 .settings-nav-group-label {
   font-size: var(--fs-xs);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+  font-weight: 500;
   color: var(--text-muted);
   padding: 12px 10px 4px;
 }
@@ -2068,7 +2091,7 @@ button:disabled {
   padding: 6px 0;
   cursor: pointer;
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: 500;
 }
 .provider-advanced-body {
   display: flex;
@@ -2083,14 +2106,14 @@ button:disabled {
 }
 .field > span {
   font-size: var(--fs-md);
-  font-weight: 600;
+  font-weight: 500;
 }
 .field input,
 .field select,
 .field textarea {
   padding: 7px 9px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--surface-2);
   color: var(--text);
   width: 100%;
@@ -2118,7 +2141,7 @@ button:disabled {
 }
 .settings-table th {
   color: var(--text-muted);
-  font-weight: 600;
+  font-weight: 500;
   font-size: var(--fs-sm);
 }
 .hotkey-table td:first-child {
@@ -2127,7 +2150,7 @@ button:disabled {
 .hotkey-table input {
   padding: 7px 9px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--surface-2);
   color: var(--text);
   width: 100%;
@@ -2186,11 +2209,11 @@ button.link {
   gap: 8px;
   padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 .provider-row.active {
-  box-shadow: inset 3px 0 0 var(--accent);
+  border-color: var(--accent);
 }
 .provider-row.highlight {
   animation: pulse-outline 1.2s ease-in-out 2;
@@ -2237,7 +2260,7 @@ button.link {
   flex: 1;
 }
 .provider-name {
-  font-weight: 600;
+  font-weight: 500;
   display: flex;
   gap: 6px;
   align-items: center;
@@ -2286,7 +2309,7 @@ button.link {
   background: var(--surface-2);
   color: var(--accent);
   border-color: var(--accent);
-  font-weight: 600;
+  font-weight: 500;
 }
 .model-picker-list {
   display: flex;
@@ -2295,7 +2318,7 @@ button.link {
   max-height: 260px;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 4px;
 }
 /* `.provider-row` (Settings → Providers) gives the base layout/active-state
@@ -2355,7 +2378,7 @@ button.link {
   gap: 6px;
   padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 .ext-card-head {
@@ -2365,7 +2388,7 @@ button.link {
   gap: 8px;
 }
 .ext-card-name {
-  font-weight: 600;
+  font-weight: 500;
   font-size: var(--fs-md);
 }
 .ext-card-desc {
@@ -2378,7 +2401,7 @@ button.link {
   gap: 10px;
   padding: 8px 12px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 /* The name/size column absorbs the slack and wraps inside itself. Without
@@ -2396,7 +2419,7 @@ button.link {
   flex-wrap: nowrap;
 }
 .model-name {
-  font-weight: 600;
+  font-weight: 500;
 }
 /* A curated model plus its (optional) gated-license token field, stacked. */
 .model-item {
@@ -2412,7 +2435,7 @@ button.link {
   gap: 4px;
   padding: 8px 12px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 .gated-token label {
@@ -2434,7 +2457,7 @@ button.link {
 .progress {
   height: 8px;
   background: var(--surface-2);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
 }
 .progress-bar {
@@ -2469,7 +2492,6 @@ button.link {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  box-shadow: var(--overlay-shadow);
 }
 .modal h2 {
   margin: 0;
@@ -2491,7 +2513,7 @@ button.link {
   font: inherit;
   font-size: var(--fs-sm);
   padding: 4px 10px;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: transparent;
   color: var(--text-muted);
@@ -2500,11 +2522,12 @@ button.link {
 .wizard-step.active {
   border-color: var(--accent);
   color: var(--accent);
-  font-weight: 600;
+  font-weight: 500;
 }
 .wizard-step.done {
   color: var(--ok);
-  border-color: var(--ok);
+  border-color: transparent;
+  background: var(--ok-bg, transparent);
 }
 .wizard-step:disabled {
   cursor: default;
@@ -2531,7 +2554,7 @@ button.link {
   align-items: center;
   padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 .starter-list {
@@ -2545,13 +2568,12 @@ button.link {
   align-items: flex-start;
   padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   cursor: pointer;
   background: var(--surface);
 }
 .starter.selected {
   border-color: var(--accent);
-  box-shadow: inset 2px 0 0 var(--accent);
 }
 .path-fork {
   display: flex;
@@ -2566,7 +2588,7 @@ button.link {
   text-align: left;
   padding: 14px 16px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
   background: var(--surface);
   cursor: pointer;
   font: inherit;
@@ -2577,7 +2599,6 @@ button.link {
 }
 .path-card.selected {
   border-color: var(--accent);
-  box-shadow: inset 2px 0 0 var(--accent);
 }
 .wizard-summary {
   display: flex;
@@ -2585,7 +2606,7 @@ button.link {
   gap: 6px;
   padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
 }
 .wizard-summary-row {
@@ -2611,7 +2632,7 @@ button.link {
   margin: 0;
   padding: 8px 10px;
   background: var(--surface-2);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: var(--fs-xs);
   white-space: pre-wrap;
   word-break: break-word;
@@ -2725,7 +2746,7 @@ button.link {
   padding-bottom: var(--safe-bottom);
   border-left: none;
   border-top: 1px solid var(--border);
-  border-radius: 16px 16px 0 0;
+  border-radius: var(--radius) var(--radius) 0 0;
   background: var(--surface);
   box-shadow: var(--overlay-shadow);
   animation: kitty-sheet-up 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -2783,7 +2804,7 @@ button.link {
 .msg-actions-menu {
   min-width: 190px;
   padding: 6px;
-  border-radius: 12px;
+  border-radius: var(--radius);
 }
 .msg-actions-menu button {
   display: flex;
@@ -2909,7 +2930,7 @@ button.link {
     justify-content: center;
     gap: 4px;
     padding: 0 10px;
-    border-radius: calc(var(--radius) / 2);
+    border-radius: var(--radius-sm);
     font-size: var(--fs-sm);
     line-height: 1;
     appearance: none;
@@ -3027,8 +3048,6 @@ button.link {
 }
 .delegate-run-role {
   font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 .delegate-run-text {
   font-size: 13px;
@@ -3044,6 +3063,6 @@ button.link {
 .delegate-run-tool {
   padding: 1px 6px;
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   font-size: 11px;
 }

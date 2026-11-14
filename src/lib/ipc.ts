@@ -29,6 +29,7 @@ import type {
   FolderData,
   LogEntry,
   McpServer,
+  BaconMcpStatus,
   McpServerPatch,
   McpServerSpec,
   MemoryStats,
@@ -522,6 +523,9 @@ export const ipc = {
   // NOT live here — see getKittyWebEnabled/getBraveMcpSearchStatus.
   getKittyToolsEnabled: () => invoke<boolean>('get_kitty_tools_enabled'),
   setKittyToolsEnabled: (enabled: boolean) => invoke<void>('set_kitty_tools_enabled', { enabled }),
+  getBaconMcpStatus: () => invoke<BaconMcpStatus>('get_bacon_mcp_status'),
+  setBaconMcpEnabled: (enabled: boolean, path: string | null) =>
+    invoke<void>('set_bacon_mcp_enabled', { enabled, path }),
   // Global master switch for delegation (specialists). Off unregisters the
   // in-process specialists MCP server, so the model is never offered
   // call_specialist/await_specialists/list_specialists (re-synced live).

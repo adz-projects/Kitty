@@ -281,6 +281,45 @@ print("OK")
 }
 
 #[tokio::test]
+async fn word_write_doc_strikethrough_runs_are_actually_struck() {
+    let path = tmp_path("strikethrough.docx");
+    let server = KittyToolsServer::new();
+    server
+        .word_write_doc(Parameters(WordWriteDocRequest {
+            path: path.to_string_lossy().to_string(),
+            doc_text: Some(
+                "keep ~~struck word~~ keep and **bold ~~both~~** and ~5 or ~6".to_string(),
+            ),
+            write_mode: Some(WordWriteModeParam::Create),
+            title: None,
+            language: None,
+        }))
+        .await;
+
+    // Independent oracle: python-docx reads `w:strike` as `font.strike`.
+    let check = run_python(&format!(
+        r#"
+from docx import Document
+doc = Document(r"{}")
+p = [p for p in doc.paragraphs if "struck word" in p.text][0]
+runs = [(r.text, r.font.strike, r.bold) for r in p.runs]
+struck = [r for r in p.runs if r.font.strike]
+assert any(r.text == "struck word" for r in struck), runs
+# Bold and strike together on the same run.
+assert any(r.text == "both" and r.bold and r.font.strike for r in p.runs), runs
+# Text outside the markers is not struck, and the markers are gone.
+assert all(not r.font.strike for r in p.runs if r.text.startswith("keep")), runs
+assert "~~" not in p.text, p.text
+# A lone tilde is literal text, not formatting.
+assert "~5 or ~6" in p.text, p.text
+print("OK")
+"#,
+        path.display()
+    ));
+    assert_eq!(check, "OK");
+}
+
+#[tokio::test]
 async fn word_write_doc_append_mode_preserves_existing_content_and_byte_identical_other_parts() {
     let path = tmp_path("append_target.docx");
     run_python(&format!(

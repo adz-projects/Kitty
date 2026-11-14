@@ -576,6 +576,20 @@ pub fn extract_pdf_text(resolved: &Path) -> Result<String, String> {
     Ok(doc.units.join("\n\n"))
 }
 
+/// Per-page text for library callers that need page numbers (Bacon's source
+/// importer). 1-based page numbers; image-only pages carry the explicit
+/// "no text layer" note. Same extract-once cache as the tools. Additive:
+/// no existing call site changes.
+pub fn extract_pdf_pages(resolved: &Path) -> Result<Vec<(u32, String)>, String> {
+    let doc = cached_pdf(resolved)?;
+    Ok(doc
+        .units
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| (i as u32 + 1, text))
+        .collect())
+}
+
 pub fn pdf_read_text(
     path: &str,
     start_page: Option<u32>,

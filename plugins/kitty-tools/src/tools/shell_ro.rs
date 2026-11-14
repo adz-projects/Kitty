@@ -232,10 +232,7 @@ fn escapes_cwd(arg: &str, command: &str) -> Option<&'static str> {
             return Some("names a drive");
         }
     }
-    if arg
-        .split(['/', '\\'])
-        .any(|segment| segment == "..")
-    {
+    if arg.split(['/', '\\']).any(|segment| segment == "..") {
         return Some("climbs out of the working directory");
     }
     None

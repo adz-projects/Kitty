@@ -159,7 +159,10 @@ mod tests {
 
     #[test]
     fn a_map_round_trips_every_field() {
-        let (a, b) = (std::env::temp_dir().join("a"), std::env::temp_dir().join("b"));
+        let (a, b) = (
+            std::env::temp_dir().join("a"),
+            std::env::temp_dir().join("b"),
+        );
         let dirs = std::env::join_paths([a.clone(), PathBuf::from("."), b.clone()]).unwrap();
         let config = InProcessConfig::from_map(&map(&[
             (PLUGIN_HOME_ENV, "home"),
@@ -208,24 +211,6 @@ mod tests {
         assert_ne!(after, Some(PathBuf::from("scoped-home")));
     }
 
-    /// Two servers in one process, configured differently, each advertise
-    /// their own tool surface - the in-process case, where the environment
-    /// cannot tell them apart.
-    #[test]
-    fn servers_in_one_process_follow_their_own_config() {
-        use crate::server::KittyToolsServer;
-        let with = KittyToolsServer::with_config(InProcessConfig {
-            viz_enabled: true,
-            ..Default::default()
-        });
-        let without = KittyToolsServer::with_config(InProcessConfig::default());
-        assert!(with
-            .tool_names()
-            .iter()
-            .any(|n| n == "generate_accessible_chart"));
-        assert!(!without
-            .tool_names()
-            .iter()
-            .any(|n| n == "generate_accessible_chart"));
-    }
+    // The "two servers in one process follow their own config" test lives in
+    // kitty-tools' server.rs, which owns the server.
 }

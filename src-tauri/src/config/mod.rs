@@ -286,6 +286,16 @@ pub struct Config {
     /// as the source value of the carry-forward migration).
     #[serde(default = "default_true")]
     pub kitty_web_enabled: bool,
+    /// Bacon notebook MCP server (Bacon phase 10): a private row pointing at
+    /// the `bacon-mcp` stdio executable, switched on in Settings. Off by
+    /// default; registering it lets Kitty search/read Bacon notes and save
+    /// things into Bacon mid-conversation.
+    #[serde(default)]
+    pub bacon_mcp_enabled: bool,
+    /// Path to the `bacon-mcp` executable. `None` auto-resolves the sibling
+    /// Bacon checkout's build output.
+    #[serde(default)]
+    pub bacon_mcp_path: Option<String>,
     /// One-shot marker for the kitty-docs-web -> kitty-web carry-forward
     /// migration below — same pattern as `kitty_tools_default_migrated`.
     #[serde(default)]
@@ -477,6 +487,8 @@ impl Default for Config {
             // `replacement_mcp_default_migrated` above.
             kitty_tools_default_migrated: true,
             kitty_web_enabled: default_true(),
+            bacon_mcp_enabled: false,
+            bacon_mcp_path: None,
             kitty_web_default_migrated: true,
             kitty_docs_web_enabled: default_true(),
             kitty_docs_web_default_migrated: true,

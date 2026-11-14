@@ -641,6 +641,13 @@ export interface DownloadProgress {
   error?: string;
 }
 
+/** Bacon notebook MCP server switch (`get_bacon_mcp_status`). */
+export interface BaconMcpStatus {
+  enabled: boolean;
+  path: string | null;
+  registered: boolean;
+}
+
 /** A BigTiny MCP server registration — daemon-global, live over REST (no
     restart to add/edit/delete/toggle). `streamable_http` is the MCP spec's
     successor to the old two-endpoint `sse` transport: a single POST endpoint,

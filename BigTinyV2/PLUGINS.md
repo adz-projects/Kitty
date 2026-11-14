@@ -68,7 +68,7 @@ them.
 ### Per-app state in an MCP server
 
 `kitty-tools` resolves its home **once per process** from `KITTY_PLUGIN_HOME`
-(`plugins/kitty-tools/src/paths.rs`), and its scratchpad and document cache
+(`plugins/kitty-doc/src/paths.rs`), and its scratchpad and document cache
 hang off that. Two apps sharing one connection would share a scratchpad.
 
 On Windows, `mcp::manager::scoped_env` gives each app's stdio child

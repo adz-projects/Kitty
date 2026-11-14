@@ -1,12 +1,10 @@
-pub mod config;
-pub mod doc_store;
-pub mod docx;
-pub mod extract;
-pub mod envelope;
-pub mod paths;
-pub mod query_filter;
+// The document library (Word read/write, PDF/Excel/text extraction, document
+// cache, path/config plumbing) lives in `kitty-doc` so apps without the MCP
+// server can link it alone. Re-exported at the original paths: every
+// `kitty_tools::…` call site, including the daemon's, is unchanged.
+pub use kitty_doc::{config, doc_store, docx, envelope, extract, paths, query_filter, text};
+
 pub mod server;
-pub mod text;
 pub mod tools;
 
 use rmcp::ServiceExt;

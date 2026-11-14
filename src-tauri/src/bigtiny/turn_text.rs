@@ -224,8 +224,14 @@ mod tests {
         let parsed = parse(&sent);
         assert_eq!(parsed.text, "remember these");
         assert_eq!(parsed.attachments.len(), 1);
-        assert_eq!(parsed.attachments[0].name, "notes.md", "label is clean of the token");
-        assert!(parsed.attachments[0].pinned, "the pin survives the round trip");
+        assert_eq!(
+            parsed.attachments[0].name, "notes.md",
+            "label is clean of the token"
+        );
+        assert!(
+            parsed.attachments[0].pinned,
+            "the pin survives the round trip"
+        );
     }
 
     #[test]

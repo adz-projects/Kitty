@@ -97,7 +97,7 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
         )}
         {validation && validation.ready && (
           <p className="muted" style={{ margin: 0 }}>
-            Everything checks out. ✓
+            Everything checks out.
           </p>
         )}
         {validation && !validation.ready && (

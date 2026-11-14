@@ -101,9 +101,7 @@ fn decode_text(bytes: &[u8]) -> (String, &'static str, bool) {
 pub fn extract_text_file(resolved: &std::path::Path) -> Result<String, String> {
     let bytes = std::fs::read(resolved).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_FILE_BYTES {
-        return Err(format!(
-            "file exceeds the {MAX_FILE_BYTES} byte read limit"
-        ));
+        return Err(format!("file exceeds the {MAX_FILE_BYTES} byte read limit"));
     }
     let (text, _encoding, _lossy) = decode_text(&bytes);
     Ok(text)

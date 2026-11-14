@@ -143,9 +143,14 @@ binaries still match their source (CI runs it). Full detail in
   agents — plus **4** visualization tools (table, SVG diagram, chart, Mermaid)
   behind their own Settings toggle.
 
+  The document half (Word read/write, PDF/Excel/text extraction, the cache
+  below) is its own library crate, **`plugins/kitty-doc/`**, re-exported by
+  kitty-tools at the old paths and linked directly by Bacon. Its PDF page
+  renderer is a default feature that kitty-tools turns off.
+
   Every paged reader (`lean_file_read`, `lean_word_read_text`,
   `lean_pdf_read_text`) writes through an **extract-once cache**
-  (`plugins/kitty-tools/src/doc_store.rs`) keyed by the file's
+  (`plugins/kitty-doc/src/doc_store.rs`) keyed by the file's
   `(path, len, mtime)` and returns a `document_id`; `lean_doc_read_chunk` and
   `lean_doc_search` read the rest of that extraction without re-parsing the
   source. The id derives from the fingerprint, so an unchanged file keeps its

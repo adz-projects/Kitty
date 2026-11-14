@@ -69,7 +69,9 @@ pub fn read_image(path: &str) -> Result<(String, String, String), String> {
     if len > MAX_IMAGE_BYTES {
         return Err(error_response(
             "IMAGE_TOO_LARGE",
-            &format!("Image is larger than the {MAX_IMAGE_BYTES} byte limit for inlining to the model."),
+            &format!(
+                "Image is larger than the {MAX_IMAGE_BYTES} byte limit for inlining to the model."
+            ),
             Some(&resolved.to_string_lossy()),
             Some("Resize or re-save the image smaller, then read it again."),
         ));

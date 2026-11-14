@@ -1,7 +1,7 @@
 //! Standardized JSON response envelope — a byte-shape-compatible Rust port
 //! of `kitty_docs_web.py`'s `success_response`/`error_response`.
 //!
-//! **Deliberately duplicated** from `plugins/kitty-tools/src/envelope.rs`
+//! **Deliberately duplicated** from `plugins/kitty-doc/src/envelope.rs`
 //! rather than shared through a third crate, mirroring the Python precedent
 //! (`kitty_docs_web.py`'s own header note: "duplicated from `lean_mcp.py`
 //! rather than imported ... a shared package would cost more than it saves").

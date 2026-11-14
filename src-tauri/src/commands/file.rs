@@ -664,7 +664,7 @@ mod tests {
 /// The single directory tree the bundled MCP tool plugins are able to reach.
 ///
 /// `kitty-tools` enforces its own path boundary
-/// (`plugins/kitty-tools/src/paths.rs::path_within_allowed`) independently of
+/// (`plugins/kitty-doc/src/paths.rs::path_within_allowed`) independently of
 /// BigTiny's per-session sandbox. This mirrors the *baseline* of that crate's
 /// resolution order, so a file this function calls reachable really is:
 ///

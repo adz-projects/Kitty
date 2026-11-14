@@ -161,8 +161,8 @@ mod imp {
 
     pub fn register(start: &str) -> Result<(), String> {
         let at = wake_time(start).ok_or_else(|| format!("'{start}' is not a time"))?;
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("could not find Kitty's own path: {e}"))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("could not find Kitty's own path: {e}"))?;
         let xml = task_xml(&exe.to_string_lossy(), &at);
         // Task Scheduler reads task XML as UTF-16 with a byte-order mark.
         let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
@@ -271,12 +271,24 @@ mod tests {
     #[test]
     fn wake_timer_settings_are_read_from_powercfg() {
         let out = "    Possible Setting Index: 002\n    Current AC Power Setting Index: 0x00000001\n    Current DC Power Setting Index: 0x00000000\n";
-        assert_eq!(parse_powercfg(out), WakeTimers { ac: Some(true), dc: Some(false) });
+        assert_eq!(
+            parse_powercfg(out),
+            WakeTimers {
+                ac: Some(true),
+                dc: Some(false)
+            }
+        );
         assert_eq!(parse_powercfg(""), WakeTimers::default());
         let important_only = "Current AC Power Setting Index: 0x00000002";
         assert_eq!(parse_powercfg(important_only).ac, Some(false));
         // A localized Windows: the labels differ, the last two values don't.
         let fr = "    Index du paramètre CA actuel : 0x00000000\n    Index du paramètre CC actuel : 0x00000001\n";
-        assert_eq!(parse_powercfg(fr), WakeTimers { ac: Some(false), dc: Some(true) });
+        assert_eq!(
+            parse_powercfg(fr),
+            WakeTimers {
+                ac: Some(false),
+                dc: Some(true)
+            }
+        );
     }
 }

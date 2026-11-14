@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "adaptive-pathway"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1065,6 +1065,12 @@ checksum = "48f68d061bc2828ae826206326e61251aca94c1e4a5305cf52d9138639c918b4"
 dependencies = [
  "encoding_rs",
 ]
+
+[[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "colored"
@@ -2700,6 +2706,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
+]
+
+[[package]]
 name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3389,10 +3405,14 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
  "moxcms",
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3683,7 +3703,7 @@ dependencies = [
 
 [[package]]
 name = "kitty"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "base64 0.22.1",
  "bigtiny2-client",
@@ -3724,13 +3744,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitty-doc"
+version = "1.0.8"
+dependencies = [
+ "base64 0.22.1",
+ "calamine",
+ "chrono",
+ "dirs 5.0.1",
+ "image",
+ "lopdf",
+ "pdf-extract",
+ "quick-xml 0.41.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "kitty-tools"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "calamine",
  "dirs 5.0.1",
+ "kitty-doc",
  "libc",
  "lopdf",
  "merman",
@@ -3747,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-wasm"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3765,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-web"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4172,7 +4212,7 @@ dependencies = [
 
 [[package]]
 name = "memorabilia"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "async-trait",
  "chrono",

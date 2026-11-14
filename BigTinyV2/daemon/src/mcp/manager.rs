@@ -676,7 +676,7 @@ fn error_result(tool_name: &str, content: String) -> ToolResult {
 /// Give a stdio server owned by an app its own `KITTY_PLUGIN_HOME`.
 ///
 /// `kitty-tools` resolves its home **once per process** from the environment
-/// (`plugins/kitty-tools/src/paths.rs`), and everything it keeps -- the
+/// (`plugins/kitty-doc/src/paths.rs`), and everything it keeps -- the
 /// scratchpad, the extract-once document cache -- hangs off that. Two apps
 /// sharing one connection would therefore share a scratchpad, which is
 /// somewhere between surprising and a data leak.

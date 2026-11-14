@@ -135,7 +135,10 @@ pub const LEGACY_EMBEDDING_FILE: &str = "embeddinggemma-300M_seq256_mixed-precis
 /// user chose themselves never silently becomes EmbeddingGemma 1.
 pub fn embedding_model_ready(name: &str) -> Option<PathBuf> {
     let path = resolve(name).or_else(|| {
-        if !name.trim().eq_ignore_ascii_case(crate::config::DEFAULT_EMBEDDING_GGUF) {
+        if !name
+            .trim()
+            .eq_ignore_ascii_case(crate::config::DEFAULT_EMBEDDING_GGUF)
+        {
             return None;
         }
         let fallback = resolve(LEGACY_EMBEDDING_FILE)?;
@@ -170,7 +173,9 @@ mod tests {
 
     #[test]
     fn only_the_tflite_embedder_needs_a_tokenizer() {
-        assert!(needs_tokenizer("embeddinggemma-300M_seq256_mixed-precision.tflite"));
+        assert!(needs_tokenizer(
+            "embeddinggemma-300M_seq256_mixed-precision.tflite"
+        ));
         assert!(!needs_tokenizer("embeddinggemma-2-text-270m.litertlm"));
         assert!(!needs_tokenizer("gemma-4-E2B-it.litertlm"));
     }

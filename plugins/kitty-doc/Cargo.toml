@@ -1,0 +1,58 @@
+[package]
+name = "kitty-doc"
+version = "1.0.8"
+edition = "2021"
+publish = false
+description = "Document library split out of kitty-tools: Word read/write, PDF/Excel/text extraction, document cache. Pure library — no MCP machinery. kitty-tools re-exports it; Bacon links it directly."
+
+# Standalone package, NOT a workspace member of src-tauri — same rationale as
+# kitty-tools (MSRV/profile/feature isolation). Deliberately free of rmcp,
+# schemars and merman so a notebook app can link the document code without
+# the MCP server's dependency graph.
+
+[lib]
+name = "kitty_doc"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
+dirs = "5"
+base64 = "0.22"
+# Image dimension probing for Word export (decode headers only, no full
+# raster decode) — png/jpeg/gif are the formats the writer embeds.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+calamine = { version = "0.26", features = ["dates"] }
+# calamine's `dates` feature pulls chrono without std; excel.rs formats
+# NaiveDateTime, which needs it. Direct dep so the features unify.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Keep lopdf on the version pdf-extract uses so only one copy is linked.
+lopdf = { version = "0.42", default-features = false }
+pdf-extract = "0.12"
+# Pure-Rust PDF page rasterization for vision reading (phase 8). No native
+# code, so it cross-compiles to Android arm64 like the rest of this crate.
+# Renders are panic-isolated per page (a malformed font must not abort).
+hayro = { version = "0.9", default-features = false, optional = true }
+
+[features]
+# PDF page rasterization (`pdf_render`) is used by Bacon's vision import only.
+# On by default so Bacon gets it unchanged; kitty-tools opts out with
+# `default-features = false`, keeping hayro and its ~20 crates out of Kitty's
+# engine, sidecar and Android builds.
+default = ["pdf-render"]
+pdf-render = ["dep:hayro"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+# panic = "abort" intentionally NOT set: the PDF extractor isolates per-page
+# panics with catch_unwind; abort would turn a malformed font into a dead app.

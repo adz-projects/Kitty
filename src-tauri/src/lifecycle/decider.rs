@@ -181,11 +181,14 @@ fn key_fingerprint(key: &str) -> String {
 fn endpoint_view(v: Option<&Value>) -> Option<Value> {
     let mut v = v?.clone();
     if let Some(o) = v.as_object_mut() {
-        let key = o.remove("api_key").and_then(|k| k.as_str().map(str::to_string));
-        let fp = key
-            .as_deref()
-            .map(key_fingerprint)
-            .or_else(|| o.get("api_key_fingerprint").and_then(Value::as_str).map(str::to_string));
+        let key = o
+            .remove("api_key")
+            .and_then(|k| k.as_str().map(str::to_string));
+        let fp = key.as_deref().map(key_fingerprint).or_else(|| {
+            o.get("api_key_fingerprint")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
         o.remove("api_key_fingerprint");
         o.remove("api_key_set");
         if let Some(fp) = fp {
@@ -199,12 +202,14 @@ fn endpoint_view(v: Option<&Value>) -> Option<Value> {
 /// longer sends (the user cleared an override) must be back at its default
 /// in the engine, or the old cutoff stays in force there.
 fn same_with_defaults(have: &Value, want: &Value, defaults: Option<&Value>) -> bool {
-    if ["dialect", "url", "model"].iter().any(|k| have.get(*k) != want.get(*k)) {
+    if ["dialect", "url", "model"]
+        .iter()
+        .any(|k| have.get(*k) != want.get(*k))
+    {
         return false;
     }
-    let key_of = |v: &Value| {
-        endpoint_view(Some(v)).and_then(|e| e.get("api_key_fingerprint").cloned())
-    };
+    let key_of =
+        |v: &Value| endpoint_view(Some(v)).and_then(|e| e.get("api_key_fingerprint").cloned());
     if key_of(have) != key_of(want) {
         return false;
     }
@@ -229,7 +234,9 @@ fn same_with_defaults(have: &Value, want: &Value, defaults: Option<&Value>) -> b
     // The engine echoes every group with its defaults filled in (`always:
     // false`, `file_types: []`), which the catalog leaves out; compared raw,
     // the two never matched and every self-heal re-sent the settings.
-    if groups_with_defaults(have.get("tool_groups")) != groups_with_defaults(want.get("tool_groups")) {
+    if groups_with_defaults(have.get("tool_groups"))
+        != groups_with_defaults(want.get("tool_groups"))
+    {
         return false;
     }
     let screen_matches = match want.get("paragraph_screen") {
@@ -258,11 +265,9 @@ fn same_with_defaults(have: &Value, want: &Value, defaults: Option<&Value>) -> b
     let have_t = have["thresholds"].as_object().unwrap_or(&empty);
     have_t.iter().all(|(k, v)| {
         want_t.contains_key(k)
-            || defaults
-                .get(k)
-                .map_or(true, |d| {
-                    (d.as_f64().unwrap_or(f64::NAN) - v.as_f64().unwrap_or(f64::NAN)).abs() < 1e-9
-                })
+            || defaults.get(k).map_or(true, |d| {
+                (d.as_f64().unwrap_or(f64::NAN) - v.as_f64().unwrap_or(f64::NAN)).abs() < 1e-9
+            })
     })
 }
 
@@ -418,8 +423,7 @@ mod tests {
             url: "http://box:8080".into(),
             ..DeciderSettings::default()
         };
-        s.thresholds
-            .insert("tool_gating_add".into(), json!(0.75));
+        s.thresholds.insert("tool_gating_add".into(), json!(0.75));
         let want = desired(&s, None, None).unwrap();
         let mut have = want.clone();
         have["thresholds"] = json!({"tool_gating_add": 0.75, "tool_gating_cold": 0.3});

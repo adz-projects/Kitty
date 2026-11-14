@@ -42,7 +42,7 @@ export function AttachmentChips() {
                   togglePinned(a.id);
                 }}
               >
-                {a.pinned ? '📌 Remembering' : 'Remember this'}
+                {a.pinned ? 'Remembering' : 'Remember this'}
               </button>
               <button
                 className="chip-x"

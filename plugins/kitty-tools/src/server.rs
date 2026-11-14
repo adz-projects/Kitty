@@ -1024,12 +1024,19 @@ impl KittyToolsServer {
                 "create"
             };
 
-            match docx::write::write_document(
+            // Images in the markdown are embedded only from inside the
+            // granted folders, the same boundary every other file tool keeps.
+            let options = docx::write::WriteOptions {
+                image_gate: Some(crate::paths::path_within_allowed),
+                ..Default::default()
+            };
+            match docx::write::write_document_with_options(
                 &resolved,
                 req.doc_text.as_deref(),
                 mode,
                 req.title.as_deref(),
                 language,
+                &options,
             ) {
                 Ok(result) => success_response(
                     json!({"path": result.path, "mode": result.mode, "language": result.language}),
@@ -1196,9 +1203,10 @@ impl KittyToolsServer {
         })
         .await;
         match outcome {
-            Ok(Ok((data, mime, note))) => {
-                CallToolResult::success(vec![ContentBlock::text(note), ContentBlock::image(data, mime)])
-            }
+            Ok(Ok((data, mime, note))) => CallToolResult::success(vec![
+                ContentBlock::text(note),
+                ContentBlock::image(data, mime),
+            ]),
             Ok(Err(envelope)) => CallToolResult::error(vec![ContentBlock::text(envelope)]),
             Err(_) => CallToolResult::error(vec![ContentBlock::text(error_response(
                 "INTERNAL_ERROR",
@@ -1483,5 +1491,31 @@ impl ServerHandler for KittyToolsServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         crate::config::scope(self.config.clone(), self.tool_router.call(tcc)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::InProcessConfig;
+
+    /// Two servers in one process, configured differently, each advertise
+    /// their own tool surface - the in-process case, where the environment
+    /// cannot tell them apart. (Moved here from config.rs when the document
+    /// library split out into kitty-doc.)
+    #[test]
+    fn servers_in_one_process_follow_their_own_config() {
+        let with = super::KittyToolsServer::with_config(InProcessConfig {
+            viz_enabled: true,
+            ..Default::default()
+        });
+        let without = super::KittyToolsServer::with_config(InProcessConfig::default());
+        assert!(with
+            .tool_names()
+            .iter()
+            .any(|n| n == "generate_accessible_chart"));
+        assert!(!without
+            .tool_names()
+            .iter()
+            .any(|n| n == "generate_accessible_chart"));
     }
 }

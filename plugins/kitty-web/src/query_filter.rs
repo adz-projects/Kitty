@@ -3,7 +3,7 @@
 //! continuation; no fabricated "no direct matches" string spliced into the
 //! returned data — callers surface that as a `message` instead).
 //!
-//! Byte-for-byte the same logic as `plugins/kitty-tools/src/query_filter.rs`
+//! Byte-for-byte the same logic as `plugins/kitty-doc/src/query_filter.rs`
 //! (the Python originals are themselves duplicates of each other, and this
 //! one has no divergence to preserve the way `envelope.rs` does). Duplicated
 //! for the same reason — see this crate's `envelope.rs` header. Used here by

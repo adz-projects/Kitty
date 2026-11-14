@@ -82,7 +82,10 @@ async fn listen_once(app: &AppHandle) -> Result<(), String> {
             // events were dropped. Approvals among them would stay invisible,
             // so collect whatever is pending again.
             if frame.trim_start().starts_with(": lagged") {
-                tracing::warn!("app event stream lagged ({}); re-syncing approvals", frame.trim());
+                tracing::warn!(
+                    "app event stream lagged ({}); re-syncing approvals",
+                    frame.trim()
+                );
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move { recover_pending(&app).await });
                 continue;

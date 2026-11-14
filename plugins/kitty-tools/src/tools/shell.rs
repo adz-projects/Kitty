@@ -459,7 +459,10 @@ mod tests {
             .and_then(|rest| rest.split_whitespace().next())
             .is_some_and(|s| s != "Z");
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!alive, "grandchild {grandchild} survived the timeout: {state}");
+        assert!(
+            !alive,
+            "grandchild {grandchild} survived the timeout: {state}"
+        );
     }
 
     #[cfg(windows)]

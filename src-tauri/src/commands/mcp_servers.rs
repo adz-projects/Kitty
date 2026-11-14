@@ -276,3 +276,133 @@ pub(crate) async fn apply(app: &tauri::AppHandle, server: &str, label: &str) -> 
         })?
         .check(server, label)
 }
+
+// ---------------------------------------------------------------------------
+// Bacon notebook MCP server (Bacon phase 10). A PRIVATE row named "bacon"
+// pointing at the bacon-mcp stdio executable — not a builtin, so it is not
+// part of ensure_builtin_servers. Switched on here; off by default. A private
+// row (rather than a shared one) is deliberate: a shared row is immutable even
+// to its creator, so a path that changes on update would be stuck.
+// ---------------------------------------------------------------------------
+
+const BACON_MCP_NAME: &str = "bacon";
+
+#[derive(serde::Serialize)]
+pub struct BaconMcpStatus {
+    pub enabled: bool,
+    pub path: Option<String>,
+    pub registered: bool,
+}
+
+#[tauri::command]
+pub async fn get_bacon_mcp_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<BaconMcpStatus, String> {
+    let (enabled, path) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.bacon_mcp_enabled, cfg.bacon_mcp_path.clone())
+    };
+    let registered = match ensure_client(&app) {
+        Ok(client) => mcp::list_servers(&client)
+            .await
+            .map(|servers| servers.iter().any(|s| s.name == BACON_MCP_NAME))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    Ok(BaconMcpStatus {
+        enabled,
+        path,
+        registered,
+    })
+}
+
+#[tauri::command]
+pub async fn set_bacon_mcp_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+    path: Option<String>,
+) -> Result<(), String> {
+    // Find the executable before recording anything: a switch saved as on
+    // with nothing to point at would show as enabled but never register.
+    let exe = if enabled {
+        Some(resolve_bacon_mcp_path(path.as_deref()).ok_or(
+            "Could not find the bacon-mcp executable. Build it in the Bacon repo (cargo build --release in crates/bacon-mcp) or set its path.",
+        )?)
+    } else {
+        None
+    };
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.bacon_mcp_enabled = enabled;
+        cfg.bacon_mcp_path = path.clone();
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    let client = ensure_client(&app)?;
+    let existing = mcp::list_servers(&client)
+        .await?
+        .into_iter()
+        .find(|s| s.name == BACON_MCP_NAME);
+
+    let Some(exe) = exe else {
+        if let Some(row) = existing {
+            mcp::delete_server(&client, &row.id).await?;
+        }
+        return Ok(());
+    };
+    let exe_str = exe.to_string_lossy().into_owned();
+    match existing {
+        Some(row) => {
+            let patch = McpServerPatch {
+                command: Some(exe_str),
+                enabled: Some(true),
+                ..Default::default()
+            };
+            mcp::update_server(&client, &row.id, &patch).await?;
+            let _ = mcp::connect_server(&client, &row.id).await;
+        }
+        None => {
+            let spec = McpServerSpec {
+                name: BACON_MCP_NAME.to_string(),
+                transport: "stdio".to_string(),
+                command: Some(exe_str),
+                args: Vec::new(),
+                url: None,
+                env: Default::default(),
+                headers: Default::default(),
+                timeout_s: Some(60),
+                enabled: true,
+            };
+            let id = mcp::create_server(&client, &spec).await?;
+            let _ = mcp::connect_server(&client, &id).await;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the bacon-mcp executable: an explicit path wins; otherwise look in
+/// the sibling Bacon checkout's build output (release, then debug). That
+/// fallback is relative to where this crate was *built*, so it only finds
+/// anything on a development machine; an installed Kitty needs the path.
+fn resolve_bacon_mcp_path(explicit: Option<&str>) -> Option<std::path::PathBuf> {
+    if let Some(p) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
+        let path = std::path::PathBuf::from(p);
+        return path.is_file().then_some(path);
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Kitty/src-tauri -> Kitty -> sibling Bacon.
+    let bacon = manifest.parent()?.parent()?.join("Bacon");
+    for profile in ["release", "debug"] {
+        let exe = bacon
+            .join("crates")
+            .join("bacon-mcp")
+            .join("target")
+            .join(profile)
+            .join("bacon-mcp.exe");
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    None
+}

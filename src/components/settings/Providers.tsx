@@ -6,6 +6,7 @@ import type { OpenRouterCredits, ProviderProfile, ProviderView } from '@/lib/typ
 import { TrustIcon, trustKind } from '@/lib/provider_trust';
 import { ProviderTypeIcon, providerTypeLabel } from '@/components/icons/ProviderTypeIcon';
 import { StarIcon } from '@/components/icons/StarIcon';
+import { KeyIcon } from '@/components/icons/KeyIcon';
 import { PencilIcon } from '@/components/icons/PencilIcon';
 import { CopyIcon } from '@/components/icons/CopyIcon';
 import { TrashIcon } from '@/components/icons/TrashIcon';
@@ -222,7 +223,11 @@ export function Providers({ highlight }: { highlight: string | null }) {
                 >
                   <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
                 </span>
-                {p.has_secret && <span title="API key stored">🔑</span>}
+                {p.has_secret && (
+                  <span title="API key stored" aria-label="API key stored">
+                    <KeyIcon />
+                  </span>
+                )}
                 {p.active && (
                   <span
                     title="Default for new chats — an already-open session keeps whatever provider it's already on, unaffected by this"

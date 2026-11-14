@@ -246,7 +246,9 @@ pub async fn list_page(
 ) -> Result<(Vec<Value>, i64), String> {
     let client = ensure_client(app)?;
     let result = client
-        .get_json(&format!("/api/chat/?limit={limit}&offset={offset}&slim=true"))
+        .get_json(&format!(
+            "/api/chat/?limit={limit}&offset={offset}&slim=true"
+        ))
         .await?;
     let rows = result
         .get("sessions")
@@ -385,7 +387,10 @@ pub(crate) async fn session_row(client: &BigTinyClient, session_id: &str) -> Opt
     }
     for page in 0..MAX_PAGES {
         let result = client
-            .get_json(&format!("/api/chat/?limit={PAGE}&offset={}&slim=true", page * PAGE))
+            .get_json(&format!(
+                "/api/chat/?limit={PAGE}&offset={}&slim=true",
+                page * PAGE
+            ))
             .await
             .ok()?;
         let rows = result.get("sessions")?.as_array()?;

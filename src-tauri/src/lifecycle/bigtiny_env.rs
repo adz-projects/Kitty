@@ -241,7 +241,10 @@ pub fn daemon_env(
         ("BIGTINY_LITERT__LIB_PATH".to_string(), lib_name.to_string()),
         ("BIGTINY_LITERT__EMBED_MODEL_PATH".to_string(), embed_model),
         ("BIGTINY_LITERT__TOKENIZER_PATH".to_string(), tokenizer),
-        ("BIGTINY_LITERT__EMBED_LIB_PATH".to_string(), embed_lib_name.to_string()),
+        (
+            "BIGTINY_LITERT__EMBED_LIB_PATH".to_string(),
+            embed_lib_name.to_string(),
+        ),
         (
             "BIGTINY_LITERT__SUMMARIZER_MODEL_PATH".to_string(),
             summarizer_litertlm,

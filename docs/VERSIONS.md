@@ -1554,3 +1554,27 @@ that window. The System One wire format is shared by the engine and kitty-web
 truncated-JSON recovery, per-chunk commits under a drop-guarded lock, and
 forced passes that survive the next turn. Kitty reopens the chat when the
 engine's own pass lands.
+
+## Bacon look, kitty-doc split (1.0.8)
+
+**Themes**: the built-in light and dark themes use Bacon's palette (paper and
+ink, walnut and lamp-lit paper, bookcloth green). Answers are set in EB
+Garamond (bundled from `@fontsource-variable/eb-garamond`), the user's own
+turns are a tinted block instead of an accent bubble, the chat is one centred
+reading column, corners are 4px/3px, and status panels are tinted rather than
+outlined. New optional theme properties are listed in `src/themes/README.md`.
+
+**kitty-doc**: the document library moved out of kitty-tools into
+`plugins/kitty-doc/` so Bacon can link it without the MCP server. kitty-tools
+re-exports it at the old paths, so no tool or engine call site changed. New in
+the Word writer: images (with alt text), footnotes, fenced code, quotes,
+strikethrough, nested lists, heading levels 5-6, a serif style template, and
+`w:lang` in `docDefaults` instead of on the styles root. `lean_word_write_doc`
+embeds an image only from inside the chat's granted folders. Appending to a
+document that already has images or footnotes numbers the new ones after the
+existing ones and adds no duplicate relationship or content type. The PDF
+page renderer (`pdf-render` feature, hayro) is Bacon-only and stays out of
+Kitty's builds.
+
+**Bacon notebook server**: Settings → MCP servers can register Bacon's
+`bacon-mcp` stdio server as a private row (desktop only, off by default).

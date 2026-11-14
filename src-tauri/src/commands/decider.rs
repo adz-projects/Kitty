@@ -34,7 +34,12 @@ async fn apply_key(slot: &str, value: Option<String>) {
 
 #[tauri::command]
 pub fn get_decider_settings(app: AppHandle) -> DeciderSettings {
-    app.state::<AppState>().config.lock().unwrap().decider.clone()
+    app.state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .decider
+        .clone()
 }
 
 /// Whether an API key is stored for the main / backup decision model, so the
@@ -66,9 +71,8 @@ pub async fn set_decider_settings(
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
         let old = &cfg.decider;
-        let model_changed = old.model.is_some()
-            && settings.model.is_some()
-            && old.model != settings.model;
+        let model_changed =
+            old.model.is_some() && settings.model.is_some() && old.model != settings.model;
         if model_changed && settings.thresholds == old.thresholds {
             settings.thresholds.clear();
         }
@@ -145,7 +149,11 @@ pub async fn set_decider_chunking(app: AppHandle, on: bool) -> Result<(), String
     {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
-        let mut ps = cfg.decider.paragraph_screen.clone().unwrap_or_else(default_screen_set);
+        let mut ps = cfg
+            .decider
+            .paragraph_screen
+            .clone()
+            .unwrap_or_else(default_screen_set);
         ps["batch_size"] = Value::from(if on { CHUNK_BATCH_ON } else { 1 });
         cfg.decider.paragraph_screen = Some(ps);
         config::save(&cfg).map_err(|e| e.to_string())?;
@@ -171,13 +179,10 @@ pub async fn get_decider_stats(app: AppHandle) -> Result<Value, String> {
 #[tauri::command]
 pub async fn get_decider_defaults(app: AppHandle) -> Result<Value, String> {
     let client = crate::bigtiny::client::ensure_client(&app)?;
-    let v = client
-        .get_json("/api/apps/me/decider")
-        .await
-        .map_err(|e| {
-            tracing::warn!("decision-model defaults failed: {e}");
-            "Could not read the decision-model defaults.".to_string()
-        })?;
+    let v = client.get_json("/api/apps/me/decider").await.map_err(|e| {
+        tracing::warn!("decision-model defaults failed: {e}");
+        "Could not read the decision-model defaults.".to_string()
+    })?;
     Ok(serde_json::json!({
         "dialects": v.get("dialects").cloned().unwrap_or(Value::Null),
         "default_thresholds": v.get("default_thresholds").cloned().unwrap_or(Value::Null),

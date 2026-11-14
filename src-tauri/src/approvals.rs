@@ -55,26 +55,26 @@ fn target_paths(args: &Value) -> Vec<&str> {
 /// so a wrapper (`cmd /c rm -rf ...`) still matches. Covers the Windows forms
 /// too, since `lean_shell` runs under `cmd.exe` there.
 pub(crate) const SECURITY_SENSITIVE_PATTERN: &str = concat!(
-            r"(?i)",
-            // Remote access, privilege, permissions, network, power.
-            r"\b(ssh|scp|sftp|sudo|su|runas|chmod|chown|icacls|takeown|cacls|netsh|iptables|",
-            r"shutdown|format|diskpart|nc|ncat|telnet|taskkill|schtasks|bcdedit|vssadmin|cipher|",
-            r"Stop-Computer|Restart-Computer|Set-ExecutionPolicy)\b",
-            // Unix recursive or forced removal, in any flag order or spelling.
-            r"|\brm\s+(?:-\S*\s+)*-\S*[rRf]",
-            r"|\brm\s+--(?:recursive|force)\b",
-            // Windows deletion: del/erase with any switch, rd/rmdir /s,
-            // PowerShell Remove-Item (and its aliases) recursive or forced.
-            r"|\b(del|erase)\s+(?:\S+\s+)*?/[sqfSQF]\b",
-            r"|\b(rd|rmdir)\s+(?:\S+\s+)*?/[sS]\b",
-            r"|\b(Remove-Item|ri)\b[^|;&]*-(Recurse|Force)\b",
-            r"|\b(reg)\s+(delete|add|import)\b",
-            // Downloads to disk.
-            r"|\bcurl\b[^|;&]*\s-[a-zA-Z]*[oO]\b|\bwget\b[^|;&]*\s-O\b",
-            r"|\b(Invoke-WebRequest|iwr|Start-BitsTransfer|certutil)\b[^|;&]*(-OutFile|-urlcache|Destination)",
-            // Encoded or hidden PowerShell.
-            r"|\b(powershell|pwsh)(\.exe)?\b[^|;&]*\s-(e|ec|enc|encodedcommand)\b",
-        );
+    r"(?i)",
+    // Remote access, privilege, permissions, network, power.
+    r"\b(ssh|scp|sftp|sudo|su|runas|chmod|chown|icacls|takeown|cacls|netsh|iptables|",
+    r"shutdown|format|diskpart|nc|ncat|telnet|taskkill|schtasks|bcdedit|vssadmin|cipher|",
+    r"Stop-Computer|Restart-Computer|Set-ExecutionPolicy)\b",
+    // Unix recursive or forced removal, in any flag order or spelling.
+    r"|\brm\s+(?:-\S*\s+)*-\S*[rRf]",
+    r"|\brm\s+--(?:recursive|force)\b",
+    // Windows deletion: del/erase with any switch, rd/rmdir /s,
+    // PowerShell Remove-Item (and its aliases) recursive or forced.
+    r"|\b(del|erase)\s+(?:\S+\s+)*?/[sqfSQF]\b",
+    r"|\b(rd|rmdir)\s+(?:\S+\s+)*?/[sS]\b",
+    r"|\b(Remove-Item|ri)\b[^|;&]*-(Recurse|Force)\b",
+    r"|\b(reg)\s+(delete|add|import)\b",
+    // Downloads to disk.
+    r"|\bcurl\b[^|;&]*\s-[a-zA-Z]*[oO]\b|\bwget\b[^|;&]*\s-O\b",
+    r"|\b(Invoke-WebRequest|iwr|Start-BitsTransfer|certutil)\b[^|;&]*(-OutFile|-urlcache|Destination)",
+    // Encoded or hidden PowerShell.
+    r"|\b(powershell|pwsh)(\.exe)?\b[^|;&]*\s-(e|ec|enc|encodedcommand)\b",
+);
 
 fn security_sensitive(command: &str) -> bool {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -270,7 +270,10 @@ mod tests {
             "relative resolves inside"
         );
         assert_eq!(
-            decide(&json!({"file_path": "c:/USERS/me/kitty/CHATS/c1/x"}), Some(&d)),
+            decide(
+                &json!({"file_path": "c:/USERS/me/kitty/CHATS/c1/x"}),
+                Some(&d)
+            ),
             Decision::Allow,
             "case-insensitive"
         );

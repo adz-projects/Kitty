@@ -1,18 +1,29 @@
-/* Dark theme — same custom-property contract as default.css. */
+/* Dark theme — same custom-property contract as light.css. Palette shared
+   with Bacon: walnut and lamp-lit paper, bookcloth green for what can be
+   acted on. `--accent` is the light green used for text and outlines;
+   `--accent-fill` is the deeper green behind `--accent-text`. */
 :root {
-  --bg: #18181b;
-  --surface: #27272a;
-  --surface-2: #1f1f23;
-  --text: #f4f4f5;
-  --text-muted: #a1a1aa;
-  --accent: #818cf8;
-  --accent-text: #18181b;
-  --border: #3f3f46;
-  --radius: 12px;
+  --bg: #100e0b;
+  --surface: #1b1814;
+  --surface-2: #2c2721;
+  --text: #f6efe0;
+  --text-muted: #c4b9a6;
+  --accent: #bfd0aa;
+  --accent-fill: #465d48;
+  --accent-text: #f0e8d8;
+  --border: #51483c;
+  --radius: 4px;
+  --radius-sm: 3px;
   --font-family: 'Montserrat', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-serif: 'EB Garamond Variable', 'EB Garamond', Garamond, 'Iowan Old Style', Georgia, serif;
+  --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --selection: #4d4431;
   --overlay-opacity: 1;
-  --overlay-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
-  --ok: #22c55e;
-  --warn: #f59e0b;
-  --danger: #f87171;
+  --overlay-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 28px rgba(0, 0, 0, 0.32);
+  --ok: #9dbb8f;
+  --warn: #d3ab62;
+  --ok-bg: rgba(157, 187, 143, 0.11);
+  --warn-bg: rgba(211, 171, 98, 0.11);
+  --danger-bg: rgba(217, 140, 126, 0.11);
+  --danger: #d98c7e;
 }

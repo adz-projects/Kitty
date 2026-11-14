@@ -26,8 +26,8 @@ pub mod bigtiny_env;
 pub mod bigtiny_proc;
 #[cfg(not(target_os = "android"))]
 pub mod bigtiny_v2;
-pub(crate) mod embedding;
 pub mod decider;
+pub(crate) mod embedding;
 pub mod engine_restart;
 mod health;
 pub mod memory;

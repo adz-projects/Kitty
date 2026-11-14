@@ -35,11 +35,11 @@
 use std::path::{Path, PathBuf};
 
 /// Environment variable carrying [`static_allowed_dirs`]. Mirrors
-/// `plugins/kitty-tools/src/paths.rs::ALLOWED_DIRS_ENV`.
+/// `plugins/kitty-doc/src/paths.rs::ALLOWED_DIRS_ENV`.
 pub const ALLOWED_DIRS_ENV: &str = "KITTY_ALLOWED_DIRS";
 
 /// Environment variable naming the file [`publish`] writes. Mirrors
-/// `plugins/kitty-tools/src/paths.rs::ALLOWED_DIRS_FILE_ENV`.
+/// `plugins/kitty-doc/src/paths.rs::ALLOWED_DIRS_FILE_ENV`.
 pub const ALLOWED_DIRS_FILE_ENV: &str = "KITTY_ALLOWED_DIRS_FILE";
 
 /// The directories every session may reach, joined with the platform's `PATH`
@@ -130,7 +130,7 @@ pub fn publish(data_dir: &Path, app_id: &str, dirs: &[String]) {
 /// which the file on disk is short or empty. That window matters here because
 /// of how the other side reads: `kitty-tools` caches this file's parse against
 /// a `(mtime, len)` stamp, stat-ing first and reading second
-/// (`plugins/kitty-tools/src/paths.rs`). A read landing inside the window gets
+/// (`plugins/kitty-doc/src/paths.rs`). A read landing inside the window gets
 /// truncated JSON, which parses to no grants at all — and the empty result is
 /// then cached against the completed write's stamp, so it persists until the
 /// file next changes. The daemon's own per-session `check_containment` is the

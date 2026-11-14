@@ -16,13 +16,25 @@ apply at runtime with no rebuild.
 | `--text`            | Primary text                                   |
 | `--text-muted`      | Secondary / muted text                         |
 | `--accent`          | Accent (primary buttons, active state)         |
-| `--accent-text`     | Text on the accent color                       |
+| `--accent-text`     | Text on the accent fill                        |
 | `--border`          | Borders / dividers                             |
-| `--radius`          | Corner radius (e.g. `12px`)                    |
+| `--radius`          | Corner radius for cards and dialogs (e.g. `4px`) |
 | `--font-family`     | UI font stack                                  |
 | `--overlay-opacity` | Overlay card opacity (`0`–`1`)                 |
 | `--overlay-shadow`  | Overlay card box-shadow                        |
 | `--ok` / `--warn` / `--danger` | Status colors                       |
+
+## Optional custom properties
+
+| Property        | Meaning                                                       |
+| --------------- | ------------------------------------------------------------- |
+| `--accent-fill` | Background behind `--accent-text` (primary buttons, your own messages). Defaults to `--accent`; set it when the accent is too light to carry text, as in the built-in dark theme. |
+| `--mono`        | Monospace font stack                                          |
+| `--font-serif`  | Reading face for assistant answers and their headings. Defaults to the UI font. EB Garamond is bundled. |
+| `--radius-sm`   | Corner radius for buttons, chips and badges. Defaults to ¾ of `--radius`. |
+| `--reading-max-width` / `--reading-line-height` | Width of the chat column (default `44rem`) and answer leading (default `1.6`). |
+| `--selection`   | Text-selection background. Defaults to the system highlight.  |
+| `--ok-bg` / `--warn-bg` / `--danger-bg` | Tinted backgrounds for success, warning and error panels. Default to `--surface-2` or none. |
 
 ## Minimal example
 

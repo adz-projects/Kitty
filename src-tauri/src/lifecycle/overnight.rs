@@ -63,7 +63,13 @@ pub async fn sync_wake_task(app: &AppHandle) -> Result<(), String> {
     if cfg!(target_os = "android") {
         return Ok(());
     }
-    let settings = app.state::<AppState>().config.lock().unwrap().overnight.clone();
+    let settings = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .overnight
+        .clone();
     tauri::async_runtime::spawn_blocking(move || super::wake_task::sync(&settings))
         .await
         .map_err(|e| e.to_string())?

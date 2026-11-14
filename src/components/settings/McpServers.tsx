@@ -36,6 +36,9 @@ const HIDDEN_SERVER_NAMES = new Set([
   'kitty-web',
   'kitty-wasm',
   'kitty-docs-web',
+  // The Bacon notebook server (Bacon phase 10): a private row managed by its
+  // own card below, not an editable generic MCP row.
+  'bacon',
 ]);
 
 type Transport = 'stdio' | 'sse' | 'streamable_http';
@@ -54,7 +57,7 @@ const emptyForm = {
       server-side — BigTiny redacts the real value in every response
       (`"***"`, encrypted at rest), so this is a presence flag, not
       something the real value could ever be read back into. Drives the
-      "🔑 key stored" placeholder and the submit-time omit-if-untouched
+      "Key stored" placeholder and the submit-time omit-if-untouched
       logic below, mirroring Providers.tsx's `has_secret` convention. */
   hasStoredKey: false,
 };
@@ -187,7 +190,6 @@ export function McpServers() {
   useEffect(() => {
     const t = window.setInterval(() => void load(), 10_000);
     return () => window.clearInterval(t);
-     
   }, []);
 
   // Visualizations live inside the file tools and Brave inside web search, so
@@ -347,6 +349,8 @@ export function McpServers() {
           }}
         />
         <BraveMcpSearchCard parentOn={webOn} />
+        {/* bacon-mcp is a desktop stdio executable. */}
+        {!isAndroid() && <BaconMcpCard />}
       </div>
 
       <div className="ext-grid ext-grid-1col">
@@ -421,7 +425,7 @@ export function McpServers() {
               type="password"
               placeholder={
                 form.hasStoredKey
-                  ? '🔑 key stored — leave blank to keep, or type to replace'
+                  ? 'Key stored — leave blank to keep, or type to replace'
                   : 'API key (optional — sent as a Bearer token)'
               }
               value={form.apiKey}
@@ -810,6 +814,85 @@ function BraveMcpSearchCard({ parentOn }: { parentOn: boolean }) {
             {busy ? 'Saving…' : 'Enable'}
           </button>
         </div>
+      )}
+      {error && <div className="chat-error">{error}</div>}
+    </div>
+  );
+}
+
+/** Dedicated card for the Bacon notebook MCP server (Bacon phase 10). A
+    private stdio row pointing at the `bacon-mcp` executable, so Kitty can
+    search/read Bacon notes and save things into Bacon mid-conversation. Off
+    by default; the path auto-resolves the sibling Bacon checkout's build
+    output unless set explicitly. */
+function BaconMcpCard() {
+  const [enabled, setEnabled] = useState(false);
+  const [path, setPath] = useState('');
+  const [registered, setRegistered] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    void ipc
+      .getBaconMcpStatus()
+      .then((s) => {
+        setEnabled(s.enabled);
+        setPath(s.path ?? '');
+        setRegistered(s.registered);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await ipc.setBaconMcpEnabled(next, path.trim() === '' ? null : path.trim());
+      setEnabled(next);
+      const s = await ipc.getBaconMcpStatus().catch(() => null);
+      if (s) setRegistered(s.registered);
+    } catch (e) {
+      setError(String(e));
+      const s = await ipc.getBaconMcpStatus().catch(() => null);
+      if (s) {
+        setEnabled(s.enabled);
+        setRegistered(s.registered);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="ext-card">
+      <label className="ext-card-head">
+        <span className="ext-card-name">Bacon Notebook</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(ev) => void toggle(ev.target.checked)}
+        />
+      </label>
+      <span className="muted ext-card-desc">
+        Search and read your Bacon notes, and save things into Bacon, mid-conversation. Needs the
+        Bacon app's bacon-mcp server built (crates/bacon-mcp).
+      </span>
+      <input
+        type="text"
+        value={path}
+        placeholder="bacon-mcp path (blank = auto-detect sibling Bacon build)"
+        onChange={(ev) => setPath(ev.target.value)}
+        onBlur={() => enabled && void toggle(true)}
+        style={{ marginTop: 8, width: '100%' }}
+        aria-label="bacon-mcp executable path"
+      />
+      {enabled && (
+        <span className="muted ext-card-desc">
+          {registered
+            ? 'Registered with the engine.'
+            : 'Not registered yet. Turn it off and on again once the engine is running.'}
+        </span>
       )}
       {error && <div className="chat-error">{error}</div>}
     </div>
