@@ -6,7 +6,8 @@
 //!   and reused. It routes internally between chat, settings and setup
 //!   (docs/ANDROID.md §8.1), which is why there is no longer a `settings` or
 //!   `wizard` label: `open_settings`/`open_wizard` now focus a hub and emit
-//!   `route://goto` at it.
+//!   `route://goto` at it. On desktop it is decorationless and draws its own
+//!   title bar, as Bacon's windows do.
 //! - `screenshot-select` — a transient, transparent, always-on-top region
 //!   picker sized to one monitor. Despite §8.1, this one *cannot* be a hub
 //!   route: it needs its own decorationless fullscreen surface, for the same
@@ -635,12 +636,17 @@ fn ensure_window(
     if let Some(win) = app.get_webview_window(label) {
         return Ok(win);
     }
-    let win = WebviewWindowBuilder::new(app, label, url(label))
+    let builder = WebviewWindowBuilder::new(app, label, url(label))
         .title(title)
         .inner_size(initial_size.0, initial_size.1)
         .min_inner_size(640.0, 420.0)
-        .visible(false)
-        .build()?;
+        .visible(false);
+    // The hub draws its own title bar (`components/shared/TitleBar.tsx`), the
+    // same construction as Bacon's windows, so the desktop window has no
+    // native frame. Windows keeps the drop shadow and the resize edges.
+    #[cfg(desktop)]
+    let builder = builder.decorations(false);
+    let win = builder.build()?;
     #[cfg(debug_assertions)]
     spawn_load_watchdog(app, win.clone(), label.to_string());
     Ok(win)

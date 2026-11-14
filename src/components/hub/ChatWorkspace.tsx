@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ipc } from '@/lib/ipc';
 import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
@@ -15,7 +16,6 @@ import { ChatHeaderControls } from '@/components/chat/ChatHeaderControls';
 import { HubBanners } from './HubBanners';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
-import { KittyIcon } from '@/components/icons/KittyIcon';
 import { ExportIcon } from '@/components/icons/ExportIcon';
 import { MenuIcon } from '@/components/icons/MenuIcon';
 import type { StackStatus } from '@/lib/types';
@@ -23,8 +23,12 @@ import type { StackStatus } from '@/lib/types';
 const DEGRADED: StackStatus[] = ['backend_down'];
 
 /** Full window: history sidebar + shared chat surface + artifacts pane. On open
-    it adopts the session handed over from the overlay (Expand). */
-export function ChatWorkspace() {
+    it adopts the session handed over from the overlay (Expand).
+
+    On the desktop the chat's actions (export, artifacts, settings, new chat)
+    sit in the window's title bar, rendered into `titleBarSlot` while the chat
+    route is showing; on Android they stay in the header row above the chat. */
+export function ChatWorkspace({ titleBarSlot }: { titleBarSlot: HTMLElement | null }) {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
   const initAdaptivePathway = useAdaptivePathwayStore((s) => s.init);
@@ -35,6 +39,7 @@ export function ChatWorkspace() {
   const exportSession = useChatStore((s) => s.exportSession);
   const newSession = useChatStore((s) => s.newSession);
   const goto = useRouteStore((s) => s.goto);
+  const view = useRouteStore((s) => s.view);
   const openDrawer = useMobileUiStore((s) => s.setDrawerOpen);
   const android = isAndroid();
   const [showArtifacts, setShowArtifacts] = useState(true);
@@ -119,66 +124,63 @@ export function ChatWorkspace() {
   const bootSpinner = status === 'backend_down' && booting;
   const artifactsShown = android ? artifactsSheetOpen : showArtifacts;
 
+  // The chat's actions. Desktop: in the title bar (only while the chat route
+  // is showing, since this component stays mounted under Settings). Android:
+  // in the header row, after the menu button and the chat's own controls.
+  const actions = (
+    <div className={android ? 'main-header-actions' : 'titlebar-actions'}>
+      {/* Export is desktop-only: on a phone the header is one crowded row
+          and ChatML export is a workstation-shaped action (you're pulling
+          a transcript into another file). Android keeps New chat + the
+          artifacts toggle. */}
+      {!android && hasMessages && (
+        <button
+          onClick={() => void exportSession()}
+          title="Export this session as ChatML"
+          aria-label="Export this session as ChatML"
+        >
+          <ExportIcon />
+        </button>
+      )}
+      {/* Android: the sheet covers this button while open and closes
+          itself (✕, swipe down, Back), so the button only ever opens. */}
+      <button onClick={() => (android ? setArtifactsSheetOpen(true) : void toggleArtifacts())}>
+        {android ? 'Artifacts' : showArtifacts ? 'Hide Artifacts' : 'Show Artifacts'}
+      </button>
+      {/* Routes within this hub rather than opening a window: with
+          multiple hubs open (D21) a shared Settings window would be
+          ambiguous about which one's session it configures.
+          Desktop-only — Android reaches Settings from the menu drawer, so
+          a second entry point here is clutter in an already narrow row. */}
+      {!android && (
+        <button onClick={() => goto('settings')} title="Settings" aria-label="Settings">
+          <SettingsGearIcon />
+        </button>
+      )}
+      <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
+        <NewChatIcon />
+      </button>
+    </div>
+  );
+
   return (
     <div className="main-window">
       {/* On Android the history lives in the menu drawer instead. */}
       {!android && <SessionList />}
       <div className="main-center">
-        <header className="main-header">
-          {/* Desktop: the mark and wordmark. `KittyIcon` fills with
-              `currentColor`, so it inherits `--text` and flips with the theme
-              for free; `app-mark` keeps the glyph centred against the
-              neighbouring buttons (see base.css).
-              Android: the menu button takes that spot. The row is too narrow
-              for a mark as well, and the drawer is the only way to saved chats
-              and Settings now that the tab bar is gone. */}
-          {android ? (
+        {android ? (
+          <header className="main-header">
+            {/* The menu button: the drawer is the only way to saved chats and
+                Settings now that the tab bar is gone. */}
             <button className="menu-button" onClick={() => openDrawer(true)} aria-label="Open menu">
               <MenuIcon />
             </button>
-          ) : (
-            <h1 className="app-mark">
-              <KittyIcon size={24} />
-              Kitty
-            </h1>
-          )}
-          {android && <ChatHeaderControls />}
-          <div style={{ display: 'flex', gap: 8 }}>
-            {/* Export is desktop-only: on a phone the header is one crowded row
-                and ChatML export is a workstation-shaped action (you're pulling
-                a transcript into another file). Android keeps New chat + the
-                artifacts toggle. */}
-            {!android && hasMessages && (
-              <button
-                onClick={() => void exportSession()}
-                title="Export this session as ChatML"
-                aria-label="Export this session as ChatML"
-              >
-                <ExportIcon />
-              </button>
-            )}
-            {/* Android: the sheet covers this button while open and closes
-                itself (✕, swipe down, Back), so the button only ever opens. */}
-            <button
-              onClick={() => (android ? setArtifactsSheetOpen(true) : void toggleArtifacts())}
-            >
-              {android ? 'Artifacts' : showArtifacts ? 'Hide Artifacts' : 'Show Artifacts'}
-            </button>
-            {/* Routes within this hub rather than opening a window: with
-                multiple hubs open (D21) a shared Settings window would be
-                ambiguous about which one's session it configures.
-                Desktop-only — Android reaches Settings from the menu drawer, so
-                a second entry point here is clutter in an already narrow row. */}
-            {!android && (
-              <button onClick={() => goto('settings')} title="Settings" aria-label="Settings">
-                <SettingsGearIcon />
-              </button>
-            )}
-            <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
-              <NewChatIcon />
-            </button>
-          </div>
-        </header>
+            <ChatHeaderControls />
+            {actions}
+          </header>
+        ) : (
+          titleBarSlot && view === 'chat' && createPortal(actions, titleBarSlot)
+        )}
         <HubBanners />
         <div className="main-body">
           {bootSpinner ? (

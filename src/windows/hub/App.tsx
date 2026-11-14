@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouteStore } from '@/stores/routeStore';
 import { isAndroid } from '@/lib/platform';
 import { trackViewportHeight } from '@/lib/viewport';
@@ -9,6 +9,7 @@ import { SessionList } from '@/components/sessions/SessionList';
 import { SettingsView } from '@/components/settings/SettingsView';
 import { WizardView } from '@/components/wizard/WizardView';
 import { ConfirmHost } from '@/components/shared/ConfirmDialog';
+import { TitleBar } from '@/components/shared/TitleBar';
 import { useStackStore } from '@/stores/stackStore';
 import { drainIncoming } from '@/lib/incoming';
 import { ApprovalModal } from '@/components/chat/ApprovalModal';
@@ -33,6 +34,9 @@ export function App() {
   const goto = useRouteStore((s) => s.goto);
   const android = isAndroid();
   const sessionId = useChatStore((s) => s.sessionId);
+  // The title bar's left-hand slot, which the chat route fills with its
+  // actions (desktop only; Android has no title bar).
+  const [titleBarSlot, setTitleBarSlot] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void init();
@@ -67,8 +71,9 @@ export function App() {
 
   return (
     <>
+      <TitleBar actionsRef={setTitleBarSlot} />
       <div hidden={view !== 'chat'} className="hub-route">
-        <ChatWorkspace />
+        <ChatWorkspace titleBarSlot={titleBarSlot} />
       </div>
       {/* `sessions` is a full-page list for anything that routes to it. On
           desktop the list lives in the chat sidebar and on Android in the menu
