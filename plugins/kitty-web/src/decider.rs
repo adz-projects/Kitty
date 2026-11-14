@@ -56,7 +56,11 @@ pub enum PageKind {
 }
 
 const PAGE_OPTIONS: [(&str, &str, PageKind); 5] = [
-    ("content", "Real content: an article, documentation, data or a listing", PageKind::Content),
+    (
+        "content",
+        "Real content: an article, documentation, data or a listing",
+        PageKind::Content,
+    ),
     (
         "bot_challenge",
         "A bot check or CAPTCHA (\"verify you are human\", \"checking your browser\")",
@@ -67,7 +71,11 @@ const PAGE_OPTIONS: [(&str, &str, PageKind); 5] = [
         "A paywall, subscription prompt or login wall instead of the content",
         PageKind::PaywallOrLogin,
     ),
-    ("error_page", "An error page: not found, access denied, server error", PageKind::ErrorPage),
+    (
+        "error_page",
+        "An error page: not found, access denied, server error",
+        PageKind::ErrorPage,
+    ),
     (
         "empty_shell",
         "An empty shell that needs JavaScript to show anything",
@@ -248,7 +256,8 @@ mod tests {
         assert!(!d.is_on("page_classify"));
         assert_eq!(d.url, "http://box:8080/v1/systemone", "the full endpoint");
         assert_eq!(d.page_min, DEFAULT_PAGE_MIN);
-        let d = Decider::from_config(&cfg("http://b", &[], r#"{"page_classify_min":0.9}"#)).unwrap();
+        let d =
+            Decider::from_config(&cfg("http://b", &[], r#"{"page_classify_min":0.9}"#)).unwrap();
         assert!((d.page_min - 0.9).abs() < 1e-6);
     }
 
@@ -274,7 +283,10 @@ mod tests {
 
     #[test]
     fn ordering_is_stable_and_keeps_unjudged_items_in_the_middle() {
-        assert_eq!(order_by(&[Some(0.1), Some(0.9), None, Some(0.9)]), vec![1, 3, 2, 0]);
+        assert_eq!(
+            order_by(&[Some(0.1), Some(0.9), None, Some(0.9)]),
+            vec![1, 3, 2, 0]
+        );
         assert_eq!(order_by(&[None, None]), vec![0, 1]);
     }
 
@@ -295,7 +307,10 @@ mod tests {
         let scores = d
             .relevance(
                 "rust trait object safety",
-                &["How to remove rust from tools".into(), "Object safety - The Rust Reference".into()],
+                &[
+                    "How to remove rust from tools".into(),
+                    "Object safety - The Rust Reference".into(),
+                ],
             )
             .await
             .unwrap();

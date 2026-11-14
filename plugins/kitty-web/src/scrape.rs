@@ -1016,7 +1016,9 @@ fn title_of(html: &str) -> String {
     let Some(open_end) = lower[start..].find('>').map(|i| start + i + 1) else {
         return String::new();
     };
-    let end = lower[open_end..].find("</title").map_or(open_end, |i| open_end + i);
+    let end = lower[open_end..]
+        .find("</title")
+        .map_or(open_end, |i| open_end + i);
     html.get(open_end..end).unwrap_or("").trim().to_string()
 }
 
@@ -1073,7 +1075,10 @@ async fn check_rendered_page(rendered: String, url: &str, html_head: &str) -> St
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            v.get("data").and_then(Value::as_str).unwrap_or("").to_string(),
+            v.get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         ),
         Some("error") if v.get("error_code").and_then(Value::as_str) == Some("SCRAPE_EMPTY") => {
             (title_of(html_head), rough_text(html_head))
@@ -1092,7 +1097,9 @@ async fn check_failed_page(response: reqwest::Response, url: &str) -> Option<Str
     let decider = crate::decider::Decider::current("page_classify")?;
     let body = read_body_capped(response, PAGE_HEAD_CHARS).await.ok()?;
     let html = String::from_utf8_lossy(&body);
-    let (kind, _) = decider.classify_page(&title_of(&html), &rough_text(&html)).await?;
+    let (kind, _) = decider
+        .classify_page(&title_of(&html), &rough_text(&html))
+        .await?;
     relabel(kind, url)
 }
 
@@ -1225,8 +1232,12 @@ mod tests {
     fn page_labels_map_to_error_codes_and_content_keeps_the_result() {
         use crate::decider::PageKind;
         assert!(relabel(PageKind::Content, "u").is_none());
-        assert!(relabel(PageKind::Challenge, "u").unwrap().contains("SCRAPE_CHALLENGE"));
-        assert!(relabel(PageKind::PaywallOrLogin, "u").unwrap().contains("SCRAPE_PAYWALL"));
+        assert!(relabel(PageKind::Challenge, "u")
+            .unwrap()
+            .contains("SCRAPE_CHALLENGE"));
+        assert!(relabel(PageKind::PaywallOrLogin, "u")
+            .unwrap()
+            .contains("SCRAPE_PAYWALL"));
     }
 
     #[tokio::test]

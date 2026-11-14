@@ -163,8 +163,14 @@ mod tests {
             (BRAVE_API_KEY_ENV.to_string(), "k".to_string()),
             (DECIDER_URL_ENV.to_string(), "http://box:8080".to_string()),
             (DECIDER_DIALECT_ENV.to_string(), "systemone".to_string()),
-            (DECIDER_FEATURES_ENV.to_string(), "page_classify, search_rerank".to_string()),
-            (DECIDER_THRESHOLDS_ENV.to_string(), "{\"page_classify_min\":0.8}".to_string()),
+            (
+                DECIDER_FEATURES_ENV.to_string(),
+                "page_classify, search_rerank".to_string(),
+            ),
+            (
+                DECIDER_THRESHOLDS_ENV.to_string(),
+                "{\"page_classify_min\":0.8}".to_string(),
+            ),
         ]
         .into();
         assert_eq!(

@@ -823,9 +823,15 @@ function BraveMcpSearchCard({ parentOn }: { parentOn: boolean }) {
 /** Dedicated card for the Bacon notebook MCP server (Bacon phase 10). A
     private stdio row pointing at the `bacon-mcp` executable, so Kitty can
     search/read Bacon notes and save things into Bacon mid-conversation. Off
-    by default; the path auto-resolves the sibling Bacon checkout's build
-    output unless set explicitly. */
+    by default and shown only when Bacon is installed. The path auto-resolves
+    (Bacon's install folder, then a sibling Bacon checkout's build output)
+    unless set explicitly. */
 function BaconMcpCard() {
+  // Whether to show the card at all, decided once per visit to this panel:
+  // only when Bacon is installed, or when the switch is already on (so it
+  // can still be turned off after Bacon is uninstalled). Hidden until known,
+  // and hidden if the check itself fails.
+  const [offered, setOffered] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [path, setPath] = useState('');
   const [registered, setRegistered] = useState(false);
@@ -836,11 +842,12 @@ function BaconMcpCard() {
     void ipc
       .getBaconMcpStatus()
       .then((s) => {
+        setOffered(s.installed || s.enabled);
         setEnabled(s.enabled);
         setPath(s.path ?? '');
         setRegistered(s.registered);
       })
-      .catch((e) => setError(String(e)));
+      .catch(() => setOffered(false));
   }, []);
 
   const toggle = async (next: boolean) => {
@@ -862,6 +869,8 @@ function BaconMcpCard() {
       setBusy(false);
     }
   };
+
+  if (!offered) return null;
 
   return (
     <div className="ext-card">

@@ -643,6 +643,8 @@ export interface DownloadProgress {
 
 /** Bacon notebook MCP server switch (`get_bacon_mcp_status`). */
 export interface BaconMcpStatus {
+  /** Bacon is installed on this machine. */
+  installed: boolean;
   enabled: boolean;
   path: string | null;
   registered: boolean;

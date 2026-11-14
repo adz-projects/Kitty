@@ -280,7 +280,8 @@ pub(crate) async fn apply(app: &tauri::AppHandle, server: &str, label: &str) -> 
 // ---------------------------------------------------------------------------
 // Bacon notebook MCP server (Bacon phase 10). A PRIVATE row named "bacon"
 // pointing at the bacon-mcp stdio executable — not a builtin, so it is not
-// part of ensure_builtin_servers. Switched on here; off by default. A private
+// part of ensure_builtin_servers. Switched on here; off by default, and only
+// offered when Bacon is installed on this machine. A private
 // row (rather than a shared one) is deliberate: a shared row is immutable even
 // to its creator, so a path that changes on update would be stuck.
 // ---------------------------------------------------------------------------
@@ -289,6 +290,10 @@ const BACON_MCP_NAME: &str = "bacon";
 
 #[derive(serde::Serialize)]
 pub struct BaconMcpStatus {
+    /// Bacon is installed here. Settings shows the switch only when this is
+    /// true, or when the switch is already on (so it can still be turned off
+    /// after Bacon is uninstalled).
+    pub installed: bool,
     pub enabled: bool,
     pub path: Option<String>,
     pub registered: bool,
@@ -310,7 +315,11 @@ pub async fn get_bacon_mcp_status(
             .unwrap_or(false),
         Err(_) => false,
     };
+    let installed = tauri::async_runtime::spawn_blocking(|| bacon_install_dir().is_some())
+        .await
+        .unwrap_or(false);
     Ok(BaconMcpStatus {
+        installed,
         enabled,
         path,
         registered,
@@ -381,14 +390,52 @@ pub async fn set_bacon_mcp_enabled(
     Ok(())
 }
 
-/// Resolve the bacon-mcp executable: an explicit path wins; otherwise look in
-/// the sibling Bacon checkout's build output (release, then debug). That
-/// fallback is relative to where this crate was *built*, so it only finds
-/// anything on a development machine; an installed Kitty needs the path.
+/// Where Bacon is installed, if it is. Bacon's installer is per-user NSIS and
+/// records `InstallLocation` under its uninstall key; HKCU is checked, then
+/// HKLM (a per-machine install), then the per-user default folder. Each
+/// candidate counts only if `bacon.exe` is actually there, so a stale key
+/// left by a failed uninstall does not.
+#[cfg(windows)]
+fn bacon_install_dir() -> Option<std::path::PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Bacon";
+    let has_exe = |dir: &std::path::Path| dir.join("bacon.exe").is_file();
+    for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let location = RegKey::predef(hive)
+            .open_subkey_with_flags(UNINSTALL_KEY, KEY_READ)
+            .and_then(|key| key.get_value::<String, _>("InstallLocation"));
+        if let Ok(location) = location {
+            let dir = std::path::PathBuf::from(location.trim().trim_matches('"'));
+            if has_exe(&dir) {
+                return Some(dir);
+            }
+        }
+    }
+    let dir = dirs::data_local_dir()?.join("Bacon");
+    has_exe(&dir).then_some(dir)
+}
+
+/// Bacon is a Windows app; there is nothing to find elsewhere.
+#[cfg(not(windows))]
+fn bacon_install_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Resolve the bacon-mcp executable: an explicit path wins; then one shipped
+/// inside Bacon's install folder; then the sibling Bacon checkout's build
+/// output (release, then debug). That last fallback is relative to where this
+/// crate was *built*, so it only finds anything on a development machine.
 fn resolve_bacon_mcp_path(explicit: Option<&str>) -> Option<std::path::PathBuf> {
     if let Some(p) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
         let path = std::path::PathBuf::from(p);
         return path.is_file().then_some(path);
+    }
+    if let Some(exe) = bacon_install_dir()
+        .map(|dir| dir.join("bacon-mcp.exe"))
+        .filter(|exe| exe.is_file())
+    {
+        return Some(exe);
     }
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // Kitty/src-tauri -> Kitty -> sibling Bacon.

@@ -52,7 +52,9 @@ fn assert_no_parser_drift(v: &Value) -> HashSet<String> {
 async fn live_keyfree_search_returns_usable_results() {
     // No BRAVE_API_KEY in the default dev environment, so `normal` mode
     // exercises the key-free co-equal pair (DuckDuckGo + Bing).
-    let out = kitty_web::search::web_search("rust programming language", 5, Some("en"), None, Some("US")).await;
+    let out =
+        kitty_web::search::web_search("rust programming language", 5, Some("en"), None, Some("US"))
+            .await;
     let v: Value = serde_json::from_str(&out).expect("valid JSON envelope");
     eprintln!("{}", serde_json::to_string_pretty(&v).unwrap());
 
@@ -98,8 +100,14 @@ async fn live_keyfree_search_returns_usable_results() {
 #[ignore = "hits the live network"]
 async fn live_bing_search_returns_usable_results() {
     // `count > 5` puts every key-free engine in play concurrently.
-    let out =
-        kitty_web::search::web_search("rust programming language", 10, Some("en"), None, Some("US")).await;
+    let out = kitty_web::search::web_search(
+        "rust programming language",
+        10,
+        Some("en"),
+        None,
+        Some("US"),
+    )
+    .await;
     let v: Value = serde_json::from_str(&out).expect("valid JSON envelope");
     eprintln!("{}", serde_json::to_string_pretty(&v).unwrap());
 

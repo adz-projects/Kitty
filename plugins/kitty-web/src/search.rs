@@ -393,7 +393,8 @@ fn source_date(source: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
         .collect();
     static ISO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let iso = ISO.get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}").expect("static regex is valid"));
+    let iso = ISO
+        .get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}").expect("static regex is valid"));
     candidates
         .iter()
         .find(|c| iso.is_match(c))
