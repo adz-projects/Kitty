@@ -32,7 +32,8 @@ apply at runtime with no rebuild.
 | `--mono`        | Monospace font stack                                          |
 | `--font-serif`  | Reading face for assistant answers and their headings. Defaults to the UI font. EB Garamond is bundled. |
 | `--radius-sm`   | Corner radius for buttons, chips and badges. Defaults to ¾ of `--radius`. |
-| `--reading-max-width` / `--reading-line-height` | Width of the chat column (default `44rem`) and answer leading (default `1.6`). |
+| `--reading-max-width` / `--reading-line-height` | Width of the chat column (default `44rem`) and the leading of chat text (default `1.62`). |
+| `--chat-font-size` | Size of chat text: the user's turns and the answer's prose (default `1.21875rem`, 19.5px). |
 | `--selection`   | Text-selection background. Defaults to the system highlight.  |
 | `--ok-bg` / `--warn-bg` / `--danger-bg` | Tinted backgrounds for success, warning and error panels. Default to `--surface-2` or none. |
 

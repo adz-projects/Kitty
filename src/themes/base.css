@@ -59,6 +59,11 @@
   --fs-3xl: 1.375rem; /* 22px  */
   --fs-4xl: 1.5rem; /* 24px  */
 
+  /* The conversation itself — what the user wrote and the answer's prose —
+     is set at one size of its own, apart from the UI ramp above (which the
+     desktop block below shrinks, and which this must not follow). */
+  --chat-font-size: 1.21875rem; /* 19.5px */
+
   /* One knob both platforms write into: Android's system font-scale and the
      desktop zoom control (D17). Consumed by the `html` rule below, so it
      reaches every `rem` above. */
@@ -389,6 +394,30 @@ button:disabled {
   padding: 4px;
   min-height: 0;
 }
+/* Equal side margins. The list's scrollbar takes its width out of the right
+   side only, so the conversation sat further from the right edge of the
+   window than from the left. On desktop the scrollbar is given a fixed width,
+   always reserved, and the list is pushed that far into its container's
+   right padding — the scrollbar lives in the margin and the text is the same
+   distance from both edges, whether or not there is anything to scroll.
+   (Android's scrollbars overlay the content and take no room.) */
+:root[data-platform='desktop'] .message-list {
+  --chat-scrollbar: 10px;
+  scrollbar-gutter: stable;
+  margin-right: calc(-1 * var(--chat-scrollbar));
+}
+:root[data-platform='desktop'] .message-list::-webkit-scrollbar {
+  width: var(--chat-scrollbar);
+}
+:root[data-platform='desktop'] .message-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+:root[data-platform='desktop'] .message-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 5px;
+}
 /* Round-4 item 1: `overflow-y: auto` reserves scrollbar chrome even with
    nothing to scroll — suppress it while the list is empty. */
 .message-list.empty {
@@ -417,10 +446,15 @@ button:disabled {
 /* The user's own turn: a quiet tinted block in the column, in the UI face,
    not an accent-filled bubble on the right. */
 .msg-user .bubble {
+  /* Three quarters of the chat's width, so a turn of the user's reads as a
+     block of its own and not as another full-measure paragraph. */
+  width: 75%;
   background: var(--surface-2);
   color: var(--text);
   padding: 8px 12px;
-  border-radius: var(--radius);
+  border-radius: 8px;
+  font-size: var(--chat-font-size);
+  line-height: var(--reading-line-height, 1.62);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -439,13 +473,17 @@ button:disabled {
   align-self: flex-start;
   max-width: 100%;
 }
-/* Answers are set as prose: the serif reading face, a size up to make up for
-   Garamond's small x-height, and looser leading. Code, tables and controls
-   inside keep their own faces. */
+/* Answers are set as prose: the serif reading face at the chat size, with
+   looser leading. Code, tables and controls inside keep their own faces. */
 .msg-assistant .bubble.markdown {
   font-family: var(--font-serif, inherit);
-  font-size: 1.125em;
-  line-height: var(--reading-line-height, 1.6);
+  font-size: var(--chat-font-size);
+  line-height: var(--reading-line-height, 1.62);
+}
+/* Inline code follows the prose it sits in rather than the UI ramp, which
+   would leave it at little more than half the size of the words around it. */
+.msg-assistant .bubble.markdown :not(pre) > code {
+  font-size: 0.8em;
 }
 .msg-assistant .bubble.markdown table,
 .msg-assistant .bubble.markdown .code-block-head {

@@ -202,10 +202,10 @@ const ROLES = ['ink', 'paper', 'rule', 'muted', 'tint', 'accent', 'font'];
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c);
 
-/** A self-contained HTML document of a mounted figure, for "Open in new
-    window": the sanitized markup, the stylesheet, and the theme's roles
-    resolved to the values in effect now (a separate window has no theme to
-    inherit them from). */
+/** A self-contained HTML document of a mounted figure, for the card's
+    Download: the sanitized markup, the stylesheet, and the theme's roles
+    resolved to the values in effect now (a saved file has no theme to inherit
+    them from). */
 export function standaloneVizDocument(host: HTMLElement, title: string): string {
   const root = host.shadowRoot;
   if (!root) return '';

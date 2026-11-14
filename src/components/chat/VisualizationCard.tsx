@@ -1,5 +1,6 @@
-import { memo, useLayoutEffect, useMemo, useRef } from 'react';
+import { memo, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCall } from '@/stores/chatStore';
+import { ipc } from '@/lib/ipc';
 import { mountViz, parseVizPayload, standaloneVizDocument } from '@/lib/viz';
 
 function stringify(v: unknown): string {
@@ -19,33 +20,17 @@ const VIZ_LABELS: Record<string, string> = {
   generate_accessible_mermaid: 'Mermaid',
 };
 
-// Pending blob-URL revokes from `openInNewWindow`, tracked so they can be
-// cancelled at teardown (multiple visualization cards → several 30s timers
-// would otherwise outlive the window).
-const revokeTimers = new Set<ReturnType<typeof setTimeout>>();
-const revokeLater = (url: string) => {
-  const id = setTimeout(() => {
-    revokeTimers.delete(id);
-    URL.revokeObjectURL(url);
-  }, 30_000);
-  revokeTimers.add(id);
-};
-if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', () => {
-    revokeTimers.forEach((id) => {
-      clearTimeout(id);
-      revokeTimers.delete(id);
-    });
-  });
-}
-
-function openInNewWindow(html: string) {
-  if (!html) return;
-  const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-  window.open(url, '_blank');
-  // Revoked after a delay rather than immediately — the new tab needs the
-  // blob to still resolve when it actually loads the URL.
-  revokeLater(url);
+/** A file name for a saved figure, from its title: lower-case words joined
+    by hyphens. `download_text` accepts a plain name only, so nothing that
+    could read as a path survives. */
+export function vizFileName(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/, '');
+  return `${slug || 'figure'}.html`;
 }
 
 /** A viz tool didn't hand back a parseable envelope. Distinguish the
@@ -88,20 +73,31 @@ export const VisualizationCard = memo(function VisualizationCard({ call }: { cal
     if (hostRef.current && html) mountViz(hostRef.current, html);
   }, [html]);
 
+  // Saves the figure as one self-contained HTML file — markup, stylesheet and
+  // the theme's colours as they are now — through the app's save dialog. This
+  // replaced "Open in new window", which built the same document but handed
+  // it to `window.open`, and the webview opens no windows of its own.
+  const [saveFailed, setSaveFailed] = useState(false);
+  const title = payload?.title ?? label;
+  const download = async () => {
+    const doc = hostRef.current ? standaloneVizDocument(hostRef.current, title) : '';
+    if (!doc) return;
+    try {
+      await ipc.downloadText(vizFileName(title), doc);
+      setSaveFailed(false);
+    } catch {
+      setSaveFailed(true);
+    }
+  };
+
   return (
     <div className="viz-card">
       <div className="viz-card-head">
         <span className="code-lang">{label}</span>
         <div className="code-actions">
           {payload && (
-            <button
-              onClick={() => {
-                if (hostRef.current) {
-                  openInNewWindow(standaloneVizDocument(hostRef.current, payload.title ?? label));
-                }
-              }}
-            >
-              Open in new window
+            <button onClick={() => void download()}>
+              {saveFailed ? 'Could not save' : 'Download'}
             </button>
           )}
         </div>
