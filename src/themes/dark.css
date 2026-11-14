@@ -15,7 +15,11 @@
   --radius: 4px;
   --radius-sm: 3px;
   --font-family: 'Montserrat', 'Segoe UI', system-ui, -apple-system, sans-serif;
-  --font-serif: 'EB Garamond Variable', 'EB Garamond', Garamond, 'Iowan Old Style', Georgia, serif;
+  --font-reading: 'Open Sans Variable', 'Open Sans', 'Segoe UI', Roboto, sans-serif;
+  /* Running text of the chat: 7.2:1 on --bg, where --text would be far higher. */
+  --chat-text: #a39e93;
+  /* Bold within it: a little under --text. */
+  --chat-strong: #d6d0c2;
   --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
   --selection: #4d4431;
   --overlay-opacity: 1;

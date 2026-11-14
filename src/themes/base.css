@@ -1,11 +1,20 @@
 /* Structural, theme-agnostic layout. MUST NOT contain color values —
    all colors/spacing/typography come from custom properties in theme files. */
 
-/* The reading face: EB Garamond (SIL OFL), bundled from the fontsource
-   package so it renders offline. Themes name it in `--font-serif`; it sets
-   assistant answers and headings, while Montserrat stays on the controls. */
+/* An optional reading face: EB Garamond (SIL OFL), bundled from the fontsource
+   package so it renders offline. The built-in themes set the whole chat in
+   Montserrat; a theme that names this in `--font-serif` gets it for assistant
+   answers and headings. The files are fetched only if something uses them. */
 @import '@fontsource-variable/eb-garamond/wght.css';
 @import '@fontsource-variable/eb-garamond/wght-italic.css';
+
+/* The reading face: Open Sans (SIL OFL), bundled the same way. Themes name it
+   in `--font-reading`; it sets the running text of the chat — the user's
+   turns and the answer's prose — while Montserrat stays on the controls and
+   on headings. Montserrat is a display face: wide, geometric, its round
+   letters near-identical, which makes a paragraph of it tiring to read. */
+@import '@fontsource-variable/open-sans/wght.css';
+@import '@fontsource-variable/open-sans/wght-italic.css';
 
 /* Self-hosted Montserrat (OFL-licensed), bundled so the app renders it
    offline with no runtime fetch to Google Fonts — consistent with the rest
@@ -61,8 +70,12 @@
 
   /* The conversation itself — what the user wrote and the answer's prose —
      is set at one size of its own, apart from the UI ramp above (which the
-     desktop block below shrinks, and which this must not follow). */
-  --chat-font-size: 1.21875rem; /* 19.5px */
+     desktop block below shrinks, and which this must not follow).
+
+     14.5px, in the reading face (Open Sans). In the hub's usual ~616px chat
+     column this is about 85 characters to the line, inside the limit of a
+     comfortable single column. */
+  --chat-font-size: 0.90625rem; /* 14.5px */
 
   /* One knob both platforms write into: Android's system font-scale and the
      desktop zoom control (D17). Consumed by the `html` rule below, so it
@@ -443,18 +456,25 @@ button:disabled {
   margin-inline: auto;
 }
 
-/* The user's own turn: a quiet tinted block in the column, in the UI face,
-   not an accent-filled bubble on the right. */
+/* The user's own turn: a quiet tinted block, not an accent-filled bubble.
+   It sits against the right edge of the column, with its
+   attachment chips and actions under it on the same side; the text inside
+   still reads left to right from the block's own left edge. */
+.msg-user {
+  align-items: flex-end;
+}
 .msg-user .bubble {
   /* Three quarters of the chat's width, so a turn of the user's reads as a
      block of its own and not as another full-measure paragraph. */
   width: 75%;
   background: var(--surface-2);
-  color: var(--text);
+  /* `--chat-text`, like the answer's prose: see `.bubble.markdown` below. */
+  color: var(--chat-text, var(--text));
   padding: 8px 12px;
   border-radius: 8px;
+  font-family: var(--font-reading, inherit);
   font-size: var(--chat-font-size);
-  line-height: var(--reading-line-height, 1.62);
+  line-height: var(--reading-line-height, 1.6);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -473,19 +493,38 @@ button:disabled {
   align-self: flex-start;
   max-width: 100%;
 }
-/* Answers are set as prose: the serif reading face at the chat size, with
-   looser leading. Code, tables and controls inside keep their own faces. */
+/* Answers are set in the reading face at the chat size, with looser leading
+   than the controls around them. Their running text is in `--chat-text`,
+   which the built-in themes hold to about 7:1 against the window — full
+   `--text` on the dark theme's near-black is close to 17:1, at which strokes
+   glare and everything is equally loud. Headings stay in `--text` and bold sits
+   just under it (`--chat-strong`), so emphasis is carried by brightness as
+   well as weight.
+   (`--font-serif` is the older name for the reading face; a theme that sets
+   only that still gets it.) */
 .msg-assistant .bubble.markdown {
-  font-family: var(--font-serif, inherit);
+  color: var(--chat-text, var(--text));
+  font-family: var(--font-reading, var(--font-serif, inherit));
   font-size: var(--chat-font-size);
-  line-height: var(--reading-line-height, 1.62);
+  /* A long line in a face with a tall x-height needs generous leading for
+     the eye to find its way back to the next one. */
+  line-height: var(--reading-line-height, 1.6);
 }
-/* Inline code follows the prose it sits in rather than the UI ramp, which
-   would leave it at little more than half the size of the words around it. */
+.msg-assistant .bubble.markdown :is(h1, h2, h3, h4, h5, h6, th) {
+  color: var(--text);
+}
+/* Bold is a step below headings: brighter than the prose it sits in, but an
+   answer with a bold phrase in every line should not out-shout its headings. */
+.msg-assistant .bubble.markdown :is(strong, b) {
+  color: var(--chat-strong, var(--text));
+}
+.msg-assistant .bubble.markdown :is(h1, h2, h3, h4, h5, h6, th) :is(strong, b) {
+  color: inherit;
+}
+/* Inline code follows the prose it sits in rather than the UI ramp. */
 .msg-assistant .bubble.markdown :not(pre) > code {
-  font-size: 0.8em;
+  font-size: 0.92em;
 }
-.msg-assistant .bubble.markdown table,
 .msg-assistant .bubble.markdown .code-block-head {
   font-family: var(--font-family);
 }
@@ -556,8 +595,8 @@ button:disabled {
 .markdown h5,
 .markdown h6 {
   margin: 1.1em 0 0.4em;
-  font-family: var(--font-serif, inherit);
-  font-weight: 500;
+  font-family: var(--font-serif, var(--font-family));
+  font-weight: 600;
   line-height: 1.3;
 }
 .markdown h1:first-child,

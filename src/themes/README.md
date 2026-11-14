@@ -30,10 +30,12 @@ apply at runtime with no rebuild.
 | --------------- | ------------------------------------------------------------- |
 | `--accent-fill` | Background behind `--accent-text` (primary buttons, your own messages). Defaults to `--accent`; set it when the accent is too light to carry text, as in the built-in dark theme. |
 | `--mono`        | Monospace font stack                                          |
-| `--font-serif`  | Reading face for assistant answers and their headings. Defaults to the UI font. EB Garamond is bundled. |
+| `--font-reading` | Typeface for the running text of the chat (the user's turns and the answer's prose). Defaults to the UI font. Open Sans is bundled: `'Open Sans Variable', sans-serif`; so is EB Garamond: `'EB Garamond Variable', serif`. `--font-serif` is the older name and still works. |
+| `--chat-text`   | Colour of that running text. Defaults to `--text`. The built-in themes set it for about 7:1 contrast against `--bg`; headings stay in `--text`. |
+| `--chat-strong` | Colour of bold within that text. Defaults to `--text`; the built-in themes set it a little dimmer. |
 | `--radius-sm`   | Corner radius for buttons, chips and badges. Defaults to ¾ of `--radius`. |
-| `--reading-max-width` / `--reading-line-height` | Width of the chat column (default `44rem`) and the leading of chat text (default `1.62`). |
-| `--chat-font-size` | Size of chat text: the user's turns and the answer's prose (default `1.21875rem`, 19.5px). |
+| `--reading-max-width` / `--reading-line-height` | Width of the chat column (default `44rem`) and the leading of chat text (default `1.6`). |
+| `--chat-font-size` | Size of chat text: the user's turns and the answer's prose (default `0.90625rem`, 14.5px, chosen for Open Sans; a serif reading face wants about a quarter more). |
 | `--selection`   | Text-selection background. Defaults to the system highlight.  |
 | `--ok-bg` / `--warn-bg` / `--danger-bg` | Tinted backgrounds for success, warning and error panels. Default to `--surface-2` or none. |
 

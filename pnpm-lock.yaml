@@ -11,6 +11,9 @@ importers:
       '@fontsource-variable/eb-garamond':
         specifier: ^5.3.0
         version: 5.3.0
+      '@fontsource-variable/open-sans':
+        specifier: ^5.3.0
+        version: 5.3.0
       '@tanstack/react-virtual':
         specifier: ^3.10.9
         version: 3.14.5(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -525,6 +528,9 @@ packages:
 
   '@fontsource-variable/eb-garamond@5.3.0':
     resolution: {integrity: sha512-656OJsA9Vv24yhqRZFEzXnzS2AYgKdEILLgHJYLzzXndgcWFKfSXFqzbRI5/6Yk1Yt7UfWrUeppE5nRQPQMwlQ==}
+
+  '@fontsource-variable/open-sans@5.3.0':
+    resolution: {integrity: sha512-VOfhZfLIOBVa6K/dTEu7scqQXYdGa4jBX8quFpQ0S6574B+W2EOBJf9PkqyVtMEI7WWIWNEbpvPc3vY1mN2mmQ==}
 
   '@humanfs/core@0.19.2':
     resolution: {integrity: sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA==}
@@ -2321,6 +2327,8 @@ snapshots:
   '@exodus/bytes@1.16.0': {}
 
   '@fontsource-variable/eb-garamond@5.3.0': {}
+
+  '@fontsource-variable/open-sans@5.3.0': {}
 
   '@humanfs/core@0.19.2':
     dependencies:
