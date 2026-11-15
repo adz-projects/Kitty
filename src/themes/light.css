@@ -1,28 +1,30 @@
 /* Light theme — custom properties only; themes/README.md is the contract.
-   Palette shared with Bacon: laid paper and iron-gall ink, bookcloth green
-   for what can be acted on. */
+   Paper: a bright, nearly neutral page with a trace of warmth (hue ~40°,
+   2-10% saturation) and near-black ink; bookcloth green for what can be
+   acted on. Each surface steps a little darker; borders one step past the
+   darkest surface. */
 :root {
-  --bg: #f4eee2;
-  --surface: #ebe4d5;
-  --surface-2: #e0d7c5;
-  --text: #2b251e;
-  --text-muted: #62584b;
+  --bg: #f8f7f4;
+  --surface: #f0efeb;
+  --surface-2: #e6e4df;
+  --text: #262422;
+  --text-muted: #5c5955;
   --accent: #3c5a44;
   --accent-fill: #3c5a44;
-  --accent-text: #f7f1e4;
-  --border: #d3c9b5;
+  --accent-text: #f8f7f4;
+  --border: #dad7d1;
   --radius: 8px;
   --radius-sm: 6px;
   --font-family: 'Montserrat', 'Segoe UI', system-ui, -apple-system, sans-serif;
   --font-reading: 'Open Sans Variable', 'Open Sans', 'Segoe UI', Roboto, sans-serif;
   /* Running text of the chat: 7:1 on --bg, where --text would be far higher. */
-  --chat-text: #554f47;
+  --chat-text: #55524e;
   /* Bold within it: a little under --text. */
-  --chat-strong: #3f3932;
+  --chat-strong: #403d3a;
   --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
-  --selection: #e2d6b8;
+  --selection: #e5e0d3;
   --overlay-opacity: 1;
-  --overlay-shadow: 0 1px 2px rgba(43, 37, 30, 0.08), 0 10px 28px rgba(43, 37, 30, 0.13);
+  --overlay-shadow: 0 1px 2px rgba(38, 36, 34, 0.08), 0 10px 28px rgba(38, 36, 34, 0.13);
   --ok: #3f6b3a;
   --warn: #7a5510;
   --ok-bg: rgba(63, 107, 58, 0.1);
