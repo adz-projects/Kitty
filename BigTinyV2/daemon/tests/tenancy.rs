@@ -1790,9 +1790,8 @@ async fn a_second_send_still_conflicts_even_though_attaching_is_allowed() {
 
 #[tokio::test]
 async fn an_app_sees_only_its_own_and_shared_mcp_tools() {
-    // The registry is a flat namespace shared by every connected server --
-    // that is deliberate and load-bearing for prompt caching -- so ownership
-    // has to be enforced at listing rather than by mangling tool names.
+    // Ownership is enforced at listing rather than by mangling tool names,
+    // which keeps names stable for prompt caching.
     let state = test_state().await;
     state.mcp.register_for_test("srv-a", Some(APP_A), &["a_only"]);
     state.mcp.register_for_test("srv-b", Some(APP_B), &["b_only"]);
@@ -1809,6 +1808,93 @@ async fn an_app_sees_only_its_own_and_shared_mcp_tools() {
 
     assert_eq!(names(APP_A), vec!["a_only", "shared_tool"]);
     assert_eq!(names(APP_B), vec!["b_only", "shared_tool"]);
+}
+
+#[tokio::test]
+async fn two_apps_running_the_same_tools_each_keep_their_own() {
+    // Kitty and Bacon each run a `kitty-tools` server advertising the same
+    // names. The registry used to be keyed by name alone, so whichever
+    // connected second took the name and the first app lost the tools from its
+    // list (the surviving entry belonged to a server it may not see).
+    let state = test_state().await;
+    state
+        .mcp
+        .register_for_test("srv-a", Some(APP_A), &["lean_file_read", "a_viz"]);
+    state
+        .mcp
+        .register_for_test("srv-b", Some(APP_B), &["lean_file_read"]);
+
+    let list = |app: &str| -> Vec<(String, String)> {
+        state
+            .mcp
+            .list_tools_for_app(app)
+            .into_iter()
+            .map(|t| (t.name, t.server_id))
+            .collect()
+    };
+
+    assert_eq!(
+        list(APP_A),
+        vec![
+            ("a_viz".to_string(), "srv-a".to_string()),
+            ("lean_file_read".to_string(), "srv-a".to_string()),
+        ]
+    );
+    assert_eq!(
+        list(APP_B),
+        vec![("lean_file_read".to_string(), "srv-b".to_string())]
+    );
+
+    // Connecting in the other order changes nothing.
+    let state = test_state().await;
+    state
+        .mcp
+        .register_for_test("srv-b", Some(APP_B), &["lean_file_read"]);
+    state
+        .mcp
+        .register_for_test("srv-a", Some(APP_A), &["lean_file_read"]);
+    let server_of = |app: &str| state.mcp.list_tools_for_app(app)[0].server_id.clone();
+    assert_eq!(server_of(APP_A), "srv-a");
+    assert_eq!(server_of(APP_B), "srv-b");
+}
+
+#[tokio::test]
+async fn an_apps_own_tool_wins_over_a_shared_one_of_the_same_name() {
+    let state = test_state().await;
+    state
+        .mcp
+        .register_for_test("srv-shared", None, &["lean_file_read", "shared_only"]);
+    state
+        .mcp
+        .register_for_test("srv-a", Some(APP_A), &["lean_file_read"]);
+
+    let tools = state.mcp.list_tools_for_app(APP_A);
+    let find = |n: &str| tools.iter().find(|t| t.name == n).unwrap().server_id.clone();
+    assert_eq!(tools.len(), 2, "one entry per name");
+    assert_eq!(find("lean_file_read"), "srv-a");
+    assert_eq!(find("shared_only"), "srv-shared");
+
+    // Another app, with no server of its own, gets the shared one.
+    let other = state.mcp.list_tools_for_app(APP_B);
+    assert_eq!(other.len(), 2);
+    assert!(other.iter().all(|t| t.server_id == "srv-shared"));
+}
+
+#[tokio::test]
+async fn one_apps_tools_do_not_survive_another_apps_server_going_away() {
+    // The registry is pruned per server; with per-app keys that must leave the
+    // other app's same-named tool alone.
+    let state = test_state().await;
+    state
+        .mcp
+        .register_for_test("srv-a", Some(APP_A), &["lean_file_read"]);
+    state
+        .mcp
+        .register_for_test("srv-b", Some(APP_B), &["lean_file_read"]);
+    state.mcp.forget_owner_for_test("srv-b");
+
+    assert_eq!(state.mcp.list_tools_for_app(APP_A).len(), 1);
+    assert!(state.mcp.list_tools_for_app(APP_B).is_empty());
 }
 
 #[tokio::test]

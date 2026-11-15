@@ -88,6 +88,12 @@ A shared MCP server's `command` is what *every* app's agent loop executes, so
 letting one app repoint it would be a code-execution vector against the
 others: shared rows are 403 to modify, even for the app that created them.
 
+Tool names are scoped the same way. Within one app (and the shared pool) a
+later-connected server shadows an earlier one of the same tool name, as it
+always did; across apps it does not. Two apps may each run a server advertising
+the same names (Kitty and Bacon both run `kitty-tools`) and each sees and calls
+its own; a name an app has no server for falls back to the shared pool.
+
 ### Per-app provider resolution
 
 V1 answered "which provider does this caller get?" with a daemon-global sort

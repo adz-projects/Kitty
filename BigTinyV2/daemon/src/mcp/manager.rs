@@ -26,14 +26,31 @@ const HEALTH_TICK: Duration = Duration::from_secs(15);
 const RECONNECT_BASE_BACKOFF: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+/// The registry scope of servers in the shared pool (`mcp_servers.app_id IS
+/// NULL`), which every app may use. An app id is never empty.
+const SHARED_SCOPE: &str = "";
+
+/// The registry key for tool `name` on a server owned by `owner`.
+fn registry_key(owner: Option<&str>, name: &str) -> (String, String) {
+    (owner.unwrap_or(SHARED_SCOPE).to_string(), name.to_string())
+}
+
 /// Registry/dispatcher over all connected MCP servers. Ports
 /// `plugins/bigtiny/bigtiny/mcp/manager.py::MCPManager`.
 ///
-/// `tool_registry` is a deliberately *flat* namespace across all servers —
-/// later-connected servers silently shadow same-named tools from earlier
-/// ones, matching the Python reference exactly. Do not "fix" this into a
-/// namespaced design; existing deployments depend on tool names being
-/// effectively global.
+/// `tool_registry` is flat *within a scope*: tool names are effectively global
+/// among the servers of one app (and the shared pool), and a later-connected
+/// server there silently shadows a same-named tool from an earlier one,
+/// matching the Python reference. Existing deployments depend on that.
+///
+/// It is **not** flat across apps. Two apps that each run a server advertising
+/// the same names (Kitty and Bacon both run `kitty-tools`, 26 `lean_*` tools)
+/// used to overwrite each other: the later connection took the name, and the
+/// earlier app's own tools then vanished from its list, because the surviving
+/// entry belonged to a server it may not see. Entries are therefore keyed by
+/// `(scope, name)`, where the scope is the owning app's id, or [`SHARED_SCOPE`]
+/// for the shared pool, and an app resolves a name in its own scope first and
+/// the shared pool second.
 pub struct MCPManager {
     pool: SqlitePool,
     /// Handle to the delegated-run orchestrator, needed only to construct the
@@ -73,7 +90,7 @@ pub struct MCPManager {
     /// lock across an await previously blocked every sibling tool call on the
     /// same shard for the whole call duration.
     servers: DashMap<String, Arc<MCPServerClient>>,
-    tool_registry: DashMap<String, ToolDefinition>,
+    tool_registry: DashMap<(String, String), ToolDefinition>,
     /// Per-server tool-call timeout, captured at connect from the server's
     /// `timeout_s` column. Absent = `DEFAULT_TOOL_TIMEOUT`. Kept here rather
     /// than on the client because in-process servers are built by
@@ -285,7 +302,10 @@ impl MCPManager {
                 self.server_app
                     .insert(server_id.to_string(), row.app_id.clone());
                 for tool in client.tools() {
-                    self.tool_registry.insert(tool.name.clone(), tool.clone());
+                    self.tool_registry.insert(
+                        registry_key(row.app_id.as_deref(), &tool.name),
+                        tool.clone(),
+                    );
                 }
                 self.servers.insert(server_id.to_string(), Arc::new(client));
                 match config.timeout_s {
@@ -498,7 +518,9 @@ impl MCPManager {
                 .map(|e| e.value().clone())
                 .collect(),
         };
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        // Across apps a name can appear once per owner; the server id keeps
+        // the order total, so repeat calls still agree.
+        tools.sort_by(|a, b| (&a.name, &a.server_id).cmp(&(&b.name, &b.server_id)));
         tools
     }
 
@@ -513,7 +535,7 @@ impl MCPManager {
             .insert(server_id.to_string(), app_id.map(str::to_string));
         for name in tool_names {
             self.tool_registry.insert(
-                name.to_string(),
+                registry_key(app_id, name),
                 ToolDefinition {
                     name: name.to_string(),
                     description: String::new(),
@@ -553,14 +575,44 @@ impl MCPManager {
     /// This is what the agent loop advertises to the model. Sorted by name for
     /// the same prompt-prefix-caching reason as [`Self::list_tools`].
     pub fn list_tools_for_app(&self, app_id: &str) -> Vec<ToolDefinition> {
-        let mut tools: Vec<ToolDefinition> = self
-            .tool_registry
-            .iter()
-            .filter(|e| self.server_visible_to(&e.value().server_id, app_id))
-            .map(|e| e.value().clone())
-            .collect();
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
-        tools
+        // One entry per name: the app's own server wins over the shared pool's
+        // when both advertise it, the same order `resolve_tool_for_app`
+        // dispatches in.
+        let mut by_name: std::collections::BTreeMap<String, (bool, ToolDefinition)> =
+            std::collections::BTreeMap::new();
+        for e in self.tool_registry.iter() {
+            let (scope, name) = e.key();
+            let own = scope == app_id;
+            if !own && scope != SHARED_SCOPE {
+                continue;
+            }
+            if !self.server_visible_to(&e.value().server_id, app_id) {
+                continue;
+            }
+            match by_name.get(name) {
+                Some((had_own, _)) if *had_own || !own => {}
+                _ => {
+                    by_name.insert(name.clone(), (own, e.value().clone()));
+                }
+            }
+        }
+        // BTreeMap order is by name: stable across calls, as the prompt-prefix
+        // cache needs.
+        by_name.into_values().map(|(_, t)| t).collect()
+    }
+
+    /// The tool `app_id` calls when it uses `name`: its own server's, else the
+    /// shared pool's. `None` when neither exists or the owning server is no
+    /// longer connected.
+    fn resolve_tool_for_app(&self, app_id: &str, name: &str) -> Option<ToolDefinition> {
+        [app_id, SHARED_SCOPE].into_iter().find_map(|scope| {
+            let tool = self
+                .tool_registry
+                .get(&(scope.to_string(), name.to_string()))
+                .map(|e| e.value().clone())?;
+            self.server_visible_to(&tool.server_id, app_id)
+                .then_some(tool)
+        })
     }
 
     /// [`Self::execute_tool`], but refusing to dispatch to a server `app_id`
@@ -579,22 +631,17 @@ impl MCPManager {
         args: &Value,
         timeout: Option<Duration>,
     ) -> ToolResult {
-        let visible = self
-            .tool_registry
-            .get(tool_name)
-            .map(|e| self.server_visible_to(&e.value().server_id, app_id))
-            .unwrap_or(false);
-        if !visible {
+        let Some(tool) = self.resolve_tool_for_app(app_id, tool_name) else {
             return error_result(tool_name, format!("[Unknown tool: {tool_name}]"));
-        }
-        self.execute_tool(tool_name, args, timeout).await
+        };
+        self.dispatch(tool, args, timeout).await
     }
 
     /// Whether a tool name is currently registered (cheap `DashMap` lookup;
     /// used by the Adaptive Pathway turn hooks to gate on the AP MCP server
     /// being connected without a full `list_tools` round-trip per tool call).
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tool_registry.contains_key(name)
+        self.tool_registry.iter().any(|e| e.key().1 == name)
     }
 
     /// Never returns an `Err` — every failure mode (unknown tool, server not
@@ -607,9 +654,33 @@ impl MCPManager {
         args: &Value,
         timeout: Option<Duration>,
     ) -> ToolResult {
-        let Some(tool) = self.tool_registry.get(tool_name).map(|e| e.value().clone()) else {
+        // Unscoped: the shared pool's tool if there is one, else any app's.
+        // Callers that act for an app use `execute_tool_for_app`.
+        let found = self
+            .tool_registry
+            .get(&(SHARED_SCOPE.to_string(), tool_name.to_string()))
+            .map(|e| e.value().clone())
+            .or_else(|| {
+                self.tool_registry
+                    .iter()
+                    .filter(|e| e.key().1 == tool_name)
+                    .map(|e| e.value().clone())
+                    .min_by(|a, b| a.server_id.cmp(&b.server_id))
+            });
+        let Some(tool) = found else {
             return error_result(tool_name, format!("[Unknown tool: {tool_name}]"));
         };
+        self.dispatch(tool, args, timeout).await
+    }
+
+    /// Run `tool` on the server that advertised it.
+    async fn dispatch(
+        &self,
+        tool: ToolDefinition,
+        args: &Value,
+        timeout: Option<Duration>,
+    ) -> ToolResult {
+        let tool_name = tool.name.as_str();
 
         // Precedence: an explicit caller override, else the server's own
         // configured `timeout_s`, else the daemon default. Callers pass
@@ -884,7 +955,9 @@ mod tests {
         let manager = MCPManager::new(pool, None);
         // Insert in deliberately shuffled order.
         for name in ["zebra", "alpha", "mike"] {
-            manager.tool_registry.insert(name.to_string(), tool(name));
+            manager
+                .tool_registry
+                .insert(registry_key(None, name), tool(name));
         }
 
         let first: Vec<String> = manager
@@ -918,7 +991,7 @@ mod tests {
             ("b_tool", "srv-b"),
         ] {
             manager.tool_registry.insert(
-                name.to_string(),
+                registry_key(None, name),
                 ToolDefinition {
                     name: name.to_string(),
                     description: String::new(),
@@ -933,7 +1006,7 @@ mod tests {
         let names: Vec<String> = manager
             .tool_registry
             .iter()
-            .map(|e| e.key().clone())
+            .map(|e| e.key().1.clone())
             .collect();
         assert!(!names.contains(&"a_tool".to_string()));
         assert!(!names.contains(&"a2_tool".to_string()));
@@ -989,7 +1062,7 @@ mod tests {
         let names: Vec<String> = manager
             .tool_registry
             .iter()
-            .map(|e| e.key().clone())
+            .map(|e| e.key().1.clone())
             .collect();
         for tool in super::super::builtin::PATHWAY_TOOLS {
             assert!(
@@ -1035,7 +1108,11 @@ mod tests {
             .connect_server("srv-mem")
             .await
             .expect("the memorabilia row must connect once its host is attached");
-        let names: Vec<String> = manager.tool_registry.iter().map(|e| e.key().clone()).collect();
+        let names: Vec<String> = manager
+            .tool_registry
+            .iter()
+            .map(|e| e.key().1.clone())
+            .collect();
         for tool in ["memorabilia_search", "memorabilia_read_item"] {
             assert!(names.contains(&tool.to_string()), "{tool} missing from {names:?}");
         }
