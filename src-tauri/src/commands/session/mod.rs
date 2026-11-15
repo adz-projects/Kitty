@@ -160,11 +160,30 @@ pub(crate) fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
 pub(crate) async fn fresh_chat_folder(app: &AppHandle) -> Result<PathBuf, String> {
     let path = new_chat_folder(&chats_base_dir(app));
     let p = path.clone();
-    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&p))
+    tokio::task::spawn_blocking(move || create_chat_folder(&p))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("could not create the chat folder {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// The folder inside a chat's working directory that holds what the user asked
+/// the model to produce (and that the artifacts drawer lists). The frontend
+/// mirrors the name in `src/lib/outputs.ts`.
+pub(crate) const OUTPUTS_DIR_NAME: &str = "outputs";
+
+/// Create a chat's folder and its `outputs` subfolder. Only the chat folder is
+/// required: a failure to make `outputs` is logged and ignored (the model
+/// creates it on demand, and the drawer tolerates its absence).
+fn create_chat_folder(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    if let Err(e) = std::fs::create_dir_all(path.join(OUTPUTS_DIR_NAME)) {
+        tracing::warn!(
+            "could not create the outputs folder in {}: {e}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// A fresh per-chat folder `<base>/chats/<timestamp>-<short-rand>/`. The
@@ -193,9 +212,25 @@ fn new_chat_folder(base: &Path) -> PathBuf {
 async fn resolve_cwd(app: &AppHandle) -> Result<String, String> {
     let path = new_chat_folder(&chats_base_dir(app));
     let path_for_blocking = path.clone();
-    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&path_for_blocking))
+    tokio::task::spawn_blocking(move || create_chat_folder(&path_for_blocking))
         .await
         .map_err(|e| format!("chat folder creation task panicked: {e}"))?
         .map_err(|e| format!("could not create the chat folder {}: {e}", path.display()))?;
     Ok(path.to_string_lossy().replace('\\', "/"))
+}
+
+#[cfg(test)]
+mod outputs_folder_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_chat_folder_comes_with_an_outputs_folder() {
+        let root = std::env::temp_dir().join(format!("kitty-outputs-{}", std::process::id()));
+        let chat = root.join("chats").join("c1");
+        create_chat_folder(&chat).unwrap();
+        assert!(chat.join(OUTPUTS_DIR_NAME).is_dir());
+        // Idempotent: a second call neither fails nor disturbs what is there.
+        create_chat_folder(&chat).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

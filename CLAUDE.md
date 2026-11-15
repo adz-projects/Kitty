@@ -476,7 +476,7 @@ Acceptance: exporting a session that mixes reasoning, tool calls, and plain turn
 - **A hotkey can be taken by another app** (Alt+Space and PowerToys) → registration failure is reported in the hub with a "Choose another hotkey" link; never block startup on it.
 - **Engine API drift** → every path lives in `src-tauri/src/bigtiny/` and the attach code; Kitty refuses an engine older than API version 2 and says why; `docs/VERSIONS.md` records the contract.
 - **The engine is shared with other apps** → Kitty never kills it, never changes another app's data, and restarts it only when no other app is using it (or the user says "Restart anyway").
-- **Artifacts detection is heuristic** (tool-name matching) → acceptable; false negatives are fine, never fabricate entries.
+- **The artifacts drawer lists only the chat's `outputs/` folder** (`<cwd>/outputs`, read from disk), and a turn's output cards come from a before/after listing of it. After a resume the cards are rebuilt from tool-call paths (a heuristic: tool-name matching), so an output made only by a shell command loses its card but stays in the drawer; false negatives are fine, never fabricate entries.
 - **Reasoning/thinking support varies per model, not per provider** → never assume; feature-detect via `reasoning_models.ts` and fall back to the plain typing indicator with no reasoning panel if unsupported or undetected.
 - **`personal`-tier (Tailscale) endpoints can legitimately go offline** → this is expected, not an error state; keep its health messaging distinct from misconfiguration ("check Tailscale" vs. "check your API key"), and recover silently on reconnect without user action.
 

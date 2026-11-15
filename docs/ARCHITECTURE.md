@@ -139,14 +139,17 @@ windows/{hub,overlay,screenshot-select}/App.tsx  one entry point per window labe
   │                          hotkey failure, V1 import), MobileDrawer (Android)
   ├─► components/chat/       Composer, MessageList/MessageItem, MessageActions,
   │                          ThinkingBox, ApprovalPrompt + ApprovalModal,
-  │                          ToolCallCard, ProviderBadge + BranchToProvider
+  │                          ToolCallCard, OutputCards (what a turn left in
+  │                          `outputs/`), ProviderBadge + BranchToProvider
   │                          (handoff gate), ChatHeaderMenu — shared by
   │                          overlay and hub (rule 5)
   ├─► components/sessions/   SessionList (paged, searchable) — the sidebar on
   │                          desktop, the menu drawer on Android
   ├─► components/settings/   one panel per Settings section (Tool permissions
   │                          lists "always allow" rules)
-  ├─► components/artifacts/  ArtifactsPane
+  ├─► components/artifacts/  ArtifactsPane — the drawer over the hub's right edge
+  │                          (a bottom sheet on Android) listing the chat's
+  │                          `outputs/` folder; never opens by itself
   ├─► components/shared/     Dialog (focus trap, Escape/Back), ConfirmDialog
   │                          (confirmDialog(), typed confirmation), Banner,
   │                          ErrorDetail, StackStatusView
@@ -155,11 +158,14 @@ windows/{hub,overlay,screenshot-select}/App.tsx  one entry point per window labe
   ├─► stores/                zustand — render state only (rule 3)
   │     chatStore.ts (+ chat/ pure helpers), approvalStore.ts (every chat's
   │     waiting approvals), sessionStore.ts, stackStore.ts, routeStore.ts,
-  │     adaptivePathwayStore.ts, mobileUiStore.ts
+  │     adaptivePathwayStore.ts, mobileUiStore.ts, artifactsStore.ts (drawer
+  │     open/unseen + the `outputs/` listing, tagged by the chat's cwd)
   │
   └─► lib/
         ipc.ts        the ONLY file that calls invoke() — typed wrappers
                       around every command, plus event listeners
+        outputs.ts    the `outputs/` folder: path mapping, new-or-changed
+                      diff, file-type labels
         types.ts      TS mirrors of Rust structs (kept in sync by hand)
         escapeStack.ts / backDismiss.ts   Escape and Android Back close the
                       topmost layer first

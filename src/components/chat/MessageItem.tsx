@@ -13,6 +13,7 @@ import { MessageActions } from './MessageActions';
 import { MessageAttachmentChips } from './MessageAttachmentChips';
 import { VisualizationCard } from './VisualizationCard';
 import { MarkdownBlocks } from './MarkdownBlocks';
+import { OutputCards } from './OutputCards';
 
 /** Taps on these do their own thing and must not also toggle the message's
     actions: links, buttons (code-block copy, the Thinking toggle, the actions
@@ -121,6 +122,7 @@ export const MessageItem = memo(function MessageItem({
           {n}
         </p>
       ))}
+      {message.outputs && message.outputs.length > 0 && <OutputCards outputs={message.outputs} />}
       {actions}
     </div>
   );

@@ -87,7 +87,7 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     let persona = card
         .as_ref()
         .map(crate::config::providers::system_prompt_for)
-        .unwrap_or_else(|| crate::config::providers::DEFAULT_SYSTEM_PROMPT.to_string());
+        .unwrap_or_else(crate::config::providers::default_system_prompt);
     if let Err(e) =
         crate::bigtiny::sessions::update_persona_override(&app, &info.session_id, &persona).await
     {

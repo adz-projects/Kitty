@@ -2,48 +2,43 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
 import { settle } from '@/lib/gesture';
+import { registerEscapeLayer } from '@/lib/escapeStack';
+import { describeOutput, outputsDir } from '@/lib/outputs';
 import { usePanGesture } from '@/hooks/usePanGesture';
 import { useBackDismiss } from '@/hooks/useBackDismiss';
-import { useChatStore, type Artifact } from '@/stores/chatStore';
+import { useChatStore } from '@/stores/chatStore';
+import { listingFor, useArtifactsStore } from '@/stores/artifactsStore';
 import { useRouteStore } from '@/stores/routeStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import type { FileEntry } from '@/lib/types';
-import { relativeTime } from '@/lib/relativeTime';
 
 const POLL_INTERVAL_MS = 5000;
 /** How often the folder is rescanned while no turn is running. */
 const IDLE_POLL_INTERVAL_MS = 30000;
 
-/** Collapsible right-side pane listing files in the chat folder this session,
-    derived from tool-call events plus a disk scan (CLAUDE.md Phase 4, Round-7
-    item 5) — the tool-call path alone misses files that land in the folder
-    without going through a tracked tool call (e.g. dropped in via Explorer).
-    Persists nothing app-side.
+const NO_ENTRIES: FileEntry[] = [];
 
-    Polls the folder continuously (not just on mount/cwd-change) so it stays
-    live while the pane sits open: additions and deletions made outside a
-    tracked tool call (Explorer, another app, a shell the agent isn't
-    supervising) both show up within one poll tick, not just at the next
-    session switch. Runs unconditionally on `cwd`, not gated on the current
-    artifact count — an empty folder that gains its first file needs the
-    add-scan to run too, not just the prune side. */
-/** `onClose` is only supplied on mobile, where this renders as a bottom sheet
-    over the conversation and therefore covers the header button that opened
-    it. Desktop is a third column with nothing obscured, so it passes nothing
-    and no close button appears.
+/** The artifacts drawer: what is in this chat's `outputs` folder — the files
+    and folders the user asked the model to make, one row per top-level entry
+    (a folder of fifty PDFs is one row). Listed from disk, so it also shows what
+    was dropped in or removed from Explorer. Persists nothing app-side.
 
-    The sheet slides up on mount and closes by ✕, the scrim, Back, or a swipe
-    down. Every one of those animates out first and only then calls `onClose`,
-    which unmounts it. A swipe on the list only moves the sheet once the list
-    is scrolled to its top — otherwise it scrolls the list, the same rule every
-    Android bottom sheet follows. */
-export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
-  const artifacts = useChatStore((s) => s.artifacts);
-  const subfolders = useChatStore((s) => s.subfolders);
+    It exists only while open — it never opens on its own — and is polled only
+    then: every tick while a turn runs (that is when files appear), otherwise
+    every IDLE_POLL_INTERVAL_MS and whenever the window regains focus.
+
+    Desktop: a drawer over the window's right edge (absolutely positioned, so
+    the conversation never moves); closes by the title-bar button, ✕ or Escape.
+    Android: a bottom sheet that slides up on mount and closes by ✕, the scrim,
+    Back, or a swipe down. Every one of those animates out first and only then
+    calls `onClose`, which unmounts it. A swipe on the list only moves the sheet
+    once the list is scrolled to its top — otherwise it scrolls the list, the
+    same rule every Android bottom sheet follows. */
+export function ArtifactsPane({ onClose }: { onClose: () => void }) {
   const cwd = useChatStore((s) => s.cwd);
-  const pruneMissingArtifacts = useChatStore((s) => s.pruneMissingArtifacts);
-  const refreshArtifactsFromDisk = useChatStore((s) => s.refreshArtifactsFromDisk);
+  const entries = useArtifactsStore((s) => listingFor(s, cwd)) ?? NO_ENTRIES;
+  const refresh = useArtifactsStore((s) => s.refresh);
   // The hub keeps the whole chat workspace mounted (hidden) while the user is
   // on the Settings/Wizard route — the poll must not keep scanning disk for a
   // pane nobody can see. (`document.hidden` alone only covers minimization.)
@@ -52,38 +47,39 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
 
   useEffect(() => {
     if (!cwd || view !== 'chat') return;
-    void refreshArtifactsFromDisk();
+    void refresh(cwd);
     let lastScan = Date.now();
     const scan = () => {
       lastScan = Date.now();
-      void refreshArtifactsFromDisk();
-      void pruneMissingArtifacts();
+      void refresh(cwd);
     };
     const id = setInterval(() => {
       // Skip the round-trip while the window is minimized/backgrounded —
       // nothing's watching, and it just spends IPC + disk I/O for no reason.
       if (document.hidden) return;
-      // Every tick while a turn runs (that is when files appear); otherwise
-      // only every IDLE_POLL_INTERVAL_MS, plus whenever the window regains
-      // focus (a file dropped in from Explorer meanwhile).
       const busy = useChatStore.getState().busy;
       if (!busy && Date.now() - lastScan < IDLE_POLL_INTERVAL_MS) return;
       scan();
     }, POLL_INTERVAL_MS);
-    const onFocus = () => scan();
-    window.addEventListener('focus', onFocus);
+    window.addEventListener('focus', scan);
     return () => {
       clearInterval(id);
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', scan);
     };
-  }, [cwd, view, refreshArtifactsFromDisk, pruneMissingArtifacts]);
+  }, [cwd, view, refresh]);
 
-  const sheet = android && onClose !== undefined;
+  const sheet = android;
   const sheetRef = useRef<HTMLElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const [closing, setClosing] = useState(false);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+
+  // Escape closes the drawer, like any other dismissable layer.
+  useEffect(() => {
+    if (android) return;
+    return registerEscapeLayer(() => onCloseRef.current());
+  }, [android]);
 
   // Animate out, then unmount. The timeout backs up `transitionend`, which
   // never fires if the transition is skipped (reduced motion, or the sheet
@@ -91,7 +87,7 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
   const requestClose = useCallback(() => {
     const el = sheetRef.current;
     if (!el || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      onCloseRef.current?.();
+      onCloseRef.current();
       return;
     }
     // Class first, synchronously: clearing a mid-drag inline transform before
@@ -109,7 +105,7 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
     const done = () => {
       if (fired) return;
       fired = true;
-      onCloseRef.current?.();
+      onCloseRef.current();
     };
     // `transitionend` bubbles, so a child's own hover transition finishing
     // must not count as the sheet having left the screen.
@@ -153,33 +149,28 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
     },
   });
 
-  const lists = (
-    <>
-      {/* Subfolders (release-fixes-2): listed, not traversed — the only
-          action is opening them in Explorer, same as the "Open folder"
-          button above but scoped to the subfolder. Android-gated for the
-          same reason as that button: the chat folder is app-private there,
-          so there's no Explorer-equivalent to open a subfolder in. */}
-      {!android && subfolders.length > 0 && (
-        <div className="artifacts-list artifacts-subfolders">
-          {subfolders.map((f) => (
-            <SubfolderRow key={f.path} folder={f} />
-          ))}
-        </div>
-      )}
-      {artifacts.length === 0 && subfolders.length === 0 ? (
-        <p className="muted" style={{ fontSize: 14, padding: '4px 8px' }}>
-          Files the agent creates or edits will appear here.
-        </p>
-      ) : (
-        <div className="artifacts-list">
-          {artifacts.map((a) => (
-            <ArtifactCard key={a.path} artifact={a} android={android} />
-          ))}
-        </div>
-      )}
-    </>
-  );
+  const openFolder = async () => {
+    if (!cwd) return;
+    try {
+      await ipc.openPath(outputsDir(cwd));
+    } catch {
+      // No outputs folder yet: the chat's own folder is the next best place.
+      void ipc.openPath(cwd);
+    }
+  };
+
+  const lists =
+    entries.length === 0 ? (
+      <p className="muted" style={{ fontSize: 14, padding: '4px 8px' }}>
+        Files you ask Kitty to make will appear here.
+      </p>
+    ) : (
+      <div className="artifacts-list">
+        {entries.map((e) => (
+          <ArtifactCard key={e.path} entry={e} android={android} />
+        ))}
+      </div>
+    );
 
   return (
     <>
@@ -192,28 +183,28 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
       >
         {sheet && <div className="sheet-handle" aria-hidden="true" />}
         <div className="artifacts-head">
-          <span>Artifacts ({artifacts.length})</span>
+          <span className="artifacts-title">
+            Artifacts <span className="artifacts-count">{entries.length}</span>
+          </span>
           {/* Android has no folder to open: the chat folder lives in the app's
               private data directory, which neither Explorer's equivalent nor
               any other app can see into. Files leave via "Download" instead. */}
           {cwd && !android && (
             <button
               className="link"
-              title="Open this session's working folder in Explorer"
-              onClick={() => void ipc.openPath(cwd)}
+              title="Open this chat's outputs folder in Explorer"
+              onClick={() => void openFolder()}
             >
               Open folder
             </button>
           )}
-          {onClose && (
-            <button
-              className="artifacts-close"
-              onClick={sheet ? requestClose : onClose}
-              aria-label="Close artifacts"
-            >
-              ✕
-            </button>
-          )}
+          <button
+            className="artifacts-close"
+            onClick={sheet ? requestClose : onClose}
+            aria-label="Close artifacts"
+          >
+            ✕
+          </button>
         </div>
         {/* Its own scroller on the sheet, so the handle and header stay put
             and a swipe down can tell "list at top" from "list scrolled". On
@@ -226,26 +217,7 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
   );
 }
 
-function SubfolderRow({ folder }: { folder: FileEntry }) {
-  return (
-    <div className="artifact-card artifact-card-folder">
-      <div className="artifact-name" title={folder.path}>
-        <FolderIcon /> {folder.name}
-      </div>
-      <div className="artifact-actions">
-        {/* `revealPath`, not `openPath`, so this button means the same thing
-            here as it does on a file card below: show the item where it
-            lives. Opening the folder outright under the same label would make
-            one word describe two different actions depending on what you
-            clicked — and the file explorer is one double-click away either
-            way. */}
-        <button onClick={() => void ipc.revealPath(folder.path)}>Show in Folder</button>
-      </div>
-    </div>
-  );
-}
-
-function ArtifactCard({ artifact, android }: { artifact: Artifact; android: boolean }) {
+function ArtifactCard({ entry, android }: { entry: FileEntry; android: boolean }) {
   const [error, setError] = useState<string | null>(null);
   // Every action reports failure (#59): a file moved or deleted since, a
   // clipboard that refused.
@@ -257,56 +229,50 @@ function ArtifactCard({ artifact, android }: { artifact: Artifact; android: bool
       setError(`Couldn't ${what}: ${String(e)}`);
     }
   };
-  const origin =
-    artifact.source === 'user'
-      ? 'Attached by you'
-      : artifact.source === 'disk'
-        ? 'Found in the folder'
-        : `Made by ${artifact.tool}`;
+  const description = describeOutput({ name: entry.name, isDir: entry.is_dir, size: entry.size });
 
   return (
     <div className="artifact-card">
-      <div className="artifact-name" title={artifact.path}>
-        <DocumentIcon /> {artifact.name}
+      <div className="artifact-name" title={entry.path}>
+        {entry.is_dir ? <FolderIcon /> : <DocumentIcon />} <span>{entry.name}</span>
       </div>
+      <div className="artifact-origin muted">{description}</div>
       {/* The full path is Windows-useful and Android-noise: there, it points
           into an app-private directory the user can't navigate to anyway. */}
       {!android && (
-        <div className="artifact-path muted" title={artifact.path}>
-          {artifact.path}
+        // Cut from the front, not the back, so what stays visible is the end
+        // of the path — the part that tells one file from another. The
+        // leading mark keeps the drive letter and slashes in reading order
+        // inside the right-to-left box that does the cutting.
+        <div className="artifact-path muted" title={entry.path}>
+          {`‎${entry.path}`}
         </div>
       )}
-      <div className="artifact-origin muted">
-        {origin}
-        {artifact.addedAt
-          ? ` · ${relativeTime(new Date(artifact.addedAt).toISOString(), Date.now())}`
-          : ''}
-      </div>
       <div className="artifact-actions">
         {android ? (
           // "Open"/"Show in Folder"/"Copy path" are all meaningless against an
           // app-private path. Saving a copy out through the system file picker
           // is the only way a file the model wrote reaches the user's device.
-          <button
-            onClick={() =>
-              void ipc
-                .downloadFile(artifact.path)
-                .then(() => setError(null))
-                .catch((e) => setError(String(e)))
-            }
-          >
-            Download
-          </button>
+          !entry.is_dir && (
+            <button
+              onClick={() =>
+                void ipc
+                  .downloadFile(entry.path)
+                  .then(() => setError(null))
+                  .catch((e) => setError(String(e)))
+              }
+            >
+              Download
+            </button>
+          )
         ) : (
           <>
-            <button onClick={() => void act(ipc.openPath(artifact.path), 'open it')}>Open</button>
-            <button onClick={() => void act(ipc.revealPath(artifact.path), 'show it')}>
+            <button onClick={() => void act(ipc.openPath(entry.path), 'open it')}>Open</button>
+            <button onClick={() => void act(ipc.revealPath(entry.path), 'show it')}>
               Show in Folder
             </button>
             <button
-              onClick={() =>
-                void act(navigator.clipboard.writeText(artifact.path), 'copy the path')
-              }
+              onClick={() => void act(navigator.clipboard.writeText(entry.path), 'copy the path')}
             >
               Copy path
             </button>

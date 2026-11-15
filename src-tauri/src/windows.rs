@@ -72,15 +72,19 @@ fn focus_window(win: &WebviewWindow) -> tauri::Result<()> {
 }
 
 fn url(label: &str) -> WebviewUrl {
-    // Path is identical in dev (vite server) and prod (dist) — see vite.config.ts.
-    // A dynamically-allocated `chat-N` label (D21 — multiple simultaneous hub
-    // windows) has no directory of its own; every hub is functionally
-    // identical, so it reuses the `hub` bundle instead.
+    WebviewUrl::App(page_path(label).into())
+}
+
+/// A window's page, relative to the app root. Identical in dev (vite server)
+/// and prod (dist) — see vite.config.ts. A dynamically-allocated `chat-N`
+/// label (D21 — multiple simultaneous hub windows) has no directory of its
+/// own; every hub is functionally identical, so it reuses the `hub` bundle.
+fn page_path(label: &str) -> String {
     let dir = match label {
         OVERLAY | SCREENSHOT_SELECT => label,
         _ => HUB,
     };
-    WebviewUrl::App(format!("src/windows/{dir}/index.html").into())
+    format!("src/windows/{dir}/index.html")
 }
 
 /// Dev-only watchdog for a window's first navigation. In dev the webview loads
@@ -109,12 +113,23 @@ fn spawn_load_watchdog(app: &AppHandle, win: WebviewWindow, label: String) {
             if booted {
                 return;
             }
-            let Ok(current) = win.url() else { continue };
+            // The window's own page on the dev server, not whatever it shows
+            // now: a first navigation that never started leaves the window on
+            // `about:blank`, and reloading that would keep it blank for good.
+            let page = app
+                .config()
+                .build
+                .dev_url
+                .as_ref()
+                .and_then(|base| base.join(&page_path(&label)).ok());
+            let Some(target) = page.or_else(|| win.url().ok()) else {
+                continue;
+            };
             tracing::warn!(
                 "window '{label}' hasn't reported ready after {attempt}x{CHECK_INTERVAL:?} \
-                 (dev server hiccup?) — re-navigating to {current}"
+                 (dev server hiccup?) — re-navigating to {target}"
             );
-            if let Err(e) = win.navigate(current) {
+            if let Err(e) = win.navigate(target) {
                 tracing::warn!("watchdog re-navigate for '{label}' failed: {e}");
             }
         }
@@ -184,9 +199,11 @@ fn schedule_geometry_save(app: &AppHandle) {
         if !win.is_visible().unwrap_or(false) {
             return;
         }
+        // Inner size, because that is what `set_size` restores. Saving the
+        // outer size grew the overlay by its frame margin on every show.
         let (Ok(pos), Ok(size), Ok(Some(monitor))) = (
             win.outer_position(),
-            win.outer_size(),
+            win.inner_size(),
             win.current_monitor(),
         ) else {
             return;
@@ -212,26 +229,42 @@ fn schedule_geometry_save(app: &AppHandle) {
     });
 }
 
-/// Where the user last left the overlay, if remembering is on and that
-/// monitor is still attached. Its size is restored too.
+/// Restore the overlay's remembered size on this monitor, if remembering is
+/// on. Only the size: the overlay always opens at the lower right of the work
+/// area, wherever it was dragged last time.
 #[cfg(desktop)]
-fn remembered_overlay_position(win: &WebviewWindow) -> Option<(i32, i32)> {
+fn restore_overlay_size(win: &WebviewWindow) {
     let app = win.app_handle();
     let saved = {
         let state = app.state::<crate::state::AppState>();
         let cfg = state.config.lock().unwrap();
         if !cfg.remember_overlay_position {
-            return None;
+            return;
         }
         cfg.overlay_geometry.clone()
     };
-    let monitors = win.available_monitors().ok()?;
-    let rect = monitors
+    let Ok(monitors) = win.available_monitors() else {
+        return;
+    };
+    let Some(rect) = monitors
         .iter()
         .filter_map(|m| m.name())
-        .find_map(|name| saved.get(name))?;
-    let _ = win.set_size(tauri::PhysicalSize::new(rect.width, rect.height));
-    Some((rect.x, rect.y))
+        .find_map(|name| saved.get(name))
+    else {
+        return;
+    };
+    // A saved size more than half again the default is taken as the old
+    // outer-size creep (or a stray resize) and the default is restored.
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let too_big = |saved: u32, default: u32| f64::from(saved) > f64::from(default) * 1.5 * scale;
+    if too_big(rect.width, OVERLAY_W) || too_big(rect.height, OVERLAY_H) {
+        let _ = win.set_size(tauri::LogicalSize::new(
+            f64::from(OVERLAY_W),
+            f64::from(OVERLAY_H),
+        ));
+    } else {
+        let _ = win.set_size(tauri::PhysicalSize::new(rect.width, rect.height));
+    }
 }
 
 /// The overlay's resting (x, y) — lower-right of the primary monitor's *work
@@ -282,9 +315,9 @@ fn place_overlay_bottom_right(win: &WebviewWindow) {
 /// rising out of the taskbar) to its resting position, then focus it. Falls
 /// back to a plain show if the work-area geometry can't be read.
 fn animate_overlay_in(win: &WebviewWindow) {
+    // Size first: the lower-right position is worked out from it.
     #[cfg(desktop)]
-    let target = remembered_overlay_position(win).or_else(|| overlay_target_position(win));
-    #[cfg(not(desktop))]
+    restore_overlay_size(win);
     let target = overlay_target_position(win);
     let Some((x, target_y)) = target else {
         let _ = win.show();
@@ -563,7 +596,7 @@ pub fn focus_or_open_chat_window(app: &AppHandle) {
     }
 }
 
-/// The tray-click / hotkey action (Round-3 item 28): the overlay and main
+/// The tray-click action (Round-3 item 28): the overlay and main
 /// window are never both active at once — if main is already open, focus it
 /// instead of also summoning the overlay; otherwise fall through to the usual
 /// overlay toggle.

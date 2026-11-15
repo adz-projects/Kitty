@@ -142,10 +142,9 @@ html {
 /* Scrollbars in the app's own language, as in Bacon: a slim rounded thumb in
    the border tone over a transparent track, darkening on hover. Desktop only:
    Android draws its own overlay scrollbars, which take no room. */
-:root[data-platform='desktop'] * {
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-}
+/* (Styled through `::-webkit-scrollbar` alone. Setting the standard
+   `scrollbar-width` / `scrollbar-color` as well makes Chromium ignore these
+   rules and draw its own thin scrollbar, arrow buttons included.) */
 :root[data-platform='desktop'] *::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -159,6 +158,11 @@ html {
   background-clip: content-box;
   border: 2px solid transparent;
   border-radius: 999px;
+}
+:root[data-platform='desktop'] *::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 :root[data-platform='desktop'] *::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
@@ -247,16 +251,16 @@ button:disabled {
   align-items: flex-start;
   justify-content: center;
   height: 100%;
-  padding: 6px;
+  /* No transparent margin around the card: it fills the window, framed by
+     its own border. (A drop shadow would need that margin to draw in.) */
+  padding: 0;
 }
 
 .overlay-card {
   width: 100%;
-  max-width: 760px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--overlay-shadow);
   overflow: hidden;
   opacity: var(--overlay-opacity);
 }
@@ -282,6 +286,48 @@ button:disabled {
      padding left them nearly as tall as the titlebar itself — barely any
      margin above/below. A tight line-height lets the icon's own size (not
      an oversized text line box) drive the button's height instead. */
+  line-height: 1;
+}
+
+/* The overlay's title bar holds everything above the conversation: the model
+   and effort pickers on the left, then new chat, settings, the chat picker,
+   expand and hide. The gap between the two groups
+   is the drag area, so the controls stay compact rather than stretching. */
+.overlay-titlebar {
+  gap: 8px;
+}
+.overlay-header-slot {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.overlay-header-slot .chat-header {
+  padding-bottom: 0;
+  gap: 6px;
+  min-width: 0;
+}
+.overlay-header-slot .provider-badge-label {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overlay-titlebar-buttons {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+}
+/* Every button and pill in the bar is the same height, centred on one line. */
+.overlay-titlebar button,
+.overlay-titlebar .status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 26px;
+  padding-top: 0;
+  padding-bottom: 0;
   line-height: 1;
 }
 
@@ -360,12 +406,21 @@ button:disabled {
   min-height: 0;
 }
 
+/* The line above the conversation is a section of the window in its own
+   right: it runs the full width, closed off by a rule, while its contents keep
+   to the reading column (the inline padding is whatever the column leaves
+   over). The negative margin carries the rule out through the 16px padding of
+   the container the chat sits in, to the edges of the pane. */
 .chat-header {
+  --chat-gutter: 16px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding-bottom: 8px;
+  margin-inline: calc(-1 * var(--chat-gutter));
+  padding-block: 0 8px;
+  padding-inline: calc(var(--chat-gutter) + max(0px, (100% - var(--reading-max-width, 44rem)) / 2));
+  border-bottom: 1px solid var(--border);
   flex-wrap: nowrap;
 }
 /* The folder/thought-partner pill takes remaining space and truncates first —
@@ -413,6 +468,43 @@ button:disabled {
   flex-shrink: 0;
   min-width: 0;
 }
+/* The controls on that line are outlined, not filled: a hairline in the
+   border tone marks each as something to press without the row reading as a
+   toolbar of solid boxes, and the fill appears only under the pointer. */
+.chat-header .pill,
+.chat-header-controls button {
+  border-color: var(--border);
+  background: transparent;
+}
+.chat-header .pill:hover,
+.chat-header-controls button:hover {
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+.chat-header .pill-thought-partner {
+  margin-left: 0;
+}
+
+/* Everything in the chat keeps to the reading column the messages are set
+   in: the header row, notices, attachment chips and the composer line up with
+   the conversation instead of running the full width of a wide window. The
+   message list itself stays full width so its scrollbar is at the window's
+   edge, and centres its own rows (`.msg`). */
+.chat
+  > :is(
+    .conflict-banner,
+    .subagent-tray,
+    .composer,
+    .chat-concluded-banner,
+    .startup-phase-banner,
+    .file-chips,
+    .approval-prompt
+  ),
+.message-list.empty > p {
+  width: 100%;
+  max-width: var(--reading-max-width, 44rem);
+  margin-inline: auto;
+}
 
 .message-list {
   flex: 1;
@@ -430,7 +522,8 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 4px;
+  /* Room above the first turn, so it does not sit hard under the header rule. */
+  padding: 10px 4px 4px;
   min-height: 0;
 }
 /* Equal side margins. The list's scrollbar takes its width out of the right
@@ -624,14 +717,16 @@ button:disabled {
 .markdown h6:first-child {
   margin-top: 0;
 }
+/* A step down from the usual scale: the prose is soft, and headings in
+   full-brightness display type at 1.5em shouted over it. */
 .markdown h1 {
-  font-size: 1.5em;
+  font-size: 1.35em;
 }
 .markdown h2 {
-  font-size: 1.3em;
+  font-size: 1.2em;
 }
 .markdown h3 {
-  font-size: 1.15em;
+  font-size: 1.05em;
 }
 .markdown h4,
 .markdown h5,
@@ -1714,9 +1809,11 @@ button:disabled {
 
 /* --- Hub title bar (desktop; Bacon's construction) ---------------------------
    The hub window is decorationless and draws its own bar: a drag area across
-   the whole bar with the title centred in it, the chat's actions on the left
-   and the window buttons on the right, both sitting above the drag area. */
+   the whole bar with the Kitty icon at its left and the title centred, and on
+   the right the chat's actions, a short space, then the window buttons. Both
+   button groups sit above the drag area. */
 .titlebar {
+  --titlebar-button-w: 46px;
   position: relative;
   display: flex;
   align-items: center;
@@ -1734,29 +1831,63 @@ button:disabled {
   align-items: center;
   justify-content: center;
 }
-.titlebar-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  max-width: 40%;
-  font-size: var(--fs-sm-plus);
-  font-weight: 500;
-  /* Clicks fall through to the drag area, so the title drags the window too. */
+/* The icon and title let clicks fall through to the drag area, so they drag
+   the window too. */
+.titlebar-icon {
+  position: absolute;
+  left: 14px;
+  display: flex;
   pointer-events: none;
 }
-.titlebar-title > svg {
-  flex: none;
-}
-.titlebar-title-text {
+.titlebar-title {
+  /* Centred, so it may use only as much width as stays clear of the buttons
+     on the right on both sides (about 330px of buttons and spacing); in a
+     narrow window it shrinks, then gives way entirely. */
+  max-width: min(40%, calc(100% - 2 * 340px));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--fs-sm-plus);
+  font-weight: 500;
+  pointer-events: none;
 }
-.titlebar-left {
+.titlebar-right {
   position: absolute;
-  left: 8px;
+  right: 0;
+  top: 0;
+  bottom: 0;
   display: flex;
   align-items: center;
+  /* A short space between the chat's actions and the window buttons, so the
+     two groups read as separate. Nothing is drawn in it, and it drags the
+     window like the rest of the bar. */
+  gap: 20px;
+  pointer-events: none;
+}
+.titlebar-right > * {
+  pointer-events: auto;
+}
+/* The chat search box, just right of the Kitty icon. */
+.titlebar-search-slot {
+  position: absolute;
+  left: 40px;
+  display: flex;
+  align-items: center;
+}
+.titlebar-search-slot .session-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+.titlebar-search-slot .session-search input {
+  width: 200px;
+  height: 28px;
+}
+.titlebar-actions-slot:empty {
+  display: none;
 }
 .titlebar-actions {
   display: flex;
@@ -1764,11 +1895,8 @@ button:disabled {
   gap: 2px;
 }
 .titlebar-buttons {
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
   display: flex;
+  height: 100%;
 }
 /* Flat controls: no fill or outline until hovered, as on a native bar. */
 .titlebar button {
@@ -1787,7 +1915,7 @@ button:disabled {
   background: var(--surface-2);
 }
 .titlebar-buttons button {
-  width: 46px;
+  width: var(--titlebar-button-w);
   height: 100%;
   padding: 0;
   justify-content: center;
@@ -1809,7 +1937,8 @@ button:disabled {
 
 .main-window {
   display: grid;
-  grid-template-columns: 260px 1fr auto;
+  --chat-list-width: 286px;
+  grid-template-columns: var(--chat-list-width) 1fr;
   height: 100%;
   background: var(--bg);
 }
@@ -1835,10 +1964,11 @@ button:disabled {
 }
 
 /* --- Session list --- */
+/* The three columns are told apart by tone — the list and the artifacts pane
+   on `--surface`, the conversation on `--bg` — not by rules between them. */
 .session-list {
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border);
   background: var(--surface);
   min-height: 0;
   overflow-y: auto;
@@ -1858,10 +1988,16 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   padding: 4px 10px;
+  /* Pinned to the top of the sidebar while the chats scroll under it. On the
+     desktop the search box is up in the title bar, so this is the first thing
+     in the list; where the search box still heads the list, it pins below it. */
   position: sticky;
-  top: 51px;
+  top: 0;
   background: var(--surface);
   z-index: 1;
+}
+.session-search + .session-toolbar {
+  top: 51px;
 }
 
 /* --- Chat folders (Round-2 item 15) --- */
@@ -1872,8 +2008,7 @@ button:disabled {
   padding: 5px 10px;
   font-size: var(--fs-sm);
   font-weight: 500;
-  background: var(--surface-2);
-  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
   cursor: pointer;
 }
 .folder-chevron {
@@ -1918,8 +2053,8 @@ button:disabled {
 }
 .session-row-actions {
   position: absolute;
-  top: 8px;
-  right: 10px;
+  top: 4px;
+  right: 4px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1955,36 +2090,56 @@ button:disabled {
   overscroll-behavior: contain;
   min-height: 0;
 }
+/* A row is one quiet line: the title, and when, at the right. The list is a
+   way back to other conversations, not something to read, so it sits a step
+   below the conversation itself — muted type, no rule under each row, and a
+   soft block for the row under the pointer or the chat that is open. */
 .session-item {
   position: relative;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 8px;
+  margin: 1px 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
   cursor: pointer;
   /* Round-4 item 5: text-select on the title/meta fought with the pointer-
      based drag tracking (Round-3 batch 4) used to reassign a session's folder. */
   user-select: none;
+}
+/* A chat in a folder is set in from the folder's name, so the list reads as
+   folders with chats inside them rather than one flat column. */
+.folder-group .session-item {
+  margin-left: 22px;
 }
 .session-item:hover {
   background: var(--surface-2);
 }
 .session-item.active {
   background: var(--surface-2);
-  font-weight: 500;
+  color: var(--text);
+}
+/* The row's menu button appears over the date while the pointer is there. */
+.session-item:hover .session-row-actions ~ .session-meta,
+.session-item:has(.session-row-actions):hover .session-meta {
+  visibility: hidden;
 }
 .session-item.dragging {
   opacity: 0.5;
 }
 /* Bulk selection (Android, release-fixes items 8-10). */
 .session-item.selectable {
-  padding-left: 34px;
+  padding-left: 30px;
 }
 .session-item.selected {
   background: var(--selection, var(--surface-2));
 }
 .session-select-check {
   position: absolute;
-  left: 10px;
-  top: 12px;
+  left: 8px;
+  top: 9px;
   margin: 0;
 }
 /* Sticks to the bottom of .session-list's own scroll area (it's a flex
@@ -2010,51 +2165,223 @@ button:disabled {
   padding: 0;
 }
 .session-title {
+  grid-area: 1 / 1;
   font-size: var(--fs-md);
-  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding-right: 20px;
 }
 .session-meta {
+  grid-area: 1 / 2;
   font-size: var(--fs-xs);
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-item > .session-snippet {
+  grid-area: 2 / 1 / 3 / -1;
+}
 /* --- Artifacts pane --- */
+/* On the desktop the pane is always a drawer over the window's right edge: it
+   takes no grid column and never changes the conversation's layout, so nothing
+   in the chat moves when it opens or closes. (Android's bottom sheet has its
+   own rules further down.) */
 .artifacts-pane {
-  width: 280px;
-  border-left: 1px solid var(--border);
+  width: 300px;
   background: var(--surface);
   overflow-y: auto;
+  overflow-x: hidden;
   overscroll-behavior: contain;
 }
+:root[data-platform='desktop'] .main-window {
+  position: relative;
+  /* The drawer slides in from 16px to the right of its resting place. Without
+     this the window briefly overflows sideways and flashes a horizontal
+     scrollbar. `clip`, not `hidden`: nothing becomes a scroll container. */
+  overflow-x: clip;
+}
+:root[data-platform='desktop'] .main-window > .artifacts-pane {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  border-left: 1px solid var(--border);
+  box-shadow: var(--overlay-shadow);
+}
+@media (prefers-reduced-motion: no-preference) {
+  :root[data-platform='desktop'] .main-window > .artifacts-pane {
+    animation: artifacts-in 140ms ease-out;
+  }
+}
+@keyframes artifacts-in {
+  from {
+    transform: translateX(16px);
+    opacity: 0;
+  }
+}
+/* The pane is dressed like the chat list on the other side of the window:
+   muted type, no rules between entries, a soft block under the pointer. */
 .artifacts-head {
-  padding: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 12px 14px 8px;
+  background: var(--surface);
   font-weight: 500;
-  border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
-.artifacts-head .link {
+.artifacts-count {
+  margin-left: 4px;
+  color: var(--text-muted);
   font-weight: 400;
 }
-.artifact-card {
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
+.artifacts-section {
+  padding: 10px 8px 4px;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.artifacts-list {
+  padding: 0 6px;
+}
+/* The count on the title-bar button while the pane is shut. */
+.titlebar-count {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+/* Something new was made while the drawer was shut: the button turns red until
+   the drawer has been opened. */
+.titlebar button.artifacts-unseen,
+.main-header-actions button.artifacts-unseen {
+  color: var(--danger);
+}
+.titlebar button.artifacts-unseen .titlebar-count {
+  color: inherit;
+}
+.artifacts-close {
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  line-height: 1;
+}
+.artifacts-close:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* --- Output cards: what a turn left in `outputs`, under its answer --- */
+.output-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.output-card {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 22rem;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family);
+}
+.output-card-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.output-card-icon {
+  flex: none;
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.output-card-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.output-card-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-md);
+  color: var(--text);
+}
+button.output-card-name {
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+}
+button.output-card-name:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  background: transparent;
+}
+.output-card-desc {
+  font-size: var(--fs-xs);
+}
+.output-card-actions {
+  display: flex;
+  gap: 12px;
+  font-size: var(--fs-xs);
+}
+.output-card-actions .link {
+  padding: 0;
+  font-size: inherit;
+}
+.output-card-error {
+  margin: 0;
+  font-size: var(--fs-xs);
+}
+.artifacts-head .link {
+  font-weight: 400;
+}
+/* An entry: the name, the path under it, and its actions as a row of quiet
+   text buttons — three short lines, with nothing drawn around them. */
+.artifact-card {
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.artifact-card:hover {
+  background: var(--surface-2);
 }
 .artifact-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
   font-size: var(--fs-md);
-  font-weight: 500;
 }
+.artifact-name > svg {
+  flex: none;
+  color: var(--text-muted);
+}
+.artifact-name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Right-to-left so the ellipsis falls at the start and the end of the path —
+   the part that differs — stays in view. */
 .artifact-path {
+  direction: rtl;
+  text-align: left;
   font-size: var(--fs-xs);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2062,23 +2389,39 @@ button:disabled {
 }
 .artifact-actions {
   display: flex;
-  gap: 4px;
+  gap: 2px 12px;
   flex-wrap: wrap;
+  margin-top: 2px;
 }
 .artifact-actions button {
+  padding: 1px 0;
+  border: none;
+  background: transparent;
   font-size: var(--fs-xs);
-  padding: 3px 6px;
+  color: var(--text-muted);
+}
+.artifact-actions button:hover {
+  background: transparent;
+  color: var(--accent);
+  text-decoration: underline;
+}
+/* A folder has one action, so it is a single line: name left, action right. */
+.artifact-card-folder {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.artifact-card-folder .artifact-actions {
+  flex: none;
+  margin-top: 0;
 }
 /* Subfolder rows (release-fixes-2): listed above the file cards, muted
    slightly relative to them since there's nothing to preview/open
    in-app — the folder icon plus the one "Show in Folder" action already
    say everything the row can offer. */
-.artifacts-subfolders {
-  border-bottom: 2px solid var(--border);
-}
 .artifact-card-folder .artifact-name {
   color: var(--text-muted);
-  font-weight: 500;
 }
 
 /* --- File chips (composer) --- */

@@ -21,7 +21,7 @@ apply at runtime with no rebuild.
 | `--radius`          | Corner radius for cards and dialogs (e.g. `4px`) |
 | `--font-family`     | UI font stack                                  |
 | `--overlay-opacity` | Overlay card opacity (`0`–`1`)                 |
-| `--overlay-shadow`  | Overlay card box-shadow                        |
+| `--overlay-shadow`  | Shadow under the Android menu drawer and artifacts sheet |
 | `--ok` / `--warn` / `--danger` | Status colors                       |
 
 ## Optional custom properties

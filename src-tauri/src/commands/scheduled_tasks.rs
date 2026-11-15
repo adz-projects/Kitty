@@ -122,7 +122,7 @@ fn card_fields(app: &AppHandle, provider_id: Option<&str>) -> Result<Value, Stri
         None => json!({
             "provider_id": null,
             "model": null,
-            "system_prompt": crate::config::providers::DEFAULT_SYSTEM_PROMPT,
+            "system_prompt": crate::config::providers::default_system_prompt(),
         }),
     })
 }

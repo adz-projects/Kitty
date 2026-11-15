@@ -37,6 +37,7 @@ export function App() {
   // The title bar's left-hand slot, which the chat route fills with its
   // actions (desktop only; Android has no title bar).
   const [titleBarSlot, setTitleBarSlot] = useState<HTMLDivElement | null>(null);
+  const [searchSlot, setSearchSlot] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void init();
@@ -71,9 +72,9 @@ export function App() {
 
   return (
     <>
-      <TitleBar actionsRef={setTitleBarSlot} />
+      <TitleBar actionsRef={setTitleBarSlot} searchRef={setSearchSlot} />
       <div hidden={view !== 'chat'} className="hub-route">
-        <ChatWorkspace titleBarSlot={titleBarSlot} />
+        <ChatWorkspace titleBarSlot={titleBarSlot} searchSlot={searchSlot} />
       </div>
       {/* `sessions` is a full-page list for anything that routes to it. On
           desktop the list lives in the chat sidebar and on Android in the menu

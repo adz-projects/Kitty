@@ -75,21 +75,30 @@ export interface Message {
   /** Things the user should know about how this reply was produced — a
       model failover, the step limit — shown under it (`chat://notice`). */
   notices?: string[];
+  /** What this turn made or changed in the chat's `outputs` folder, one entry
+      per top-level file or folder — rendered as cards after the answer. Set at
+      the end of a live turn (from a before/after listing) or rebuilt from the
+      replayed tool calls on a resume. */
+  outputs?: OutputRef[];
 }
 
+/** A top-level entry of a chat's `outputs` folder that a turn produced. */
+export interface OutputRef {
+  name: string;
+  /** Absolute, forward-slashed. */
+  path: string;
+  /** Unknown (undefined) for one rebuilt from a replayed tool call whose path
+      is the entry itself; the live listing fills it in once loaded. */
+  isDir?: boolean;
+  size?: number;
+}
+
+/** A path a tool call wrote to (`deriveArtifact`). Only used to work out which
+    `outputs` entries a replayed turn touched. */
 export interface Artifact {
   path: string;
   name: string;
   tool: string;
-  /** `'tool'` (default) for goosed tool-call-derived artifacts, `'user'` for a
-      file the user attached to a message, `'disk'` for a file found in the
-      working directory that wasn't otherwise derived from a tool call or
-      attachment (e.g. dropped in via Explorer) — distinguishes the sources in
-      the UI without changing how any of them are opened/revealed. */
-  source?: 'user' | 'tool' | 'disk';
-  /** When it appeared, for one made during this window's session (a replayed
-      artifact has no reliable time, so none). Epoch ms. */
-  addedAt?: number;
 }
 
 /** An inlined document (large paste or dropped text file) in chat-only mode. */

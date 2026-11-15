@@ -29,6 +29,8 @@ import {
 } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
 import { modelAcceptsImages } from '@/lib/vision_models';
+import { changedEntries, outputEntryOf, outputKey, toOutputRef } from '@/lib/outputs';
+import { listOutputs, useArtifactsStore } from './artifactsStore';
 import type {
   FileEntry,
   NetworkTier,
@@ -54,15 +56,13 @@ import {
   deriveArtifact,
   extractGooseToolMeta,
   findMatchingProvider,
-  isArtifactInScope,
   isImageFileName,
   isAutoSpecialistCollection,
   isStragglerAssistantMessage,
-  userFileArtifact,
   hasSomethingToSend,
   untrustedWarning,
 } from './chat/messageUtils';
-import type { Artifact, Attachment, Message, PendingImage, ToolCall } from './chat/types';
+import type { Attachment, Message, OutputRef, PendingImage, ToolCall } from './chat/types';
 import { noticeText } from './chat/notices';
 
 export * from './chat/errorUtils';
@@ -101,15 +101,15 @@ interface ChatState {
     ok: boolean;
   } | null;
   /** The session's original chat folder, captured once at creation/load
-      time — the artifacts pane's fallback scope (with `cwd`) until
+      time — the approval check's fallback scope (with `cwd`) until
       `sessionGrants` has loaded. */
   chatDir: string | null;
   /** Everything this session is allowed to touch, as the *daemon* sees it —
       `chat_dir`/`cwd` plus every working folder set during the session and
       every file the user attached to a turn.
 
-      Scopes the artifacts pane to the user's own files. (Approval decisions
-      use the same grants, but in Rust: `approvals.rs`.) Refreshed wherever
+      Approval decisions use the same grants, but in Rust: `approvals.rs`.
+      Refreshed wherever
       the grant set can change (session create/load/adopt, and after a send
       that carried attachments).
 
@@ -131,14 +131,6 @@ interface ChatState {
       session id that doesn't exist yet. */
   creatingSession: boolean;
   messages: Message[];
-  artifacts: Artifact[];
-  /** Direct subdirectories of `cwd` (release-fixes-2) — shown in the
-      Artifacts pane as "open in Explorer" rows, not traversed into. Purely
-      disk-derived (unlike `artifacts`, never populated from tool-call
-      events or carried across a window handoff), so it's fine for this to
-      lag a `refreshArtifactsFromDisk` poll tick behind a session switch
-      rather than being threaded through every reset site `artifacts` is. */
-  subfolders: FileEntry[];
   droppedFiles: PathInfo[];
   attachments: Attachment[];
   pendingImages: PendingImage[];
@@ -261,17 +253,6 @@ interface ChatState {
       regardless of the automatic token threshold, then surfaces a notice with
       what was folded. No-op when there's no active session. */
   compact: () => Promise<void>;
-  /** Drop any artifact whose file no longer exists on disk — covers both a
-      tool call deleting it and the user deleting it out-of-band (Explorer,
-      another app). Best-effort: a failed check just leaves the list as-is
-      until the next call. */
-  pruneMissingArtifacts: () => Promise<void>;
-  /** Scan `cwd` on disk and merge in any file not already tracked as an
-      artifact (e.g. dropped in via Explorer rather than written by a tool
-      call) — the tool-call-derived path above is event-driven and only ever
-      sees files a tracked tool call actually wrote. Best-effort: a failed
-      scan (missing/inaccessible directory) just leaves the list as-is. */
-  refreshArtifactsFromDisk: () => Promise<void>;
   /** Optionally pass an already-fetched provider list (e.g. from
       `loadSession`, which needs one anyway) to skip a redundant
       `listProviders` round-trip. */
@@ -345,7 +326,6 @@ interface ChatState {
         after the replay since `session/load` doesn't reliably include an
         in-progress turn's not-yet-committed partial content. */
     messages?: Message[];
-    artifacts?: Artifact[];
   }) => Promise<void>;
   /** Hand the current session off to the main window (the overlay's "Expand"
       button). Resets local session state afterward so reopening the overlay lands on
@@ -371,6 +351,8 @@ let lastSentAt: number | null = null;
 // streaming; that would otherwise attribute the response to the wrong model.
 let lastSentProvider: string | null = null;
 let lastSentModel: string | null = null;
+// The `outputs` listing taken when the running turn began (`beginTurnOutputs`).
+let turnOutputs: { sessionId: string; cwd: string; before: FileEntry[] } | null = null;
 // Grace-period timer between "Stop" and offering "Force Stop" (Round-5).
 // Module-level like the fields above — one in-flight turn per active session.
 const STOP_GRACE_MS = 12_000;
@@ -534,12 +516,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
   // is copied into the session's own working directory — the one folder
   // `decideChatApproval` already permits chat-mode tool access to — so the
   // model's own tool can genuinely open it there.
-  const addArtifact = (artifact: Artifact) =>
-    set((s) => ({
-      artifacts: s.artifacts.some((a) => a.path === artifact.path)
-        ? s.artifacts
-        : [...s.artifacts, artifact],
-    }));
 
   /** Resolve dropped/picked paths to ones the app and the model can actually
       open, preserving the order they arrived in. Folders are left alone —
@@ -583,7 +559,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       try {
         const file = await ipc.readFileAny(f.path);
         get().addPendingImage(file.mime ?? 'image/png', file.content);
-        addArtifact(userFileArtifact(f.path, f.name));
       } catch (e) {
         set({ error: String(e) });
       }
@@ -593,7 +568,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       const file = await ipc.readFileAny(f.path);
       if (file.kind === 'text') {
         get().addPastedText(file.content, f.name);
-        addArtifact(userFileArtifact(f.path, f.name));
         return;
       }
       // Ensure a real session (and therefore a real working directory)
@@ -611,7 +585,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
             `inside it.]`,
           copiedName
         );
-        addArtifact(userFileArtifact(`${cwd.replace(/[\\/]+$/, '')}/${copiedName}`, copiedName));
       } catch {
         // Best-effort fallback: if the copy itself fails (disk full,
         // permissions, etc.), don't leave the model to guess at a path that
@@ -825,6 +798,42 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
     if (warning) set({ warning });
   };
 
+  /** Remember what `outputs` holds as a turn starts, so that when it ends the
+      new and changed entries can be told apart (`finishTurnOutputs`). */
+  const beginTurnOutputs = async (sessionId: string): Promise<void> => {
+    turnOutputs = null;
+    const cwd = get().cwd;
+    if (!cwd) return;
+    turnOutputs = { sessionId, cwd, before: await listOutputs(cwd) };
+  };
+
+  /** A turn ended (completed or failed): list `outputs` again, hand the
+      listing to the drawer, and put a card for every new or modified
+      top-level entry on the turn's last answer. Flags the drawer's button when
+      there is something. Does nothing if the window has moved to another chat
+      meanwhile. */
+  const finishTurnOutputs = async (sessionId: string): Promise<void> => {
+    const turn = turnOutputs;
+    if (!turn || turn.sessionId !== sessionId) return;
+    turnOutputs = null;
+    const after = await listOutputs(turn.cwd);
+    useArtifactsStore.getState().setListing(turn.cwd, after);
+    const changed = changedEntries(turn.before, after);
+    if (changed.length === 0) return;
+    if (get().sessionId !== sessionId || get().cwd !== turn.cwd) return;
+    const refs: OutputRef[] = changed.map(toOutputRef);
+    let attached = false;
+    set((s) => {
+      const i = s.messages.length - 1;
+      if (i < 0 || s.messages[i].role !== 'assistant') return s;
+      const msgs = s.messages.slice();
+      msgs[i] = { ...msgs[i], outputs: refs };
+      attached = true;
+      return { messages: msgs };
+    });
+    if (attached) useArtifactsStore.getState().markNew();
+  };
+
   const doSend = async (
     text: string,
     snapshot?: {
@@ -871,7 +880,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       const imageFiles = files.filter((f) => !f.is_dir && isImageFileName(f.name));
       const imageSet = new Set(imageFiles);
       const otherFiles = files.filter((f) => !imageSet.has(f));
-      for (const f of [...otherFiles, ...imageFiles]) addArtifact(userFileArtifact(f.path, f.name));
       let images: { mime: string; data_url: string }[] | undefined;
       if (imageFiles.length) {
         const results = await Promise.all(
@@ -952,6 +960,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // blank list and leave its busy flag stuck on a turn whose events all
       // belong to the abandoned session. Aborting means the typed text is
       // lost — the lesser evil, and the user explicitly moved on.
+      await beginTurnOutputs(sessionId);
       if (get().sessionId !== sessionId) return false;
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.
@@ -1007,8 +1016,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
     thinkingEffort: null,
     creatingSession: false,
     messages: [],
-    artifacts: [],
-    subfolders: [],
     droppedFiles: [],
     attachments: [],
     pendingImages: [],
@@ -1087,47 +1094,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         set({
           compactionNotice: `Compact failed — ${String(e)}`,
         });
-      }
-    },
-
-    pruneMissingArtifacts: async () => {
-      const artifacts = get().artifacts;
-      if (artifacts.length === 0) return;
-      try {
-        const infos = await ipc.inspectPaths(artifacts.map((a) => a.path));
-        const missing = new Set(infos.filter((i) => !i.exists).map((i) => i.path));
-        if (missing.size === 0) return;
-        set((s) => ({ artifacts: s.artifacts.filter((a) => !missing.has(a.path)) }));
-      } catch {
-        // best-effort — try again on the next call
-      }
-    },
-
-    refreshArtifactsFromDisk: async () => {
-      const cwd = get().cwd;
-      if (!cwd) return;
-      try {
-        const entries = await ipc.listDirectory(cwd);
-        // Subfolders (release-fixes-2) are a separate, purely disk-derived
-        // list — never mixed into `artifacts` (which also carries tool-call
-        // provenance) and just replaced wholesale each poll, unlike the
-        // dedupe-and-append below.
-        set({ subfolders: entries.filter((e) => e.is_dir) });
-        // Compare on a normalized (forward-slash, lowercased) form — Windows
-        // paths are case-insensitive and tool-derived artifact paths can mix
-        // separators (see absoluteArtifactPath in messageUtils.ts), so raw
-        // string equality would under-dedupe against disk-scanned entries.
-        const normalize = (p: string) => p.replace(/\\/g, '/').toLowerCase();
-        set((s) => {
-          const known = new Set(s.artifacts.map((a) => normalize(a.path)));
-          const additions: Artifact[] = entries
-            .filter((e) => !e.is_dir && !known.has(normalize(e.path)))
-            .map((e) => ({ path: e.path, name: e.name, tool: 'disk', source: 'disk' as const }));
-          if (additions.length === 0) return s;
-          return { artifacts: [...s.artifacts, ...additions] };
-        });
-      } catch {
-        // best-effort — try again on the next call (e.g. cwd not yet created)
       }
     },
 
@@ -1271,7 +1237,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // switch that landed during the replay await still skips the snapshot,
       // because it leaves this window bound to a different (or no) session.
       if (info.messages && get().sessionId === info.session_id) {
-        set({ messages: info.messages, artifacts: info.artifacts ?? [] });
+        set({ messages: info.messages });
       }
     },
 
@@ -1301,7 +1267,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
             // turn's partial content). Only while a turn is running: an idle
             // chat's replay is complete, and shipping the whole transcript
             // through IPC twice bought nothing.
-            ...(s.busy ? { messages: s.messages, artifacts: s.artifacts } : {}),
+            ...(s.busy ? { messages: s.messages } : {}),
           }
         : null;
       // A rejected window-open/hide pair used to escape as an unhandled
@@ -1337,7 +1303,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         concludedReason: null,
         replaying: false,
         messages: [],
-        artifacts: [],
         droppedFiles: [],
         attachments: [],
         pendingImages: [],
@@ -1437,7 +1402,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         creatingSession: true,
         title: null,
         messages: [],
-        artifacts: [],
         droppedFiles: [],
         attachments: [],
         pendingImages: [],
@@ -1601,7 +1565,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         title: title ?? null,
         thinkingEffort: null,
         messages: [],
-        artifacts: [],
         error: null,
         errorType: null,
         providerOffline: false,
@@ -2048,6 +2011,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         lastSentAt = performance.now();
         lastSentProvider = get().providerName;
         lastSentModel = get().model;
+        await beginTurnOutputs(sessionId);
         await ipc.regenerateLast(sessionId);
       } catch (e) {
         // The reconsidered turn never started — un-collapse the original
@@ -2219,26 +2183,13 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           String(u.toolCallId ?? '').trim() !== ''
             ? String(u.toolCallId)
             : `#${String(u.title ?? u.kind ?? 'tool')}:${JSON.stringify(u.rawInput ?? {})}`;
-        // Scope the pane to the user's own files. `sessionGrants` is the
-        // daemon's view of what this session may touch (chat folder, current
-        // cwd, every working folder set during it, every attached file) and
-        // is already cached here for the approval handler; chat folder + cwd
-        // is the pre-load fallback, same as there. See `isArtifactInScope`
-        // for why a tool's own cache/temp writes must not land in the pane.
+        // A resumed session's cards are rebuilt from the paths its tool calls
+        // wrote to (a live turn's are found by listing `outputs` when it ends:
+        // `finishTurnOutputs`). A path inside a subfolder of `outputs` belongs
+        // to that top-level folder.
         const g0 = get();
-        const scope = g0.sessionGrants
-          ? [
-              g0.sessionGrants.chat_dir,
-              g0.sessionGrants.cwd,
-              ...g0.sessionGrants.working_dirs,
-              ...g0.sessionGrants.attached_paths,
-            ]
-          : [g0.chatDir, g0.cwd];
-        const derived = deriveArtifact(u, g0.cwd);
-        const artifact =
-          derived && isArtifactInScope(derived.path, scope)
-            ? { ...derived, ...(g0.replaying ? {} : { addedAt: Date.now() }) }
-            : null;
+        const derived = g0.replaying ? deriveArtifact(u, g0.cwd) : null;
+        const entry = derived && g0.cwd ? outputEntryOf(derived.path, g0.cwd) : null;
         set((s) => {
           let msgs = s.messages.slice();
           let last = msgs[msgs.length - 1];
@@ -2292,11 +2243,13 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           else toolCalls.push(merged);
           last.toolCalls = toolCalls;
 
-          const artifacts =
-            artifact && !s.artifacts.some((a) => a.path === artifact.path)
-              ? [...s.artifacts, artifact]
-              : s.artifacts;
-          return { messages: msgs, artifacts };
+          if (entry && !last.outputs?.some((o) => outputKey(o.name) === outputKey(entry.name))) {
+            last.outputs = [
+              ...(last.outputs ?? []),
+              { name: entry.name, path: entry.path, ...(entry.nested ? { isDir: true } : {}) },
+            ];
+          }
+          return { messages: msgs };
         });
       };
       replayHandlers.set('chat://tool-call', handleToolCall);
@@ -2405,7 +2358,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
             concludedReason: null,
             replaying: false,
             messages: [],
-            artifacts: [],
             droppedFiles: [],
             attachments: [],
             pendingImages: [],
@@ -2452,7 +2404,6 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
             concludedReason: null,
             replaying: false,
             messages: [],
-            artifacts: [],
             droppedFiles: [],
             attachments: [],
             pendingImages: [],
@@ -2522,6 +2473,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
             loopSuspected: false,
           };
         });
+        void finishTurnOutputs(e.session_id);
       });
       void onChatError((e) => {
         // Same backgrounded-turn handling as onComplete — a backgrounded turn
@@ -2556,6 +2508,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
               ? 'context_exceeded'
               : s.concludedReason,
         }));
+        void finishTurnOutputs(e.session_id);
       });
       // Reuses `compactionNotice` rather than adding a second banner: this is
       // a context-management notice like the compaction one, and it is

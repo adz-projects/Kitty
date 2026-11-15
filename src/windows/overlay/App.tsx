@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ipc, onNewSessionRequest } from '@/lib/ipc';
 import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
@@ -37,6 +37,9 @@ export function App() {
   }, [init, initAdaptivePathway]);
 
   const sessionId = useChatStore((s) => s.sessionId);
+  // The title bar's left-hand slot: the chat's header row (folder pill, model,
+  // effort, ⋯) is drawn there rather than as a row of its own.
+  const [headerSlot, setHeaderSlot] = useState<HTMLDivElement | null>(null);
   const booting = useStackStore(selectBooting);
   const degraded = DEGRADED.includes(status);
   // A first-connect `backend_down` during the grace window is a slow daemon
@@ -65,8 +68,20 @@ export function App() {
         style={{ display: 'flex', flexDirection: 'column', height: '100%' }}
       >
         <div className="overlay-titlebar" data-tauri-drag-region>
-          <strong>Kitty</strong>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className="overlay-header-slot" ref={setHeaderSlot} />
+          <div className="overlay-titlebar-buttons">
+            {/* Left to right after the chat's own controls: new chat and
+                settings, the chat picker, then expand and hide. */}
+            <button
+              onClick={() => void useChatStore.getState().newSession()}
+              title="New chat"
+              aria-label="New chat"
+            >
+              <NewChatIcon />
+            </button>
+            <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
+              <SettingsGearIcon />
+            </button>
             <RecentSessions />
             <button onClick={expand} title="Expand to full window" aria-label="Expand">
               <DoubleChevronIcon direction="up" />
@@ -77,16 +92,6 @@ export function App() {
               aria-label="Hide overlay"
             >
               <DoubleChevronIcon direction="down" />
-            </button>
-            <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
-              <SettingsGearIcon />
-            </button>
-            <button
-              onClick={() => void useChatStore.getState().newSession()}
-              title="New chat"
-              aria-label="New chat"
-            >
-              <NewChatIcon />
             </button>
           </div>
         </div>
@@ -99,7 +104,7 @@ export function App() {
           ) : degraded ? (
             <StackStatusView status={status} />
           ) : (
-            <ChatView />
+            <ChatView headerSlot={headerSlot} />
           )}
         </div>
       </div>

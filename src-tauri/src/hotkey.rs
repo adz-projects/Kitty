@@ -20,7 +20,7 @@ use crate::windows;
 /// behavior when rolling back.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
-    ToggleMain,
+    ToggleOverlay,
     AttachClipboard,
     OpenNewWindow,
 }
@@ -46,9 +46,12 @@ fn bind_shortcut(app: &AppHandle, accel: &str, action: Action) -> Result<(), Str
             // Fire on key press only, not release, to avoid a double toggle.
             if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
                 match action {
-                    Action::ToggleMain => {
-                        if let Err(e) = windows::toggle_or_focus_main(&handle) {
-                            tracing::warn!("toggle_or_focus_main from hotkey failed: {e}");
+                    // Always the overlay, even with a full window open: the
+                    // hotkey is the overlay's own summon (the tray click still
+                    // prefers an open window).
+                    Action::ToggleOverlay => {
+                        if let Err(e) = windows::toggle_overlay(&handle) {
+                            tracing::warn!("toggle_overlay from hotkey failed: {e}");
                         }
                     }
                     Action::AttachClipboard => attach_clipboard(&handle),
@@ -86,7 +89,7 @@ pub fn register(
 ) -> Result<(), String> {
     let mut desired: Vec<(String, Action)> = Vec::new();
     for accel in accelerators {
-        desired.push((accel.clone(), Action::ToggleMain));
+        desired.push((accel.clone(), Action::ToggleOverlay));
     }
     if let Some(accel) = clipboard_hotkey {
         desired.push((accel.to_string(), Action::AttachClipboard));

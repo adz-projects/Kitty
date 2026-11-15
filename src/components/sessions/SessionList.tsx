@@ -5,6 +5,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
 import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { useChatStore } from '@/stores/chatStore';
@@ -49,7 +50,7 @@ const LONG_PRESS_MS = 500;
     default on Windows and — per Tauri's own docs — that disables HTML5 DnD in
     the same webview. Tracking pointer position ourselves sidesteps the native
     handler entirely and works regardless of that setting. */
-export function SessionList() {
+export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | null } = {}) {
   // Narrow slices, not the whole store: a whole-store subscription re-renders
   // this entire (potentially long) sidebar whenever ANY slice changes — e.g.
   // the 150ms-debounced `setQuery` on a keystroke, or a single session being
@@ -404,18 +405,24 @@ export function SessionList() {
     setCreatingFolder(false);
   };
 
+  const search = (
+    <div className="session-search">
+      <input
+        value={searchInput}
+        placeholder="Search chats"
+        onChange={(e) => onSearchChange(e.target.value)}
+      />
+      <button title="Refresh" aria-label="Refresh" onClick={() => void refresh()}>
+        <RefreshIcon />
+      </button>
+    </div>
+  );
+
   return (
     <aside className="session-list">
-      <div className="session-search">
-        <input
-          value={searchInput}
-          placeholder="Search chats"
-          onChange={(e) => onSearchChange(e.target.value)}
-        />
-        <button title="Refresh" onClick={() => void refresh()}>
-          <RefreshIcon />
-        </button>
-      </div>
+      {/* Desktop: the search box lives in the window's title bar, above this
+          list. Elsewhere it heads the list. */}
+      {searchSlot ? createPortal(search, searchSlot) : search}
       <div className="session-toolbar">
         <span className="muted" style={{ fontSize: 13 }}>
           {query.trim()
@@ -801,6 +808,11 @@ function SessionRow({
       }}
       role="button"
       tabIndex={0}
+      // The row shows only the title and when; where the chat lives and which
+      // model it used are a hover away rather than a second line on every row.
+      title={[s.title, s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd, s.modelId]
+        .filter(Boolean)
+        .join(' · ')}
     >
       {selectionMode && (
         <input
@@ -817,15 +829,7 @@ function SessionRow({
       <div className="session-title">{s.title}</div>
       {s.snippet && <div className="session-snippet muted">{s.snippet}</div>}
       <div className="session-meta muted">
-        {resuming
-          ? 'Resuming…'
-          : [
-              relativeTime(s.updatedAt, Date.now()),
-              s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd,
-              s.modelId,
-            ]
-              .filter(Boolean)
-              .join(' · ')}
+        {resuming ? 'Resuming…' : relativeTime(s.updatedAt, Date.now())}
       </div>
       {/* Kebab menu (rename, move to folder) is desktop-only on Android
           (release-fixes item 9) — long-press bulk-select + the bottom action

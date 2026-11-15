@@ -190,15 +190,40 @@ save a file, use a relative path inside the working directory rather than an abs
 elsewhere. Be direct about assumptions and uncertainty rather than glossing over them, and \
 prefer verifiable action (running a command, reading a file, writing output) over speculation.";
 
+/// Appended to every chat's system prompt, whether the built-in one or a
+/// provider's own: where the files the user asked for go, so the artifacts
+/// drawer (which lists `outputs/` and nothing else) shows them.
+pub const OUTPUTS_INSTRUCTION: &str = "Files the user asked you to produce — a document, a \
+report, a dataset, a folder of downloads — go in the `outputs/` folder inside the working \
+directory (create it if it does not exist). Working files you make along the way — scripts, \
+scratch notes, caches, intermediate data — stay outside it. Only put something in `outputs/` \
+if the user asked for it.";
+
+/// `prompt` followed, after a blank line, by [`OUTPUTS_INSTRUCTION`] — once:
+/// a prompt that already carries it is returned unchanged.
+pub fn with_outputs_instruction(prompt: &str) -> String {
+    let prompt = prompt.trim_end();
+    if prompt.contains(OUTPUTS_INSTRUCTION) {
+        return prompt.to_string();
+    }
+    format!("{prompt}\n\n{OUTPUTS_INSTRUCTION}")
+}
+
+/// The built-in prompt as a session runs with it: for a chat with no provider
+/// card, and for a scheduled run with none.
+pub fn default_system_prompt() -> String {
+    with_outputs_instruction(DEFAULT_SYSTEM_PROMPT)
+}
+
 /// The system prompt a session on `profile` runs with.
 pub fn system_prompt_for(profile: &ProviderProfile) -> String {
-    profile
+    let own = profile
         .system_prompt
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .unwrap_or(DEFAULT_SYSTEM_PROMPT)
-        .to_string()
+        .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    with_outputs_instruction(own)
 }
 
 /// Retire the "On this device" (`local`) provider type: there is no local
@@ -414,15 +439,30 @@ mod tests {
     #[test]
     fn a_provider_without_its_own_prompt_gets_the_default() {
         let mut p = typed("a", "openrouter");
-        assert_eq!(system_prompt_for(&p), DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(system_prompt_for(&p), default_system_prompt());
         p.system_prompt = Some("  ".into());
         assert_eq!(
             system_prompt_for(&p),
-            DEFAULT_SYSTEM_PROMPT,
+            default_system_prompt(),
             "blank is not a prompt"
         );
         p.system_prompt = Some("Be terse.".into());
-        assert_eq!(system_prompt_for(&p), "Be terse.");
+        assert_eq!(
+            system_prompt_for(&p),
+            format!("Be terse.\n\n{OUTPUTS_INSTRUCTION}"),
+            "a custom prompt gets the outputs instruction too"
+        );
+    }
+
+    #[test]
+    fn the_outputs_instruction_is_added_once() {
+        let once = with_outputs_instruction("Be terse.");
+        assert_eq!(with_outputs_instruction(&once), once);
+        assert_eq!(once.matches(OUTPUTS_INSTRUCTION).count(), 1);
+        let mut p = typed("a", "openrouter");
+        p.system_prompt = Some(once.clone());
+        assert_eq!(system_prompt_for(&p), once);
+        assert!(default_system_prompt().starts_with(DEFAULT_SYSTEM_PROMPT));
     }
 
     #[test]

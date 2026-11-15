@@ -45,7 +45,6 @@ beforeEach(() => {
     thinkingEffort: null,
     creatingSession: false,
     messages: [],
-    artifacts: [],
     droppedFiles: [],
     attachments: [],
     pendingImages: [],
@@ -216,7 +215,6 @@ describe('chatStore adoptSession handoff snapshot', () => {
     session_id: 's1',
     cwd: '/c',
     messages: snapshot,
-    artifacts: [],
   };
 
   it('applies the mid-turn snapshot after the replay', async () => {

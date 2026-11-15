@@ -47,7 +47,7 @@ describe('TitleBar', () => {
     const html = render();
     expect(html).toContain('data-tauri-drag-region');
     expect(html).toContain('Trip planning');
-    expect(html).toContain('class="titlebar-left"');
+    expect(html).toContain('class="titlebar-actions-slot"');
     for (const label of ['Minimize', 'Maximize or restore', 'Close']) {
       expect(html).toContain(`aria-label="${label}"`);
     }

@@ -12,14 +12,14 @@ import { ChatHeaderMenu } from './ChatHeaderMenu';
  * `ChatWorkspace` hoists this into the window header beside "Show artifacts"
  * and "New chat" and `ChatView` drops its header entirely. Same components,
  * same state, different parent — nothing here knows which. */
-export function ChatHeaderControls() {
+export function ChatHeaderControls({ menu = true }: { menu?: boolean } = {}) {
   return (
     <div className="chat-header-controls">
       <ProviderBadge />
       <EffortPicker />
       {/* The overflow menu: incognito on both platforms, and on Android the
           chat's allowed folders too (#79). */}
-      <ChatHeaderMenu />
+      {menu && <ChatHeaderMenu />}
     </div>
   );
 }

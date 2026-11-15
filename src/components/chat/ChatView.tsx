@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactElement } from 'react';
+import { createPortal } from 'react-dom';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
 import { humanizeChatError, useChatStore } from '@/stores/chatStore';
 import { useStackStore } from '@/stores/stackStore';
+import { useArtifactsStore } from '@/stores/artifactsStore';
 import { ChatTranscript } from './ChatTranscript';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
@@ -29,7 +31,13 @@ import { BranchProviderDialog } from './BranchToProvider';
     the chat side did better — collapsing a long paste into a chip, and inlining
     a dropped file's *content* rather than its path — are now simply how the
     composer behaves. */
-export function ChatView() {
+/** `headerSlot`: where the chat's header row (folder pill, model, effort, ⋯)
+    goes. Left out, it heads the chat as usual (the main window). Given, it is
+    rendered into that element instead: the overlay passes its title bar, and
+    `null` means the title bar is not mounted yet, so nothing is drawn. In the
+    title bar only the model and effort pickers are shown: the folder pill and
+    the ⋯ menu stay in the main window. */
+export function ChatView({ headerSlot }: { headerSlot?: HTMLElement | null } = {}) {
   // Individual slice selectors (not a whole-store `useChatStore()` call) so a
   // change to any one field — e.g. a streamed message delta — re-renders only
   // what consumes it, never the entire chat surface.
@@ -95,67 +103,77 @@ export function ChatView() {
     void refreshProvider();
   }, [bindEvents, refreshProvider]);
 
+  // The chat's `outputs` listing, for the cards under its answers (and the
+  // drawer, where there is one): loaded when the chat changes, kept current by
+  // the drawer's poll and by the end of each turn.
+  useEffect(() => {
+    if (cwd) void useArtifactsStore.getState().refresh(cwd);
+  }, [cwd, sessionId]);
+
   useEffect(() => {
     const un = onFileDrop((paths) => void addDroppedPaths(paths));
     return () => void un.then((fn) => fn());
   }, [addDroppedPaths]);
 
   const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : null;
+  const placeHeader = (header: ReactElement) =>
+    headerSlot === undefined ? header : headerSlot ? createPortal(header, headerSlot) : null;
   return (
     <div className="chat">
       {/* Android has no chat header at all: the folder pill points at a
           filesystem the user cannot browse, and the controls are hoisted into
           the window header by `ChatWorkspace` rather than costing a second
           header row on a phone-height screen. */}
-      {!isAndroid() && (
-        <div className="chat-header">
-          {isDefaultFolder ? (
-            // No project folder chosen — the "thought partner" state. No folder
-            // icon; clicking the pill opens the picker to attach a working dir.
-            // Still wrapped: a thought-partner session can have attached files,
-            // and those are grants the user should be able to see and withdraw.
-            <AllowedDirsPopover sessionId={sessionId}>
-              <button
-                className="pill pill-thought-partner"
-                title="Thinking space — click to set a working directory"
-                onClick={async () => {
-                  const dir = await pickFolder();
-                  if (dir) await setWorkingDir(dir);
-                }}
-              >
-                Thought Partner
-              </button>
-            </AllowedDirsPopover>
-          ) : (
-            // A working folder is set: show it, plus an inline reset control
-            // that returns the session to the default "thought partner" state
-            // without opening the picker.
-            <AllowedDirsPopover sessionId={sessionId}>
-              <span className="pill pill-folder">
+      {!isAndroid() &&
+        placeHeader(
+          <div className="chat-header">
+            {headerSlot !== undefined ? null : isDefaultFolder ? (
+              // No project folder chosen — the "thought partner" state. No folder
+              // icon; clicking the pill opens the picker to attach a working dir.
+              // Still wrapped: a thought-partner session can have attached files,
+              // and those are grants the user should be able to see and withdraw.
+              <AllowedDirsPopover sessionId={sessionId}>
                 <button
-                  className="pill-body"
-                  title={`Working directory: ${cwd} — click to change`}
+                  className="pill pill-thought-partner"
+                  title="Thinking space — click to set a working directory"
                   onClick={async () => {
                     const dir = await pickFolder();
                     if (dir) await setWorkingDir(dir);
                   }}
                 >
-                  <FolderIcon /> {folder ?? 'set folder'}
+                  Thought Partner
                 </button>
-                <button
-                  className="pill-reset"
-                  title="Return to thought partner (clear the working folder)"
-                  aria-label="Return to thought partner"
-                  onClick={() => void resetWorkingDir()}
-                >
-                  ×
-                </button>
-              </span>
-            </AllowedDirsPopover>
-          )}
-          <ChatHeaderControls />
-        </div>
-      )}
+              </AllowedDirsPopover>
+            ) : (
+              // A working folder is set: show it, plus an inline reset control
+              // that returns the session to the default "thought partner" state
+              // without opening the picker.
+              <AllowedDirsPopover sessionId={sessionId}>
+                <span className="pill pill-folder">
+                  <button
+                    className="pill-body"
+                    title={`Working directory: ${cwd} — click to change`}
+                    onClick={async () => {
+                      const dir = await pickFolder();
+                      if (dir) await setWorkingDir(dir);
+                    }}
+                  >
+                    <FolderIcon /> {folder ?? 'set folder'}
+                  </button>
+                  <button
+                    className="pill-reset"
+                    title="Return to thought partner (clear the working folder)"
+                    aria-label="Return to thought partner"
+                    onClick={() => void resetWorkingDir()}
+                  >
+                    ×
+                  </button>
+                </span>
+              </AllowedDirsPopover>
+            )}
+            <ChatHeaderControls menu={headerSlot === undefined} />
+          </div>
+        )}
 
       {providerOffline && (
         <Banner

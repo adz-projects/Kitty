@@ -1617,3 +1617,33 @@ Kitty's builds.
 
 **Bacon notebook server**: Settings → MCP servers can register Bacon's
 `bacon-mcp` stdio server as a private row (desktop only, off by default).
+
+## Outputs folder, artifacts drawer, output cards
+
+**Outputs folder.** Every new chat folder is created with an `outputs/`
+subfolder (best effort: a failure is logged and never fails the session). The
+system prompt of every chat, the built-in one or a provider card's own, ends
+with the same instruction (`OUTPUTS_INSTRUCTION`, added once by
+`with_outputs_instruction`): files the user asked for go in `outputs/`, working
+files stay outside it. It is set when the chat is created, so older chats do
+not have it. The engine is unchanged; the text is part of the persona, which is
+fixed per chat, so the cached prompt prefix is unaffected
+(`BigTinyV2/prompt_determinism.md`).
+
+**Drawer.** The artifacts pane lists exactly the top-level entries of
+`<cwd>/outputs` (files and folders), read from disk and polled only while it is
+open. On desktop it is always a drawer over the hub's right edge and never
+changes the conversation's layout; Android keeps its bottom sheet. It never
+opens by itself. New output turns the title-bar button red (`--danger`) until
+the drawer is opened; that flag is in memory only. The `show_artifacts` config
+field is no longer read or written by the frontend (the Rust field stays so old
+config files parse). Attachments and anything outside `outputs/` no longer
+appear there. `deriveArtifact` remains, but only to rebuild cards on resume.
+
+**Cards.** When a turn ends (completed or failed) the chat store lists
+`outputs/` again, compares with the listing taken when the turn began (new, or
+a changed modified time or size), and attaches a card per top-level entry to
+the turn's last answer. After a resume, cards are rebuilt from replayed tool
+calls whose path is inside `outputs/` (so a shell-only output has a card live
+but not after a resume), hidden if the entry is gone, and never flag the drawer.
+Descriptions are the file-type label and size, computed locally.

@@ -76,7 +76,7 @@ export function Appearance() {
             checked={draft.remember_overlay_position}
             onChange={(e) => update({ remember_overlay_position: e.target.checked })}
           />
-          <span>Remember overlay size &amp; position</span>
+          <span>Remember overlay size</span>
         </label>
       )}
 
