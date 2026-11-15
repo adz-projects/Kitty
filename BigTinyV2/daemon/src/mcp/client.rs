@@ -114,7 +114,15 @@ impl MCPServerClient {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        let mut cmd = Command::new(&command);
+        // The child's PATH: the overlay's when it sets one (Windows env names
+        // are case-insensitive), else the daemon's.
+        let child_path = env_overlay
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| std::ffi::OsString::from(v))
+            .or_else(|| std::env::var_os("PATH"));
+        let program = super::child_transport::resolve_program(&command, child_path.as_deref());
+        let mut cmd = Command::new(&program);
         cmd.args(&args);
         for (k, v) in &env_overlay {
             cmd.env(k, v);
