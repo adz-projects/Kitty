@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-web"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "anyhow",
  "base64",
