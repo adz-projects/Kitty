@@ -1811,6 +1811,25 @@ async fn an_app_sees_only_its_own_and_shared_mcp_tools() {
 }
 
 #[tokio::test]
+async fn has_tool_answers_for_the_calling_app_only() {
+    // `has_tool` gates the Adaptive Pathway hooks, so it must agree with what
+    // the app can actually dispatch: its own tools and the shared pool's, never
+    // another app's — even when both apps advertise the same name.
+    let state = test_state().await;
+    state.mcp.register_for_test("srv-a", Some(APP_A), &["lean_file_read"]);
+    state.mcp.register_for_test("srv-b", Some(APP_B), &["lean_file_read", "b_only"]);
+    state.mcp.register_for_test("srv-shared", None, &["shared_tool"]);
+
+    assert!(state.mcp.has_tool(APP_A, "lean_file_read"));
+    assert!(state.mcp.has_tool(APP_B, "lean_file_read"));
+    assert!(state.mcp.has_tool(APP_A, "shared_tool"));
+    assert!(state.mcp.has_tool(APP_B, "shared_tool"));
+    assert!(state.mcp.has_tool(APP_B, "b_only"));
+    assert!(!state.mcp.has_tool(APP_A, "b_only"));
+    assert!(!state.mcp.has_tool(APP_A, "no_such_tool"));
+}
+
+#[tokio::test]
 async fn two_apps_running_the_same_tools_each_keep_their_own() {
     // Kitty and Bacon each run a `kitty-tools` server advertising the same
     // names. The registry used to be keyed by name alone, so whichever

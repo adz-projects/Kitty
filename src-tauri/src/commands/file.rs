@@ -1,7 +1,7 @@
 //! File I/O and path-inspection commands: ChatML export writes, text/binary
 //! attachment reads, and dropped-path metadata.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tauri::AppHandle;
@@ -545,6 +545,108 @@ pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     .map_err(|e| format!("directory list task panicked: {e}"))?
 }
 
+/// One top-level entry of an `outputs` folder, with a signature that changes
+/// whenever anything inside it changes. Unlike [`FileEntry`] (the flat listing
+/// the drawer shows), `size` and `modified` aggregate over the entry's whole
+/// subtree: an edit to a file nested in a subfolder still moves its top-level
+/// entry's signature, so the turn before/after diff sees it. `modified` is
+/// Unix-epoch **milliseconds** — sub-second, so rewriting a file within the same
+/// second is still a change. Only used to diff a turn's outputs, never displayed.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputSnapshotEntry {
+    pub name: String,
+    pub path: String,
+    /// Total size of the entry: a file's own length, or the sum of every
+    /// descendant file's length for a folder.
+    pub size: u64,
+    /// Latest modification among the entry and all its descendants, epoch ms.
+    pub modified: u64,
+    pub is_dir: bool,
+}
+
+/// Epoch milliseconds of a metadata's mtime; `0` when the platform can't report it.
+fn modified_millis(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Aggregate `(total file size, latest mtime millis)` over `path` and everything
+/// under it. Symlinks are skipped (no cycles, no escaping the folder) and so are
+/// dotfiles and anything unreadable; a file contributes its own length and mtime.
+fn aggregate_outputs(path: &Path) -> (u64, u64) {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return (0, 0),
+    };
+    if meta.file_type().is_symlink() {
+        return (0, 0);
+    }
+    if meta.is_file() {
+        return (meta.len(), modified_millis(&meta));
+    }
+    if !meta.is_dir() {
+        return (0, 0);
+    }
+    let mut size = 0u64;
+    let mut modified = modified_millis(&meta);
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return (size, modified),
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let (s, m) = aggregate_outputs(&entry.path());
+        size = size.saturating_add(s);
+        modified = modified.max(m);
+    }
+    (size, modified)
+}
+
+/// Snapshot the top-level entries of an `outputs` folder for change detection:
+/// one [`OutputSnapshotEntry`] per entry, each carrying a whole-subtree signature
+/// (see the struct). A turn takes one before it starts and one when it ends; the
+/// diff of the two is what the turn made or changed. Reads the folder recursively
+/// (unlike `list_directory`), so it is only called at turn boundaries, not on the
+/// drawer's poll. A missing folder is an error the caller treats as "empty".
+#[tauri::command]
+pub async fn outputs_snapshot(path: String) -> Result<Vec<OutputSnapshotEntry>, String> {
+    tokio::task::spawn_blocking(move || {
+        let dir = PathBuf::from(&path);
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("could not list directory {path}: {e}"))?;
+        let out: Vec<OutputSnapshotEntry> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let p = entry.path();
+                let meta = std::fs::symlink_metadata(&p).ok()?;
+                if meta.file_type().is_symlink() || (!meta.is_file() && !meta.is_dir()) {
+                    return None;
+                }
+                let (size, modified) = aggregate_outputs(&p);
+                Some(OutputSnapshotEntry {
+                    path: p.to_string_lossy().to_string(),
+                    name,
+                    size,
+                    modified,
+                    is_dir: meta.is_dir(),
+                })
+            })
+            .collect();
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("outputs snapshot task panicked: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +760,68 @@ mod tests {
             std::fs::read_dir(&cwd_dir).unwrap().next().is_none(),
             "nothing may be copied into the chat folder"
         );
+    }
+
+    /// A folder's signature must move when a file *inside* it is edited — the
+    /// flat `list_directory` mtime/size would not, which is exactly the nested
+    /// edit the outputs diff used to miss.
+    #[test]
+    fn a_nested_edit_changes_the_top_level_folder_signature() {
+        let root = temp_subdir("snap_nested");
+        let folder = root.join("pdfs");
+        std::fs::create_dir_all(folder.join("2024")).unwrap();
+        let nested = folder.join("2024").join("a.pdf");
+        std::fs::write(&nested, b"first").unwrap();
+
+        let (size_before, mtime_before) = aggregate_outputs(&folder);
+        assert_eq!(size_before, 5);
+
+        // Rewrite the nested file with different bytes; the folder's own mtime
+        // need not move, but the aggregate must.
+        std::fs::write(&nested, b"second version").unwrap();
+        let (size_after, mtime_after) = aggregate_outputs(&folder);
+        assert_eq!(size_after, 14);
+        assert!(
+            size_after != size_before || mtime_after != mtime_before,
+            "a nested edit must change the folder's signature"
+        );
+    }
+
+    /// The signature aggregates every descendant, and a brand-new nested file
+    /// counts too.
+    #[test]
+    fn a_new_nested_file_changes_the_folder_signature() {
+        let root = temp_subdir("snap_new");
+        let folder = root.join("reports");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.md"), b"one").unwrap();
+        let before = aggregate_outputs(&folder);
+
+        std::fs::write(folder.join("b.md"), b"two").unwrap();
+        let after = aggregate_outputs(&folder);
+        assert_eq!(after.0, before.0 + 3);
+        assert!(after.1 >= before.1);
+    }
+
+    /// A top-level file's signature is just its own size and mtime, and the
+    /// mtime is millisecond-resolution (not whole seconds).
+    #[test]
+    fn a_file_signature_is_its_own_size_and_millisecond_mtime() {
+        let root = temp_subdir("snap_file");
+        let file = root.join("report.docx");
+        std::fs::write(&file, b"hello").unwrap();
+        let (size, mtime) = aggregate_outputs(&file);
+        assert_eq!(size, 5);
+        let meta = std::fs::metadata(&file).unwrap();
+        let expect = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(mtime, expect);
+        // Epoch millis for any recent date far exceed a whole-seconds value.
+        assert!(mtime > 1_000_000_000_000);
     }
 }
 

@@ -80,6 +80,11 @@ export interface Message {
       the end of a live turn (from a before/after listing) or rebuilt from the
       replayed tool calls on a resume. */
   outputs?: OutputRef[];
+  /** The working directory `outputs` belongs to — the session cwd when the turn
+      ran. Cards reconcile against this folder's listing, not whatever cwd the
+      window happens to be on now, so changing the working directory mid-chat
+      neither hides earlier cards nor re-points them at a different folder. */
+  outputsCwd?: string;
 }
 
 /** A top-level entry of a chat's `outputs` folder that a turn produced. */

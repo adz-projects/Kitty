@@ -1004,6 +1004,18 @@ export interface FileEntry {
   is_dir: boolean;
 }
 
+/** Mirrors `commands::file::OutputSnapshotEntry` — a top-level `outputs` entry
+    whose `size`/`modified` aggregate its whole subtree, for the turn before/after
+    diff. `modified` is epoch **milliseconds** (unlike `FileEntry`'s seconds), so
+    a nested or same-second edit still registers as a change. Never displayed. */
+export interface OutputSnapshotEntry {
+  name: string;
+  path: string;
+  size: number;
+  modified: number;
+  is_dir: boolean;
+}
+
 /** Parsed from a raw ACP `session/list` entry. */
 export interface SessionSummary {
   sessionId: string;

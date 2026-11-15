@@ -26,6 +26,7 @@ import type {
   OvernightView,
   FileAttachment,
   FileEntry,
+  OutputSnapshotEntry,
   FolderData,
   LogEntry,
   McpServer,
@@ -406,6 +407,10 @@ export const ipc = {
   downloadText: (name: string, content: string) =>
     invoke<boolean>('download_text', { name, content }),
   listDirectory: (path: string) => invoke<FileEntry[]>('list_directory', { path }),
+  /** Recursive per-top-level-entry signature of an `outputs` folder, for the
+      turn before/after diff (any nested or sub-second edit counts). See the Rust
+      `outputs_snapshot`. */
+  outputsSnapshot: (path: string) => invoke<OutputSnapshotEntry[]>('outputs_snapshot', { path }),
   // Providers
   listProviders: () => invoke<ProviderView[]>('list_providers'),
   upsertProvider: (profile: ProviderProfile, secret: string | null) =>

@@ -122,7 +122,9 @@ export const MessageItem = memo(function MessageItem({
           {n}
         </p>
       ))}
-      {message.outputs && message.outputs.length > 0 && <OutputCards outputs={message.outputs} />}
+      {message.outputs && message.outputs.length > 0 && (
+        <OutputCards outputs={message.outputs} outputsCwd={message.outputsCwd} />
+      )}
       {actions}
     </div>
   );

@@ -143,7 +143,7 @@ async fn a_server_that_logs_plain_text_to_stdout_still_works() {
         .expect("connect must survive non-JSON lines on stdout");
 
     assert!(
-        manager.has_tool("echo_tool"),
+        manager.has_tool("kitty", "echo_tool"),
         "tools must still be registered for a noisy server"
     );
 

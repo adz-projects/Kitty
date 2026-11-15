@@ -48,8 +48,13 @@ export function outputKey(name: string): string {
 }
 
 /** Entries in `after` that were not in `before`, or whose modification time or
-    size changed: what a turn made or changed. */
-export function changedEntries(before: FileEntry[], after: FileEntry[]): FileEntry[] {
+    size changed: what a turn made or changed. Generic over the entry shape so it
+    can diff the recursive `OutputSnapshotEntry` signatures (whose `modified`/
+    `size` aggregate each entry's whole subtree, so a nested edit counts) as well
+    as a flat listing. */
+export function changedEntries<
+  T extends { name: string; modified: number; size: number; is_dir: boolean },
+>(before: T[], after: T[]): T[] {
   const was = new Map(before.map((e) => [outputKey(e.name), e]));
   return after.filter((e) => {
     const old = was.get(outputKey(e.name));
@@ -62,7 +67,12 @@ export function sortEntries(entries: FileEntry[]): FileEntry[] {
   return entries.slice().sort((a, b) => b.modified - a.modified || a.name.localeCompare(b.name));
 }
 
-export function toOutputRef(e: FileEntry): OutputRef {
+export function toOutputRef(e: {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+}): OutputRef {
   return { name: e.name, path: e.path, isDir: e.is_dir, size: e.size };
 }
 

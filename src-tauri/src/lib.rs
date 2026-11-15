@@ -266,6 +266,7 @@ pub fn run() {
             commands::download_file,
             commands::download_text,
             commands::list_directory,
+            commands::outputs_snapshot,
             commands::list_providers,
             commands::upsert_provider,
             commands::delete_provider,

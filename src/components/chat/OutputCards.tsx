@@ -3,19 +3,28 @@ import { ipc } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
 import { describeOutput, outputKey } from '@/lib/outputs';
 import { listingFor, useArtifactsStore } from '@/stores/artifactsStore';
-import { useChatStore, type OutputRef } from '@/stores/chatStore';
+import { type OutputRef } from '@/stores/chatStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 
 /** What a turn left in the chat's `outputs` folder, one quiet card per
     top-level file or folder, between the answer and the message actions.
 
-    Once the folder's listing is loaded it is the authority: a card whose entry
-    has since been deleted is hidden, and the size and file-or-folder come from
-    it rather than from what the turn recorded. */
-export function OutputCards({ outputs }: { outputs: OutputRef[] }) {
-  const cwd = useChatStore((s) => s.cwd);
-  const entries = useArtifactsStore((s) => listingFor(s, cwd));
+    Reconciles against the listing of the folder the outputs were made in
+    (`outputsCwd`), not whatever cwd the window is on now: once that listing is
+    loaded it is the authority — a card whose entry has since been deleted is
+    hidden, and size/file-or-folder come from it. The recorded path is kept, so
+    changing the working directory mid-chat never re-points a card at a
+    different folder's same-named file. With no listing for that folder (e.g.
+    the cwd changed), the recorded refs are shown as-is. */
+export function OutputCards({
+  outputs,
+  outputsCwd,
+}: {
+  outputs: OutputRef[];
+  outputsCwd?: string;
+}) {
+  const entries = useArtifactsStore((s) => listingFor(s, outputsCwd ?? null));
   const byName = entries ? new Map(entries.map((e) => [outputKey(e.name), e])) : null;
 
   const cards: OutputRef[] = [];
@@ -25,7 +34,7 @@ export function OutputCards({ outputs }: { outputs: OutputRef[] }) {
       continue;
     }
     const live = byName.get(outputKey(o.name));
-    if (live) cards.push({ ...o, path: live.path, isDir: live.is_dir, size: live.size });
+    if (live) cards.push({ ...o, isDir: live.is_dir, size: live.size });
   }
   if (cards.length === 0) return null;
 

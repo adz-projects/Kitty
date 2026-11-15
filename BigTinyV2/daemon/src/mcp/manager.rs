@@ -637,11 +637,13 @@ impl MCPManager {
         self.dispatch(tool, args, timeout).await
     }
 
-    /// Whether a tool name is currently registered (cheap `DashMap` lookup;
-    /// used by the Adaptive Pathway turn hooks to gate on the AP MCP server
-    /// being connected without a full `list_tools` round-trip per tool call).
-    pub fn has_tool(&self, name: &str) -> bool {
-        self.tool_registry.iter().any(|e| e.key().1 == name)
+    /// Whether `app_id` can currently use a tool named `name`: its own server's
+    /// or the shared pool's, exactly what [`Self::execute_tool_for_app`] would
+    /// dispatch to. Two `DashMap` lookups, not a registry scan, and never another
+    /// app's tool — the Adaptive Pathway turn hooks gate on the AP MCP server
+    /// being connected without a full `list_tools` round-trip per tool call.
+    pub fn has_tool(&self, app_id: &str, name: &str) -> bool {
+        self.resolve_tool_for_app(app_id, name).is_some()
     }
 
     /// Never returns an `Err` — every failure mode (unknown tool, server not

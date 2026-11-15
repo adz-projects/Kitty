@@ -13,6 +13,7 @@ const { handlers, ipc } = vi.hoisted(() => {
     bindWindowSession: vi.fn(),
     isSessionBusy: vi.fn(),
     listDirectory: vi.fn(),
+    outputsSnapshot: vi.fn(),
   };
   return { handlers, ipc };
 });
@@ -62,6 +63,16 @@ const file = (name: string, over: Partial<FileEntry> = {}): FileEntry => ({
   ...over,
 });
 
+// A live turn reads `outputs` twice: a recursive snapshot when it begins (the
+// diff's "before") and, when it ends, a snapshot ("after") plus a flat listing
+// for the drawer. The snapshot entries have the same shape as `file()`; only
+// their values matter to the diff.
+const mockOutputs = (before: FileEntry[], after: FileEntry[]) => {
+  ipc.outputsSnapshot.mockResolvedValueOnce(before);
+  ipc.outputsSnapshot.mockResolvedValue(after);
+  ipc.listDirectory.mockResolvedValue(after);
+};
+
 const lastMsg = () => {
   const m = useChatStore.getState().messages;
   return m[m.length - 1];
@@ -108,9 +119,8 @@ const complete = (sid = 's1') => handlers.onComplete({ session_id: sid, result: 
 
 describe('output cards at the end of a live turn', () => {
   it('attaches a card for what the turn made, and flags the drawer', async () => {
-    ipc.listDirectory.mockResolvedValueOnce([file('old.txt')]);
+    mockOutputs([file('old.txt')], [file('old.txt'), file('report.docx')]);
     await useChatStore.getState().send('make me a report');
-    ipc.listDirectory.mockResolvedValue([file('old.txt'), file('report.docx')]);
     useChatStore.setState((s) => ({ messages: [...s.messages, assistant()] }));
 
     complete();
@@ -125,12 +135,11 @@ describe('output cards at the end of a live turn', () => {
   });
 
   it('counts a changed file, and a new folder as one entry', async () => {
-    ipc.listDirectory.mockResolvedValueOnce([file('a.csv')]);
+    mockOutputs(
+      [file('a.csv')],
+      [file('a.csv', { modified: 200 }), file('pdfs', { is_dir: true })]
+    );
     await useChatStore.getState().send('go');
-    ipc.listDirectory.mockResolvedValue([
-      file('a.csv', { modified: 200 }),
-      file('pdfs', { is_dir: true }),
-    ]);
     useChatStore.setState((s) => ({ messages: [...s.messages, assistant()] }));
 
     complete();
@@ -141,7 +150,7 @@ describe('output cards at the end of a live turn', () => {
   });
 
   it('does nothing when the turn left outputs as it found them', async () => {
-    ipc.listDirectory.mockResolvedValue([file('a.csv')]);
+    mockOutputs([file('a.csv')], [file('a.csv')]);
     await useChatStore.getState().send('just chat');
     useChatStore.setState((s) => ({ messages: [...s.messages, assistant()] }));
 
@@ -153,9 +162,8 @@ describe('output cards at the end of a live turn', () => {
   });
 
   it('does not flag a drawer that is already open', async () => {
-    ipc.listDirectory.mockResolvedValueOnce([]);
+    mockOutputs([], [file('x.txt')]);
     await useChatStore.getState().send('go');
-    ipc.listDirectory.mockResolvedValue([file('x.txt')]);
     useArtifactsStore.setState({ open: true });
     useChatStore.setState((s) => ({ messages: [...s.messages, assistant()] }));
 
@@ -167,9 +175,8 @@ describe('output cards at the end of a live turn', () => {
   });
 
   it('attaches nothing if the window moved to another chat meanwhile', async () => {
-    ipc.listDirectory.mockResolvedValueOnce([]);
+    mockOutputs([], [file('x.txt')]);
     await useChatStore.getState().send('go');
-    ipc.listDirectory.mockResolvedValue([file('x.txt')]);
     useChatStore.setState((s) => ({ messages: [...s.messages, assistant()] }));
 
     complete();
@@ -178,18 +185,49 @@ describe('output cards at the end of a live turn', () => {
 
     expect(useChatStore.getState().messages).toEqual([]);
     expect(useArtifactsStore.getState().unseen).toBe(false);
+    // The late completion must not clobber the new chat's listing either.
+    expect(useArtifactsStore.getState().listingCwd).toBeNull();
   });
 
   it('also cards a turn that failed after writing something', async () => {
-    ipc.listDirectory.mockResolvedValueOnce([]);
+    mockOutputs([], [file('partial.md')]);
     await useChatStore.getState().send('go');
-    ipc.listDirectory.mockResolvedValue([file('partial.md')]);
     useChatStore.setState((s) => ({ messages: [...s.messages, assistant('Working…')] }));
 
     handlers.onChatError({ session_id: 's1', message: 'boom' });
     await flush();
 
     expect(lastMsg()?.outputs?.[0].name).toBe('partial.md');
+  });
+
+  it('flags the drawer even when the turn ended before any answer', async () => {
+    mockOutputs([], [file('x.txt')]);
+    await useChatStore.getState().send('go');
+    // No assistant message was ever produced — the turn errored out early. The
+    // new output must still flag the drawer, even though no card can attach.
+    handlers.onChatError({ session_id: 's1', message: 'boom' });
+    await flush();
+
+    expect(useArtifactsStore.getState().unseen).toBe(true);
+    expect(lastMsg()?.role).toBe('user');
+    expect(lastMsg()?.outputs).toBeUndefined();
+  });
+
+  it('cards a folder whose nested file was edited (aggregate signature changed)', async () => {
+    // The recursive snapshot reports the folder's whole-subtree size/mtime, so a
+    // nested edit moves the top-level entry's signature even though the folder
+    // itself was not created or renamed.
+    mockOutputs(
+      [file('pdfs', { is_dir: true, size: 100, modified: 100 })],
+      [file('pdfs', { is_dir: true, size: 150, modified: 200 })]
+    );
+    await useChatStore.getState().send('update the report');
+    useChatStore.setState((s) => ({ messages: [...s.messages, assistant()] }));
+
+    complete();
+    await flush();
+
+    expect(lastMsg()?.outputs?.map((o) => o.name)).toEqual(['pdfs']);
   });
 });
 
@@ -211,6 +249,7 @@ describe('output cards rebuilt on resume', () => {
 
     const last = lastMsg();
     expect(last?.outputs?.map((o) => o.name)).toEqual(['report.docx']);
+    expect(last?.outputsCwd).toBe('/c');
     expect(useArtifactsStore.getState().unseen).toBe(false);
   });
 

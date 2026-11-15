@@ -30,10 +30,10 @@ import {
 import { isAndroid } from '@/lib/platform';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import { changedEntries, outputEntryOf, outputKey, toOutputRef } from '@/lib/outputs';
-import { listOutputs, useArtifactsStore } from './artifactsStore';
+import { listOutputs, snapshotOutputs, useArtifactsStore } from './artifactsStore';
 import type {
-  FileEntry,
   NetworkTier,
+  OutputSnapshotEntry,
   PathInfo,
   ProviderView,
   SessionAllowedDirs,
@@ -351,8 +351,8 @@ let lastSentAt: number | null = null;
 // streaming; that would otherwise attribute the response to the wrong model.
 let lastSentProvider: string | null = null;
 let lastSentModel: string | null = null;
-// The `outputs` listing taken when the running turn began (`beginTurnOutputs`).
-let turnOutputs: { sessionId: string; cwd: string; before: FileEntry[] } | null = null;
+// The `outputs` signature taken when the running turn began (`beginTurnOutputs`).
+let turnOutputs: { sessionId: string; cwd: string; before: OutputSnapshotEntry[] } | null = null;
 // Grace-period timer between "Stop" and offering "Force Stop" (Round-5).
 // Module-level like the fields above — one in-flight turn per active session.
 const STOP_GRACE_MS = 12_000;
@@ -799,39 +799,45 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
   };
 
   /** Remember what `outputs` holds as a turn starts, so that when it ends the
-      new and changed entries can be told apart (`finishTurnOutputs`). */
+      new and changed entries can be told apart (`finishTurnOutputs`). The
+      snapshot is recursive, so an edit to a file anywhere under `outputs` —
+      even nested in a subfolder, even within the same second — counts. */
   const beginTurnOutputs = async (sessionId: string): Promise<void> => {
     turnOutputs = null;
     const cwd = get().cwd;
     if (!cwd) return;
-    turnOutputs = { sessionId, cwd, before: await listOutputs(cwd) };
+    turnOutputs = { sessionId, cwd, before: await snapshotOutputs(cwd) };
   };
 
-  /** A turn ended (completed or failed): list `outputs` again, hand the
-      listing to the drawer, and put a card for every new or modified
+  /** A turn ended (completed or failed): snapshot `outputs` again, hand the
+      drawer a fresh top-level listing, and put a card for every new or changed
       top-level entry on the turn's last answer. Flags the drawer's button when
-      there is something. Does nothing if the window has moved to another chat
-      meanwhile. */
+      anything changed. Does nothing if the window has moved to another chat
+      meanwhile — the guard runs before any shared state is touched, so a late
+      completion can't clobber the chat the user moved on to. */
   const finishTurnOutputs = async (sessionId: string): Promise<void> => {
     const turn = turnOutputs;
     if (!turn || turn.sessionId !== sessionId) return;
     turnOutputs = null;
-    const after = await listOutputs(turn.cwd);
-    useArtifactsStore.getState().setListing(turn.cwd, after);
-    const changed = changedEntries(turn.before, after);
-    if (changed.length === 0) return;
+    const [afterListing, afterSnapshot] = await Promise.all([
+      listOutputs(turn.cwd),
+      snapshotOutputs(turn.cwd),
+    ]);
     if (get().sessionId !== sessionId || get().cwd !== turn.cwd) return;
+    useArtifactsStore.getState().setListing(turn.cwd, afterListing);
+    const changed = changedEntries(turn.before, afterSnapshot);
+    if (changed.length === 0) return;
+    // Something changed: flag the drawer whether or not a card can be attached
+    // to the last message (a turn that errored before any answer still counts).
+    useArtifactsStore.getState().markNew();
     const refs: OutputRef[] = changed.map(toOutputRef);
-    let attached = false;
     set((s) => {
       const i = s.messages.length - 1;
       if (i < 0 || s.messages[i].role !== 'assistant') return s;
       const msgs = s.messages.slice();
-      msgs[i] = { ...msgs[i], outputs: refs };
-      attached = true;
+      msgs[i] = { ...msgs[i], outputs: refs, outputsCwd: turn.cwd };
       return { messages: msgs };
     });
-    if (attached) useArtifactsStore.getState().markNew();
   };
 
   const doSend = async (
@@ -1061,8 +1067,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         // running, say so (its `chat://compaction` reopens the chat); if it
         // already folded everything, there is nothing left to do here and the
         // chat must reopen rather than stay blocked.
-        const reopen =
-          r.compacted || r.skip === 'nothing_to_fold' || r.skip === 'below_threshold';
+        const reopen = r.compacted || r.skip === 'nothing_to_fold' || r.skip === 'below_threshold';
         if (r.skip === 'lock_held') {
           set({
             compactionNotice:
@@ -1666,8 +1671,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           // streamed deltas append to it instead of spawning a duplicate bubble.
           // `load_session` answers this itself; ask separately only when the
           // load failed before it could.
-          const stillBusy =
-            replayBusy ?? (await ipc.isSessionBusy(sessionId).catch(() => false));
+          const stillBusy = replayBusy ?? (await ipc.isSessionBusy(sessionId).catch(() => false));
           // Re-check the epoch *after* the await above: a New Chat / session
           // switch could have landed during the `isSessionBusy` round-trip
           // (its UI cost is hidden while replay's placeholder is up), in which
@@ -2248,6 +2252,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
               ...(last.outputs ?? []),
               { name: entry.name, path: entry.path, ...(entry.nested ? { isDir: true } : {}) },
             ];
+            last.outputsCwd = g0.cwd ?? undefined;
           }
           return { messages: msgs };
         });
@@ -2534,10 +2539,8 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
             : 'Older context was compacted into a background summary.',
           // The engine's own forced pass (after an overflow) repaired this
           // chat: reopen it, exactly as a manual Compact would.
-          sessionConcluded:
-            s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
-          concludedReason:
-            s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
+          sessionConcluded: s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
+          concludedReason: s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
         }));
       });
     },

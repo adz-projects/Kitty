@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { ipc } from '@/lib/ipc';
 import { outputsDir, sortEntries } from '@/lib/outputs';
-import type { FileEntry } from '@/lib/types';
+import type { FileEntry, OutputSnapshotEntry } from '@/lib/types';
 
 /** The top-level entries of `<cwd>/outputs`. A directory that does not exist
     yet (nothing made so far) is simply empty; a failed read is too, which at
@@ -9,6 +9,19 @@ import type { FileEntry } from '@/lib/types';
 export async function listOutputs(cwd: string): Promise<FileEntry[]> {
   try {
     return await ipc.listDirectory(outputsDir(cwd));
+  } catch {
+    return [];
+  }
+}
+
+/** The recursive before/after signature of `<cwd>/outputs` for change detection
+    (one entry per top-level file/folder, each aggregating its whole subtree).
+    Unlike `listOutputs` this sees nested and sub-second edits, so any edit to a
+    file in `outputs` counts as a new artifact. Only taken at turn boundaries;
+    a missing folder or failed read is `[]`, same as `listOutputs`. */
+export async function snapshotOutputs(cwd: string): Promise<OutputSnapshotEntry[]> {
+  try {
+    return await ipc.outputsSnapshot(outputsDir(cwd));
   } catch {
     return [];
   }
