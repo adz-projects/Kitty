@@ -25,8 +25,10 @@
 //! thread and `embed` talks to it over a channel.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::{mpsc, Mutex};
+use std::sync::Arc;
 use std::thread;
+
+use crate::embed_priority::PriorityQueue;
 
 use async_trait::async_trait;
 
@@ -242,7 +244,14 @@ struct Cmd(String, tokio::sync::oneshot::Sender<Option<Vec<f32>>>);
 
 /// Handle to the LiteRT-LM embedding actor thread.
 pub struct LiteRtLmEmbedder {
-    tx: Mutex<mpsc::SyncSender<Cmd>>,
+    queue: Arc<PriorityQueue<Cmd>>,
+}
+
+impl Drop for LiteRtLmEmbedder {
+    /// The actor drains what is queued and exits.
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 impl LiteRtLmEmbedder {
@@ -252,13 +261,14 @@ impl LiteRtLmEmbedder {
     /// on the thread answers every request with `None`, which callers treat
     /// as "embedder unavailable" (lexical fallback), never as an error.
     pub fn spawn(lib_path: impl Into<String>, model_path: impl Into<String>) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Cmd>(super::EMBED_QUEUE_DEPTH);
+        let queue = super::new_queue::<Cmd>();
+        let actor_queue = queue.clone();
         let (lib_path, model_path) = (lib_path.into(), model_path.into());
         thread::Builder::new()
             .name("litert-lm-embed".into())
-            .spawn(move || actor(&lib_path, &model_path, rx))
+            .spawn(move || actor(&lib_path, &model_path, &actor_queue))
             .expect("spawn litert-lm-embed thread");
-        Self { tx: Mutex::new(tx) }
+        Self { queue }
     }
 }
 
@@ -266,14 +276,14 @@ impl LiteRtLmEmbedder {
 impl SemanticEmbedder for LiteRtLmEmbedder {
     async fn embed(&self, text: &str) -> Option<Vec<f32>> {
         let (rtx, rrx) = tokio::sync::oneshot::channel();
-        // Full queue or a gone actor: "unavailable", which every caller
-        // already handles (lexical fallback). See `super::EMBED_QUEUE_DEPTH`.
-        super::enqueue(&self.tx, Cmd(text.to_string(), rtx))?;
+        // Refused (full, or a gone actor): "unavailable", which every caller
+        // already handles (lexical fallback). See `super::new_queue`.
+        super::enqueue(&self.queue, Cmd(text.to_string(), rtx))?;
         rrx.await.ok().flatten()
     }
 }
 
-fn actor(lib_path: &str, model_path: &str, rx: mpsc::Receiver<Cmd>) {
+fn actor(lib_path: &str, model_path: &str, queue: &PriorityQueue<Cmd>) {
     let mut engine = match Engine::open(lib_path, model_path) {
         Ok(e) => {
             tracing::info!(model = %model_path, "litert-lm embedder ready");
@@ -281,13 +291,13 @@ fn actor(lib_path: &str, model_path: &str, rx: mpsc::Receiver<Cmd>) {
         }
         Err(e) => {
             tracing::warn!("litert-lm embedder unavailable: {e}");
-            for Cmd(_, reply) in rx.iter() {
+            while let Some(Cmd(_, reply)) = queue.pop() {
                 let _ = reply.send(None);
             }
             return;
         }
     };
-    for Cmd(text, reply) in rx.iter() {
+    while let Some(Cmd(text, reply)) = queue.pop() {
         if reply.is_closed() {
             continue; // the caller gave up (a recall timeout); skip the work
         }

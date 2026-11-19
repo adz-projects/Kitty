@@ -209,6 +209,12 @@ pub async fn delete_me(
         state.mcp.disconnect_server(&id).await;
     }
     let providers = owned("providers").await;
+    // The rows go with the purge; the in-memory state built for them (replay
+    // buffers, cached workspace listings) would otherwise outlive them.
+    for id in owned("sessions").await {
+        state.agent.forget_session(&id);
+        state.replay.forget(&id);
+    }
     state.plugins.close(&app_id).await;
     state.memorabilia.close(&app_id).await;
 

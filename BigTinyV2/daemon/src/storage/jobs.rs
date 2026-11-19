@@ -97,12 +97,31 @@ pub async fn list_by_status(
         .await?)
 }
 
-pub async fn mark_running(pool: &SqlitePool, id: &str) -> Result<(), StorageError> {
-    sqlx::query("UPDATE jobs SET status = 'running', started_at = datetime('now') WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
+/// Claim a pending job for running. Returns rows affected: `0` means it is
+/// no longer pending (cancelled while it waited its turn) and must not run.
+///
+/// This is also what makes `pending` mean "has run nothing": a job runs only
+/// after this succeeds, so a pending job is safe to start again after a
+/// restart (see [`pending_on_boot`]).
+pub async fn mark_running(pool: &SqlitePool, id: &str) -> Result<u64, StorageError> {
+    let out = sqlx::query(
+        "UPDATE jobs SET status = 'running', started_at = datetime('now') \
+         WHERE id = ? AND status = 'pending'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(out.rows_affected())
+}
+
+/// Jobs a previous process accepted but never started, oldest first.
+///
+/// Safe to dispatch again, unlike `running` ones: [`mark_running`] is the
+/// gate every run passes, so these executed nothing. Jobs now wait `pending`
+/// under the per-app job limit, so a restart can find many of them.
+pub async fn pending_on_boot(pool: &SqlitePool) -> Result<Vec<JobRow>, StorageError> {
+    let sql = format!("SELECT {COLS} FROM jobs WHERE status = 'pending' ORDER BY created_at, rowid");
+    Ok(sqlx::query_as::<_, JobRow>(&sql).fetch_all(pool).await?)
 }
 
 /// Move a job that has not already finished to a terminal state.
@@ -162,12 +181,13 @@ pub async fn cancel_for_app(
 /// Called once at startup. **Deliberately not a re-queue**: a turn may have
 /// executed tools with side effects -- files written, requests sent -- and
 /// silently re-running it would repeat them. The owner sees `interrupted` and
-/// decides whether resubmitting is safe.
+/// decides whether resubmitting is safe. `pending` jobs ran nothing and are
+/// resumed instead ([`pending_on_boot`]).
 pub async fn mark_interrupted_on_boot(pool: &SqlitePool) -> Result<u64, StorageError> {
     let result = sqlx::query(
         "UPDATE jobs SET status = 'interrupted', finished_at = datetime('now'), \
          error = 'the daemon stopped while this job was running' \
-         WHERE status IN ('pending','running')",
+         WHERE status = 'running'",
     )
     .execute(pool)
     .await?;
@@ -249,10 +269,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_crash_leaves_jobs_interrupted_rather_than_requeued() {
+    async fn a_crash_interrupts_running_jobs_and_keeps_unstarted_ones_pending() {
         // The property that stops a job with side effects from silently
         // re-running: `interrupted` is terminal, and resubmitting is the
-        // owner's decision.
+        // owner's decision. A pending job ran nothing, so it stays pending
+        // and is resumed.
         let pool = pool().await;
         create(&pool, "j1", "app-a", "s1", "x", None).await.unwrap();
         create(&pool, "j2", "app-a", "s1", "y", None).await.unwrap();
@@ -260,15 +281,26 @@ mod tests {
         create(&pool, "j3", "app-a", "s1", "z", None).await.unwrap();
         finish(&pool, "j3", "succeeded", Some("r"), None).await.unwrap();
 
-        assert_eq!(mark_interrupted_on_boot(&pool).await.unwrap(), 2);
+        assert_eq!(mark_interrupted_on_boot(&pool).await.unwrap(), 1);
+        let pending: Vec<String> = pending_on_boot(&pool).await.unwrap().into_iter().map(|j| j.id).collect();
+        assert_eq!(pending, vec!["j1"]);
 
-        for (id, expected) in [("j1", "interrupted"), ("j2", "interrupted"), ("j3", "succeeded")] {
+        for (id, expected) in [("j1", "pending"), ("j2", "interrupted"), ("j3", "succeeded")] {
             assert_eq!(
                 get_for_app(&pool, id, "app-a").await.unwrap().unwrap().status,
                 expected,
                 "job {id}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_while_waiting_is_never_claimed() {
+        let pool = pool().await;
+        create(&pool, "j1", "app-a", "s1", "x", None).await.unwrap();
+        assert_eq!(cancel_for_app(&pool, "j1", "app-a").await.unwrap(), 1);
+        assert_eq!(mark_running(&pool, "j1").await.unwrap(), 0, "must not start");
+        assert_eq!(mark_running(&pool, "nope").await.unwrap(), 0);
     }
 
     #[tokio::test]

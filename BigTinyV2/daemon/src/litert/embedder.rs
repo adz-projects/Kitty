@@ -15,8 +15,10 @@
 //! prompt consistently for every belief snippet so the whole vector space is
 //! comparable (adaptive-pathway only ever compares vectors within this space).
 
-use std::sync::{mpsc, Mutex};
+use std::sync::Arc;
 use std::thread;
+
+use crate::embed_priority::PriorityQueue;
 
 use async_trait::async_trait;
 use tokenizers::Tokenizer;
@@ -39,11 +41,17 @@ enum Cmd {
 
 /// Handle to the embedding actor thread. Cheap to clone-free share via `Arc`.
 ///
-/// The sender is behind a `Mutex` only to be `Sync` (`mpsc::Sender` is `Send`
-/// but not `Sync`, and `SemanticEmbedder: Send + Sync`); the lock is never held
-/// across the actual embedding work.
+/// Requests reach the actor through a bounded two-lane queue (see
+/// `super::new_queue`); its lock is never held across the embedding work.
 pub struct LiteRtEmbedder {
-    tx: Mutex<mpsc::SyncSender<Cmd>>,
+    queue: Arc<PriorityQueue<Cmd>>,
+}
+
+impl Drop for LiteRtEmbedder {
+    /// The actor drains what is queued and exits.
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 impl LiteRtEmbedder {
@@ -60,15 +68,16 @@ impl LiteRtEmbedder {
         model_path: impl Into<String>,
         tokenizer_path: impl Into<String>,
     ) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Cmd>(super::EMBED_QUEUE_DEPTH);
+        let queue = super::new_queue::<Cmd>();
+        let actor_queue = queue.clone();
         let lib_path = lib_path.into();
         let model_path = model_path.into();
         let tokenizer_path = tokenizer_path.into();
         thread::Builder::new()
             .name("litert-embed".into())
-            .spawn(move || actor(lib_path, model_path, tokenizer_path, rx))
+            .spawn(move || actor(lib_path, model_path, tokenizer_path, &actor_queue))
             .expect("spawn litert-embed thread");
-        Self { tx: Mutex::new(tx) }
+        Self { queue }
     }
 }
 
@@ -78,7 +87,7 @@ impl SemanticEmbedder for LiteRtEmbedder {
         let (rtx, rrx) = tokio::sync::oneshot::channel();
         // Full queue or a gone actor: "unavailable" (lexical fallback). The
         // reply is awaited directly -- no blocking-pool thread per caller.
-        super::enqueue(&self.tx, Cmd::Embed(text.to_string(), rtx))?;
+        super::enqueue(&self.queue, Cmd::Embed(text.to_string(), rtx))?;
         rrx.await.ok().flatten()
     }
 }
@@ -93,12 +102,12 @@ impl SemanticEmbedder for LiteRtEmbedder {
 /// it), so the model must not be dropped early. Locals drop in reverse order
 /// (`it`, then `model`, then `lib`), which is exactly the required teardown
 /// order.
-fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc::Receiver<Cmd>) {
+fn actor(lib_path: String, model_path: String, tokenizer_path: String, queue: &PriorityQueue<Cmd>) {
     use edgefirst_tflite::{Library, Model};
 
     /// Reply `None` to every request, forever. Used when the engine can't load.
-    fn drain_unavailable(rx: mpsc::Receiver<Cmd>) {
-        for Cmd::Embed(_, reply) in rx.iter() {
+    fn drain_unavailable(queue: &PriorityQueue<Cmd>) {
+        while let Some(Cmd::Embed(_, reply)) = queue.pop() {
             let _ = reply.send(None);
         }
     }
@@ -107,21 +116,21 @@ fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc:
         Ok(t) => t,
         Err(e) => {
             tracing::warn!("litert embedder tokenizer {tokenizer_path}: {e}");
-            return drain_unavailable(rx);
+            return drain_unavailable(queue);
         }
     };
     let lib = match Library::from_path(&lib_path) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!("litert embedder runtime {lib_path}: {e}");
-            return drain_unavailable(rx);
+            return drain_unavailable(queue);
         }
     };
     let model = match Model::from_file(&lib, &model_path) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("litert embedder model {model_path}: {e}");
-            return drain_unavailable(rx);
+            return drain_unavailable(queue);
         }
     };
     // GPU-first with a CPU (XNNPACK) fallback. `edgefirst-tflite` has no
@@ -153,18 +162,18 @@ fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc:
                 Ok(it) => it,
                 Err(e2) => {
                     tracing::warn!("litert embedder interpreter: {e2}");
-                    return drain_unavailable(rx);
+                    return drain_unavailable(queue);
                 }
             }
         }
         Err(e) => {
             tracing::warn!("litert embedder interpreter: {e}");
-            return drain_unavailable(rx);
+            return drain_unavailable(queue);
         }
     };
 
     tracing::info!(model = %model_path, gpu = tried_gpu, "litert embedder ready");
-    for Cmd::Embed(text, reply) in rx.iter() {
+    while let Some(Cmd::Embed(text, reply)) = queue.pop() {
         if reply.is_closed() {
             continue; // the caller gave up; skip the work
         }

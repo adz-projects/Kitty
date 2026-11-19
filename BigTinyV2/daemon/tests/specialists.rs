@@ -128,7 +128,7 @@ async fn mock_tool_then_stop(server: &mut mockito::ServerGuard, tool: &str) {
 async fn run_and_collect(agent: &Arc<Agent>, session_id: &str) -> Vec<SSEEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
     agent
-        .run_turn(session_id.to_string(), "go".into(), None, None, tx)
+        .run_turn(session_id.to_string(), "go".into(), None, None, tx, None)
         .expect("turn should start");
     let mut events = Vec::new();
     while let Some(ev) = rx.recv().await {
@@ -796,7 +796,7 @@ async fn cancelling_a_parent_cancels_its_delegates() {
 
     let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
     agent
-        .run_turn("kid".into(), "go".into(), None, None, tx)
+        .run_turn("kid".into(), "go".into(), None, None, tx, None)
         .unwrap();
 
     // Wait for the child's turn to actually be registered before cancelling —

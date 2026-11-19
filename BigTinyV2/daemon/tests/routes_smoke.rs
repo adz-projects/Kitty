@@ -109,6 +109,7 @@ async fn test_state_inner(
         memorabilia: memorabilia.clone(),
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
         replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
+        admission: bigtiny2::agent::admission::Admission::from_config(&bigtiny2::config::AgentConfig::default()),
         instance_id: "test-instance".to_string(),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     })
@@ -528,6 +529,97 @@ async fn send_on_a_nonexistent_session_returns_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_job_left_pending_by_a_previous_run_is_resumed() {
+    use bigtiny2::storage::{jobs, sessions};
+    let state = test_state().await;
+    sessions::create_session_for_app(&state.db, "s-job", "t", TEST_APP)
+        .await
+        .unwrap();
+    jobs::create(&state.db, "j-left", TEST_APP, "s-job", "hello", None)
+        .await
+        .unwrap();
+
+    bigtiny2::routes::jobs::resume_pending(&state).await;
+
+    // No provider is registered here, so the run itself fails; what matters is
+    // that the job was picked up rather than left pending forever.
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let job = jobs::get_for_app(&state.db, "j-left", TEST_APP)
+                .await
+                .unwrap()
+                .unwrap();
+            if job.status != "pending" && job.status != "running" {
+                break job.status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the resumed job must run to a terminal state");
+    assert_eq!(status, "failed");
+}
+
+#[tokio::test]
+async fn admin_stats_reports_the_growth_counters() {
+    let state = test_state().await;
+    let _held = state.admission.turns.try_admit(TEST_APP).unwrap();
+    let resp = create_router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/admin/stats")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["turns_by_app"][TEST_APP], 1);
+    for key in ["providers", "replay", "embed_queue", "background_work", "workspace_snapshots"] {
+        assert!(body.get(key).is_some(), "missing {key}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn send_past_the_apps_turn_limit_is_refused_with_retry_after() {
+    let state = test_state().await;
+    bigtiny2::storage::sessions::create_session_for_app(&state.db, "s-limit", "t", TEST_APP)
+        .await
+        .unwrap();
+    // Occupy every place this app has, as that many running turns would.
+    let limit = state.admission.turns.limit();
+    let held: Vec<_> = (0..limit)
+        .map(|_| state.admission.turns.try_admit(TEST_APP).unwrap())
+        .collect();
+
+    let send = |app: axum::Router| async move {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/chat/s-limit/send")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json!({"message": "hi"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+
+    let resp = send(create_router(state.clone())).await;
+    assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(resp.headers().contains_key("retry-after"));
+    assert_eq!(body_json(resp).await["reason"], "app_turn_limit");
+
+    // Another app sharing the engine is unaffected.
+    assert!(state.admission.turns.try_admit("another-app").is_ok());
+
+    drop(held);
+    let resp = send(create_router(state.clone())).await;
+    assert_ne!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

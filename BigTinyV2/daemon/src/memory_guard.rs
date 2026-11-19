@@ -162,7 +162,41 @@ pub fn install_ceiling() {
 #[cfg(not(windows))]
 pub fn install_ceiling() {}
 
-/// Log each time private memory reaches a new doubling step (2, 4, 8 GiB …).
+/// This process's private (committed) memory, where the OS reports it.
+pub fn private_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        sys::private_bytes()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+type StatsFuture = std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>;
+pub type StatsSource = std::sync::Arc<dyn Fn() -> StatsFuture + Send + Sync>;
+
+/// Replaceable rather than set-once: an embedding host can run the engine
+/// more than once in one process.
+static STATS_SOURCE: std::sync::RwLock<Option<StatsSource>> = std::sync::RwLock::new(None);
+
+/// Register what the watchdog logs alongside a memory warning: the daemon's
+/// growth counters, so the log says *what* grew, not only that something did.
+/// Set once the server state exists; until then warnings carry memory alone.
+pub fn set_stats_source(source: StatsSource) {
+    if let Ok(mut slot) = STATS_SOURCE.write() {
+        *slot = Some(source);
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn stats_source() -> Option<StatsSource> {
+    STATS_SOURCE.read().ok().and_then(|s| s.clone())
+}
+
+/// Log each time private memory reaches a new doubling step (2, 4, 8 GiB …),
+/// with a snapshot of the growth counters.
 #[cfg(windows)]
 pub fn spawn_watchdog() {
     tokio::spawn(async move {
@@ -175,8 +209,12 @@ pub fn spawn_watchdog() {
             };
             if let Some(level) = next_report_level(private, reported) {
                 reported = level;
+                let stats = match stats_source() {
+                    Some(source) => source().await.to_string(),
+                    None => "{}".to_string(),
+                };
                 tracing::warn!(
-                    "daemon private memory is {:.1} GiB (passed {:.0} GiB)",
+                    "daemon private memory is {:.1} GiB (passed {:.0} GiB); stats: {stats}",
                     gib(private),
                     gib(level)
                 );

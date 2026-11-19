@@ -97,6 +97,7 @@ async fn test_state() -> Arc<AppState> {
         memorabilia: memorabilia.clone(),
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
         replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
+        admission: bigtiny2::agent::admission::Admission::from_config(&bigtiny2::config::AgentConfig::default()),
         instance_id: "test-instance".to_string(),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     })

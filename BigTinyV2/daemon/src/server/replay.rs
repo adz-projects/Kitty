@@ -32,6 +32,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
@@ -44,6 +45,16 @@ use super::events::{SSEEvent, SSEEventType};
 /// the transcript instead, which is the durable record either way.
 const BUFFER_CAPACITY: usize = 512;
 
+/// Bytes retained per turn. The event count alone did not bound memory: a
+/// structural event carries a whole tool result, so 512 of them could be tens
+/// of MB for a single session.
+const BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long a finished turn's tail stays replayable. Long enough for a client
+/// that dropped at the end of a turn to come back for it; after that the
+/// transcript is the record, and the buffer is memory nobody will read.
+const FINISHED_TTL: Duration = Duration::from_secs(10 * 60);
+
 /// One event, with the id a client resumes from.
 #[derive(Debug, Clone)]
 pub struct Recorded {
@@ -51,8 +62,17 @@ pub struct Recorded {
     pub event: SSEEvent,
 }
 
+/// Roughly what an event costs to hold: its serialized size, plus the
+/// per-entry overhead.
+fn event_bytes(event: &SSEEvent) -> usize {
+    serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0) + 64
+}
+
 struct TurnBuffer {
-    events: VecDeque<Recorded>,
+    events: VecDeque<(Recorded, usize)>,
+    bytes: usize,
+    /// When the terminal frame was recorded, for [`FINISHED_TTL`].
+    finished_at: Option<Instant>,
     next_id: u64,
     /// Text deltas dropped rather than buffered, so a resuming client can be
     /// told its transcript has a hole.
@@ -67,6 +87,8 @@ impl TurnBuffer {
     fn new() -> Self {
         Self {
             events: VecDeque::with_capacity(64),
+            bytes: 0,
+            finished_at: None,
             next_id: 1,
             dropped_deltas: 0,
             finished: false,
@@ -97,9 +119,25 @@ impl ReplayBuffers {
         Self::default()
     }
 
-    /// Start (or restart) a session's buffer. Called when a turn begins.
+    /// Start (or restart) a session's buffer. Called when a turn begins, and
+    /// also where expired buffers are swept: buffers only accumulate as turns
+    /// start, so sweeping here keeps the total bounded without a timer.
     pub fn begin(&self, session_id: &str) {
+        self.sweep_expired(FINISHED_TTL);
         self.turns.insert(session_id.to_string(), TurnBuffer::new());
+    }
+
+    /// Drop the buffers of turns that finished longer than `ttl` ago.
+    fn sweep_expired(&self, ttl: Duration) {
+        self.turns
+            .retain(|_, b| b.finished_at.is_none_or(|at| at.elapsed() < ttl));
+    }
+
+    /// `(buffers, bytes)` currently held, for the daemon's growth counters.
+    pub fn usage(&self) -> (usize, usize) {
+        self.turns
+            .iter()
+            .fold((0, 0), |(n, bytes), b| (n + 1, bytes + b.bytes))
     }
 
     /// Record an event and return the id assigned to it.
@@ -117,13 +155,25 @@ impl ReplayBuffers {
         buf.next_id += 1;
         if event.is_last {
             buf.finished = true;
+            buf.finished_at = Some(Instant::now());
         }
-        buf.events.push_back(Recorded {
-            id,
-            event: event.clone(),
-        });
-        while buf.events.len() > BUFFER_CAPACITY {
-            buf.events.pop_front();
+        let size = event_bytes(event);
+        buf.bytes += size;
+        buf.events.push_back((
+            Recorded {
+                id,
+                event: event.clone(),
+            },
+            size,
+        ));
+        // Always keep the newest event (often the terminal frame), even when it
+        // alone is over the byte cap.
+        while buf.events.len() > 1
+            && (buf.events.len() > BUFFER_CAPACITY || buf.bytes > BUFFER_MAX_BYTES)
+        {
+            if let Some((_, dropped)) = buf.events.pop_front() {
+                buf.bytes -= dropped;
+            }
         }
         Some(id)
     }
@@ -135,7 +185,7 @@ impl ReplayBuffers {
     /// and must reconcile from the transcript rather than assume continuity.
     pub fn since(&self, session_id: &str, last_id: Option<u64>) -> Option<Replay> {
         let buf = self.turns.get(session_id)?;
-        let oldest = buf.events.front().map(|r| r.id);
+        let oldest = buf.events.front().map(|(r, _)| r.id);
 
         let truncated = match (last_id, oldest) {
             // `last_id` comes straight off a client's `Last-Event-ID` header,
@@ -147,8 +197,13 @@ impl ReplayBuffers {
             _ => false,
         };
         let events: Vec<Recorded> = match last_id {
-            Some(last) => buf.events.iter().filter(|r| r.id > last).cloned().collect(),
-            None => buf.events.iter().cloned().collect(),
+            Some(last) => buf
+                .events
+                .iter()
+                .filter(|(r, _)| r.id > last)
+                .map(|(r, _)| r.clone())
+                .collect(),
+            None => buf.events.iter().map(|(r, _)| r.clone()).collect(),
         };
         Some(Replay {
             events,
@@ -170,7 +225,8 @@ impl ReplayBuffers {
     ///
     /// Not called on turn end: a client that reconnects a moment after the
     /// turn finished still wants the tail. Buffers are replaced by the next
-    /// `begin`, and dropped when the session is.
+    /// `begin`, expire [`FINISHED_TTL`] after their turn ends, and are dropped
+    /// when the session is.
     pub fn forget(&self, session_id: &str) {
         self.turns.remove(session_id);
     }
@@ -314,6 +370,47 @@ mod tests {
         b.begin("s1");
         assert_eq!(b.record("s1", &tool()), Some(1));
         assert_eq!(b.since("s1", None).unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn the_buffer_is_bounded_by_bytes_too() {
+        let b = ReplayBuffers::new();
+        b.begin("s1");
+        let big = SSEEvent {
+            event_type: SSEEventType::ToolFinish,
+            tool_result: Some("x".repeat(1024 * 1024)),
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            b.record("s1", &big);
+        }
+        let (_, bytes) = b.usage();
+        assert!(bytes <= BUFFER_MAX_BYTES, "held {bytes} bytes");
+        assert!(b.since("s1", Some(1)).unwrap().truncated);
+    }
+
+    #[test]
+    fn a_single_oversized_terminal_frame_is_still_kept() {
+        let b = ReplayBuffers::new();
+        b.begin("s1");
+        let mut last = terminal();
+        last.content = Some("x".repeat(BUFFER_MAX_BYTES + 1));
+        b.record("s1", &last);
+        assert!(b.since("s1", None).unwrap().finished);
+    }
+
+    #[test]
+    fn finished_buffers_expire_but_live_ones_do_not() {
+        let b = ReplayBuffers::new();
+        b.begin("done");
+        b.record("done", &terminal());
+        b.begin("running");
+        b.record("running", &tool());
+
+        b.sweep_expired(Duration::ZERO);
+        assert!(b.since("done", None).is_none(), "an expired tail is freed");
+        assert!(b.is_live("running"), "a running turn is never swept");
+        assert_eq!(b.usage().0, 1);
     }
 
     #[test]

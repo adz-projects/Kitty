@@ -974,6 +974,22 @@ impl ProviderRouter {
         queue.set_limit(concurrency).await;
     }
 
+    /// `(provider, in_flight, limit, waiting)` for every provider with a
+    /// queue, for the daemon's growth counters (`GET /api/admin/stats`).
+    pub async fn all_queue_usage(&self) -> Vec<(String, u32, u32, usize)> {
+        let queues: Vec<(String, Arc<ProviderQueue>)> = self
+            .queues
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let mut out = Vec::with_capacity(queues.len());
+        for (id, q) in queues {
+            out.push((id, q.in_flight().await, q.limit().await, q.queue_depth().await));
+        }
+        out.sort();
+        out
+    }
+
     /// A snapshot of one provider's queue, for `GET /api/providers`.
     pub async fn queue_stats(&self, provider_id: &str, app_id: &str) -> Option<QueueStats> {
         let q = self.queues.get(provider_id)?.clone();

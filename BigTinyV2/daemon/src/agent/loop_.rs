@@ -920,6 +920,9 @@ async fn recall_within_budget<T>(
     fut: impl std::future::Future<Output = T>,
 ) -> Option<T> {
     let started = std::time::Instant::now();
+    // A user is waiting on this turn: its embeddings go ahead of background
+    // memory work from every app (`embed_priority`).
+    let fut = crate::embed_priority::interactive(fut);
     match tokio::time::timeout(Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS), fut).await {
         Ok(v) => Some(v),
         Err(_) => {
@@ -2000,7 +2003,10 @@ impl AgentLoop {
                 let left = Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS)
                     .saturating_sub(recall_started.elapsed())
                     .max(Duration::from_millis(250));
-                self.memorabilia_counterpoint(session_id, stance, left).await
+                crate::embed_priority::interactive(
+                    self.memorabilia_counterpoint(session_id, stance, left),
+                )
+                .await
             }
             _ => None,
         };

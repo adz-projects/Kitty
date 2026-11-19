@@ -19,6 +19,49 @@ use crate::storage::sessions;
 
 use super::AppState;
 
+/// The daemon's growth counters: everything that holds memory in proportion
+/// to load. Served by `GET /api/admin/stats` and logged by the memory
+/// watchdog when it fires, so a runaway names its source.
+pub async fn stats_snapshot(state: &AppState) -> serde_json::Value {
+    let (replay_buffers, replay_bytes) = state.replay.usage();
+    let (embed_interactive, embed_background) = crate::embed_priority::total_depth();
+    let (bg_sessions, bg_live, snapshots) = state.agent.bookkeeping_counts();
+    let providers: Vec<serde_json::Value> = state
+        .router
+        .all_queue_usage()
+        .await
+        .into_iter()
+        .map(|(id, in_flight, limit, waiting)| {
+            json!({ "provider": id, "in_flight": in_flight, "limit": limit, "waiting": waiting })
+        })
+        .collect();
+    let per_app = |usage: Vec<(String, u32)>| -> serde_json::Value {
+        usage
+            .into_iter()
+            .map(|(app, n)| (app, json!(n)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
+    json!({
+        "private_bytes": crate::memory_guard::private_bytes(),
+        "turns_running": state.agent.active_session_ids().len(),
+        "turns_by_app": per_app(state.admission.turns.usage()),
+        "turn_limit_per_app": state.admission.turns.limit(),
+        "jobs_by_app": per_app(state.admission.jobs.usage()),
+        "job_limit_per_app": state.admission.jobs.limit(),
+        "providers": providers,
+        "replay": { "buffers": replay_buffers, "bytes": replay_bytes },
+        "embed_queue": { "interactive": embed_interactive, "background": embed_background },
+        "background_work": { "sessions": bg_sessions, "live_tasks": bg_live },
+        "workspace_snapshots": snapshots,
+    })
+}
+
+/// `GET /api/admin/stats`
+pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
+    Json(stats_snapshot(&state).await).into_response()
+}
+
 /// How recently another app must have authenticated to count as attached.
 /// `last_seen_at` is written about once a minute per key, so three intervals
 /// comfortably covers an app that is open but momentarily quiet.

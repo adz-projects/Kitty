@@ -274,6 +274,7 @@ async fn async_main() {
     // live under the ceiling. See `memory_guard` for the incident behind it.
     bigtiny2::memory_guard::install_ceiling();
     bigtiny2::memory_guard::spawn_watchdog();
+    bigtiny2::log_rotate::spawn(&data_dir);
 
     let options = RunOptions {
         host: args.host,

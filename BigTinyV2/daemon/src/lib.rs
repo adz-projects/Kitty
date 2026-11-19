@@ -3,6 +3,8 @@ pub mod config;
 pub mod discovery;
 pub mod crypto;
 pub mod memory_guard;
+pub mod embed_priority;
+pub mod log_rotate;
 pub mod decider;
 pub mod embed_cache;
 pub mod env_contract;
@@ -118,7 +120,8 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // Anything still `running` belongs to a previous process that stopped
     // without finishing it. Marked `interrupted`, never re-queued: a turn may
     // have executed tools with side effects, and silently re-running it would
-    // repeat them. The owner decides whether resubmitting is safe.
+    // repeat them. The owner decides whether resubmitting is safe. `pending`
+    // jobs ran nothing; they are resumed once the server state exists.
     match storage::jobs::mark_interrupted_on_boot(&pool).await {
         Ok(0) => {}
         Ok(n) => tracing::warn!("marked {n} job(s) interrupted by a previous shutdown"),
@@ -372,10 +375,26 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         plugins: plugins.clone(),
         memorabilia: memorabilia.clone(),
         replay: Arc::new(server::replay::ReplayBuffers::new()),
+        admission: agent::admission::Admission::from_config(&config.agent),
         key_cache: key_cache.clone(),
         instance_id: instance_id.clone(),
         shutdown: restart_requested.clone(),
     });
+
+    routes::jobs::resume_pending(&state).await;
+
+    // The memory watchdog logs these counters when it fires. Weak, so the
+    // registration never keeps a stopped engine's state alive.
+    let stats_state = Arc::downgrade(&state);
+    memory_guard::set_stats_source(Arc::new(move || {
+        let s = stats_state.clone();
+        Box::pin(async move {
+            match s.upgrade() {
+                Some(state) => routes::admin::stats_snapshot(&state).await,
+                None => serde_json::json!({}),
+            }
+        })
+    }));
 
     // Per-app identity replaces V1's single shared secret. `registration_token`
     // is the bootstrap credential published in the handshake file; it

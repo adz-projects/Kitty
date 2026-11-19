@@ -943,6 +943,81 @@ pub struct SendMessageRequest {
     pub images: Option<Vec<Value>>,
 }
 
+/// Move a turn's events from its (unbounded) channel to the client's
+/// (bounded) queue, recording each for replay.
+///
+/// The turn side is unbounded, so this loop must never stop *reading* it.
+/// It used to `await` a full client queue for each structural event, and
+/// while it waited every delta the turn emitted piled up in the unbounded
+/// channel behind it -- the one buffer on the streaming path with no limit.
+/// Now structural events that do not fit wait in `pending` (they are few),
+/// and a delta is dropped at once if it cannot go straight out. Deltas are
+/// also dropped while anything is pending, so a delta never overtakes the
+/// tool call or status frame emitted before it.
+async fn forward_to_client(
+    mut rx: mpsc::UnboundedReceiver<SSEEvent>,
+    client_tx: mpsc::Sender<(Option<u64>, SSEEvent)>,
+    replay: crate::server::replay::SharedReplay,
+    session_id: String,
+) {
+    let mut pending: std::collections::VecDeque<(Option<u64>, SSEEvent)> =
+        std::collections::VecDeque::new();
+    let mut dropped: u64 = 0;
+    let mut turn_done = false;
+    loop {
+        if turn_done && pending.is_empty() {
+            break;
+        }
+        tokio::select! {
+            // Prefer draining what is owed to the client, so `pending` stays
+            // short whenever the client is keeping up.
+            biased;
+            permit = client_tx.reserve(), if !pending.is_empty() => match permit {
+                Ok(permit) => {
+                    if let Some(item) = pending.pop_front() {
+                        permit.send(item);
+                    }
+                }
+                Err(_) => break, // client is gone; dropping `rx` ends the turn's stream
+            },
+            next = rx.recv(), if !turn_done => {
+                let Some(event) = next else {
+                    turn_done = true;
+                    continue;
+                };
+                // Record before sending: a client that drops mid-frame must
+                // still find the event waiting when it comes back.
+                let event_id = replay.record(&session_id, &event);
+                let droppable = matches!(
+                    event.event_type,
+                    SSEEventType::LlmDelta | SSEEventType::ReasoningDelta
+                ) && !event.is_last;
+                if droppable {
+                    if !pending.is_empty() || client_tx.try_send((event_id, event)).is_err() {
+                        dropped += 1;
+                    }
+                    if client_tx.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
+                if !pending.is_empty() {
+                    pending.push_back((event_id, event)); // keep the order
+                    continue;
+                }
+                match client_tx.try_send((event_id, event)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(item)) => pending.push_back(item),
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!("dropped {dropped} streaming deltas for a client that fell behind");
+    }
+}
+
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AppIdentity>,
@@ -961,13 +1036,32 @@ pub async fn send_message(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 
+    // The app's own allowance of concurrent turns, so one app driving many
+    // sessions cannot crowd out the others sharing this engine.
+    let Ok(admitted) = state.admission.turns.try_admit(&identity.app_id) else {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": format!(
+                    "this app already has {} turns running; try again when one finishes",
+                    state.admission.turns.limit()
+                ),
+                "reason": "app_turn_limit",
+            })),
+        )
+            .into_response();
+        resp.headers_mut()
+            .insert("Retry-After", HeaderValue::from_static("5"));
+        return resp;
+    };
+
     let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();
     let replay = state.replay.clone();
     let replay_session = id.clone();
 
     if let Err(e) = state
         .agent
-        .run_turn(id.clone(), body.message, body.images, None, tx)
+        .run_turn(id.clone(), body.message, body.images, None, tx, admitted)
     {
         return err_response(StatusCode::CONFLICT, e);
     }
@@ -992,31 +1086,7 @@ pub async fn send_message(
     // correctness — and a client that has stopped reading entirely closes
     // the channel, which the turn already treats as a cancel.
     let (client_tx, client_rx) = mpsc::channel::<(Option<u64>, SSEEvent)>(SSE_CLIENT_QUEUE);
-    tokio::spawn(async move {
-        let mut rx = rx;
-        let mut dropped: u64 = 0;
-        while let Some(event) = rx.recv().await {
-            // Record before sending: a client that drops mid-frame must still
-            // find the event waiting when it comes back.
-            let event_id = replay.record(&replay_session, &event);
-            let droppable = matches!(
-                event.event_type,
-                SSEEventType::LlmDelta | SSEEventType::ReasoningDelta
-            ) && !event.is_last;
-            if droppable {
-                if client_tx.try_send((event_id, event)).is_err() {
-                    dropped += 1;
-                }
-                continue;
-            }
-            if client_tx.send((event_id, event)).await.is_err() {
-                break; // client is gone; dropping `rx` ends the turn's stream
-            }
-        }
-        if dropped > 0 {
-            tracing::warn!("dropped {dropped} streaming deltas for a client that fell behind");
-        }
-    });
+    tokio::spawn(forward_to_client(rx, client_tx, replay, replay_session));
 
     // A keepalive comment every `KEEPALIVE_INTERVAL` while the turn is quiet
     // -- most importantly while it waits on an approval, which can take far
@@ -1159,5 +1229,103 @@ pub async fn revoke_dir(
             };
             err_response(status, e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn delta(text: &str) -> SSEEvent {
+        SSEEvent::content(text)
+    }
+
+    fn tool(name: &str) -> SSEEvent {
+        SSEEvent {
+            event_type: SSEEventType::ToolStart,
+            tool_name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    type Setup = (
+        mpsc::UnboundedSender<SSEEvent>,
+        mpsc::Receiver<(Option<u64>, SSEEvent)>,
+        tokio::task::JoinHandle<()>,
+        crate::server::replay::SharedReplay,
+    );
+
+    fn setup(client_queue: usize) -> Setup {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (client_tx, client_rx) = mpsc::channel(client_queue);
+        let replay = Arc::new(crate::server::replay::ReplayBuffers::new());
+        replay.begin("s");
+        let task = tokio::spawn(forward_to_client(rx, client_tx, replay.clone(), "s".into()));
+        (tx, client_rx, task, replay)
+    }
+
+    /// Wait until the forwarder has read `n` deltas off the turn's channel.
+    /// The replay buffer counts every delta it sees, so this is proof the
+    /// unbounded side was drained.
+    async fn wait_for_deltas(replay: &crate::server::replay::SharedReplay, n: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while replay.since("s", None).map(|r| r.dropped_deltas).unwrap_or(0) < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the forwarder must keep reading the turn's channel");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_client_keeps_structural_order_and_sheds_deltas() {
+        let (tx, mut client_rx, task, replay) = setup(1);
+        tx.send(tool("first")).unwrap(); // fills the client queue
+        tx.send(tool("second")).unwrap(); // waits in `pending`
+        for i in 0..1000 {
+            tx.send(delta(&format!("d{i}"))).unwrap(); // must be dropped, not queued
+        }
+        tx.send(tool("third")).unwrap();
+        drop(tx);
+        wait_for_deltas(&replay, 1000).await;
+
+        let mut seen = Vec::new();
+        while let Ok(Some((_, e))) =
+            tokio::time::timeout(Duration::from_secs(1), client_rx.recv()).await
+        {
+            seen.push(e.tool_name.unwrap_or_else(|| "delta".into()));
+        }
+        assert_eq!(seen, vec!["first", "second", "third"]);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_turn_channel_is_drained_while_the_client_is_stalled() {
+        let (tx, _client_rx, _task, replay) = setup(1);
+        tx.send(tool("fills the queue")).unwrap();
+        tx.send(tool("pending")).unwrap();
+        for i in 0..10_000 {
+            tx.send(delta(&format!("d{i}"))).unwrap();
+        }
+        // Read off the turn's channel even though the client takes nothing:
+        // the backlog does not live on the unbounded side.
+        wait_for_deltas(&replay, 10_000).await;
+        // The forwarder is still alive, holding the turn's stream open.
+        assert!(!tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_departed_client_ends_the_turn_stream() {
+        let (tx, client_rx, task, _replay) = setup(1);
+        tx.send(tool("a")).unwrap();
+        tx.send(tool("b")).unwrap();
+        drop(client_rx);
+        tx.send(tool("c")).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the forwarder must notice the client left")
+            .unwrap();
+        assert!(tx.is_closed(), "the turn sees its stream close, which cancels it");
     }
 }

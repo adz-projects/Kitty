@@ -67,6 +67,8 @@ pub struct AppState {
     /// already in progress. Necessary once work outlives its submitter --
     /// see `server::replay`.
     pub replay: crate::server::replay::SharedReplay,
+    /// Per-app limits on concurrent turns and jobs (`agent::admission`).
+    pub admission: Arc<crate::agent::admission::Admission>,
     /// This launch's identity, echoed on `/api/health` so a client can prove
     /// the process answering on a port is the one its handshake describes.
     pub instance_id: String,
@@ -102,6 +104,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // per-app instance state, an MCP server provides tools. See
         // `crate::plugins`.
         .route("/api/admin/restart", post(admin::restart))
+        .route("/api/admin/stats", get(admin::stats))
         .route("/api/apps/me/events", get(events::events))
         .route("/api/apps/me/import-v1", post(apps::import_v1))
         .route("/api/apps/me/pending", get(hitl::pending_for_app))

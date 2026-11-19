@@ -634,11 +634,25 @@ pub struct AgentConfig {
     /// parent's tool call while holding a concurrency permit.
     #[serde(default = "default_specialist_timeout_secs")]
     pub specialist_timeout_secs: u64,
+    /// Interactive turns (`/send`) one app may run at once, across all its
+    /// sessions. Past it `/send` answers 429. One session already runs one
+    /// turn at a time; this bounds an app that opens many sessions, so it
+    /// cannot crowd the shared engine out from under the other apps. `0`
+    /// means no limit.
+    #[serde(default = "default_max_turns_per_app")]
+    pub max_turns_per_app: u32,
+    /// Detached jobs one app may run at once. Further jobs wait, still
+    /// `queued`, rather than being refused: a batch is meant to be submitted
+    /// all at once and worked through. `0` means no limit.
+    #[serde(default = "default_max_jobs_per_app")]
+    pub max_jobs_per_app: u32,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            max_turns_per_app: default_max_turns_per_app(),
+            max_jobs_per_app: default_max_jobs_per_app(),
             max_concurrent_tool_calls: default_max_concurrent_tool_calls(),
             disconnect_grace_secs: default_disconnect_grace_secs(),
             sandbox_strict: false,
@@ -652,6 +666,14 @@ impl Default for AgentConfig {
 
 fn default_max_concurrent_tool_calls() -> i32 {
     5
+}
+
+fn default_max_turns_per_app() -> u32 {
+    16
+}
+
+fn default_max_jobs_per_app() -> u32 {
+    4
 }
 
 fn default_max_concurrent_specialists() -> i32 {

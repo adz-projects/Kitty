@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod approval_policy;
 pub mod compaction;
 pub mod context;
@@ -327,6 +328,9 @@ impl Agent {
         images: Option<Vec<Value>>,
         provider_override: Option<String>,
         tx: mpsc::UnboundedSender<SSEEvent>,
+        // The app's place under its turn limit (`admission`), released when the
+        // turn task ends however it ends.
+        admitted: admission::Admitted,
     ) -> Result<(), String> {
         let this = self.clone();
         let turn_token = Uuid::new_v4();
@@ -385,6 +389,7 @@ impl Agent {
                 let cleanup_session_id = session_id.clone();
                 let cancel_tx = tx.clone();
                 let handle = tokio::spawn(async move {
+                    let _admitted = admitted;
                     // Drop-guard cleanup: if `run()` panics, everything after
                     // it in this task used to be skipped — leaking the
                     // `tasks` entry and wedging the session into a permanent
@@ -567,6 +572,16 @@ impl Agent {
     /// the life of the process.
     pub fn forget_session(&self, session_id: &str) {
         self.provider_mismatch_warned.remove(session_id);
+        // Same story: the workspace listing cached for the prompt is only ever
+        // replaced by the session's next turn, which a deleted session never has.
+        self.workspace_snapshots.remove(session_id);
+        // Turn-end work (compaction, learning) for a session that no longer
+        // exists has nothing left to write to.
+        if let Some((_, handles)) = self.background_tasks.remove(session_id) {
+            for h in handles {
+                h.abort();
+            }
+        }
     }
 
     /// Abort the in-flight turn for `session_id`, if any. Emits the terminal
@@ -717,6 +732,17 @@ impl Agent {
     /// job or scheduled run alike, since all of them hold a `tasks` slot.
     /// Same "finished but unreaped doesn't count" rule as
     /// [`Self::has_active_turns`].
+    /// `(sessions with turn-end work, live background tasks, cached
+    /// workspace listings)`, for the daemon's growth counters.
+    pub fn bookkeeping_counts(&self) -> (usize, usize, usize) {
+        let live = self
+            .background_tasks
+            .iter()
+            .map(|e| e.value().iter().filter(|h| !h.is_finished()).count())
+            .sum();
+        (self.background_tasks.len(), live, self.workspace_snapshots.len())
+    }
+
     pub fn active_session_ids(&self) -> Vec<String> {
         self.tasks
             .iter()
@@ -963,7 +989,7 @@ mod tests {
         assert!(agent.tasks.get("no-such-session").unwrap().1.is_finished());
 
         let (tx2, _rx2) = mpsc::unbounded_channel::<SSEEvent>();
-        let result = agent.run_turn("no-such-session".into(), "hi".into(), None, None, tx2);
+        let result = agent.run_turn("no-such-session".into(), "hi".into(), None, None, tx2, None);
         assert!(
             result.is_ok(),
             "a finished entry must be replaceable: {result:?}"
@@ -986,7 +1012,7 @@ mod tests {
         let agent = test_agent().await;
         let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
         agent
-            .run_turn("no-such-session".into(), "hi".into(), None, None, tx)
+            .run_turn("no-such-session".into(), "hi".into(), None, None, tx, None)
             .expect("first turn for a session is always accepted");
 
         // Drain to the end. `recv()` returning `None` *is* the assertion:

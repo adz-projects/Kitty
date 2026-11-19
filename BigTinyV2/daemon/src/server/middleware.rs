@@ -265,12 +265,22 @@ pub async fn request_logging_middleware(req: Request<Body>, next: Next) -> Respo
     let response = next.run(req).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-    tracing::info!(
-        "{method} {path} -> {} ({duration_ms:.1}ms)",
-        response.status().as_u16()
-    );
+    let status = response.status().as_u16();
+    // Every attached app polls health every few seconds; at `info` that was
+    // the bulk of daemon.log and buried everything worth reading. A failing
+    // health check still shows.
+    if is_routine_poll(&path) && response.status().is_success() {
+        tracing::debug!("{method} {path} -> {status} ({duration_ms:.1}ms)");
+    } else {
+        tracing::info!("{method} {path} -> {status} ({duration_ms:.1}ms)");
+    }
 
     response
+}
+
+/// Requests clients make on a timer rather than because something happened.
+fn is_routine_poll(path: &str) -> bool {
+    path == "/api/health"
 }
 
 #[cfg(test)]

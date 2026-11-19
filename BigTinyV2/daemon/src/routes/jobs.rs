@@ -150,32 +150,77 @@ pub async fn create(
 
     // Detached by construction: the turn runs on its own task and nothing about
     // its progress depends on this response, or on the caller still being here.
+    dispatch(
+        &state,
+        identity.app_id.clone(),
+        job_id.clone(),
+        session_id.clone(),
+        body.prompt.clone(),
+    );
+
+    Json(json!({ "job_id": job_id, "session_id": session_id })).into_response()
+}
+
+/// Run a pending job on its own task, once the app has room under its job
+/// limit. Used by `POST /api/jobs` and, at startup, for jobs a previous
+/// process accepted but never started.
+pub fn dispatch(state: &AppState, app_id: String, job_id: String, session_id: String, prompt: String) {
     let agent = state.agent.clone();
     let pool = state.db.clone();
-    let prompt = body.prompt.clone();
-    let sid = session_id.clone();
-    let jid = job_id.clone();
+    let admission = state.admission.clone();
     tokio::spawn(async move {
-        if let Err(e) = jobs::mark_running(&pool, &jid).await {
-            tracing::warn!("could not mark job {jid} running: {e}");
+        // Wait for room under the app's job limit, still `pending`: a batch of
+        // hundreds runs a few at a time instead of all at once.
+        let _admitted = admission.jobs.admit(&app_id).await;
+        // The gate every run passes. Nothing runs unless the job was claimed
+        // here, which is what makes a `pending` job safe to resume after a
+        // restart -- and what stops one cancelled while it waited.
+        match jobs::mark_running(&pool, &job_id).await {
+            Ok(1) => {}
+            Ok(_) => return, // cancelled (or deleted) while it waited
+            Err(e) => {
+                tracing::warn!("could not mark job {job_id} running: {e}");
+                let _ = jobs::finish(&pool, &job_id, "failed", None, Some("could not record the job's start")).await;
+                return;
+            }
         }
         // Jobs are `Background` in the provider queue: a user waiting on a
         // chat message should not sit behind a batch.
         match agent
-            .run_turn_and_wait(&sid, &prompt, crate::provider::queue::Priority::Background)
+            .run_turn_and_wait(&session_id, &prompt, crate::provider::queue::Priority::Background)
             .await
         {
             Ok(_notices) => {
-                let result = sessions::last_assistant_text(&pool, &sid).await.ok().flatten();
-                let _ = jobs::finish(&pool, &jid, "succeeded", result.as_deref(), None).await;
+                let result = sessions::last_assistant_text(&pool, &session_id).await.ok().flatten();
+                let _ = jobs::finish(&pool, &job_id, "succeeded", result.as_deref(), None).await;
             }
             Err(msg) => {
-                let _ = jobs::finish(&pool, &jid, "failed", None, Some(&msg)).await;
+                let _ = jobs::finish(&pool, &job_id, "failed", None, Some(&msg)).await;
             }
         }
     });
+}
 
-    Json(json!({ "job_id": job_id, "session_id": session_id })).into_response()
+/// Start again every job a previous process accepted but never started.
+pub async fn resume_pending(state: &AppState) {
+    let pending = match jobs::pending_on_boot(&state.db).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("could not read pending jobs: {e}");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!("resuming {} job(s) that a previous run accepted but never started", pending.len());
+    for job in pending {
+        let Some(session_id) = job.session_id else {
+            let _ = jobs::finish(&state.db, &job.id, "failed", None, Some("the job's session no longer exists")).await;
+            continue;
+        };
+        dispatch(state, job.app_id, job.id, session_id, job.prompt);
+    }
 }
 
 #[derive(Debug, Deserialize)]
