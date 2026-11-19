@@ -99,6 +99,11 @@ work in parallel, use several sessions — that is what `parent_session_id`
 groups. Rejoining a running turn is `GET /{id}/stream`, which is a different
 thing from starting one.
 
+**Turns per app** (2.6.0). An app may run at most `agent.max_turns_per_app`
+interactive turns at once across all its sessions (default 16; `0` is no
+limit). Past it `POST /send` is **429** with `Retry-After: 5` and
+`{"error", "reason": "app_turn_limit"}`. Other apps are unaffected.
+
 ## Streaming
 
 `data: {json}` terminated by a blank line, optionally preceded by `id: <n>`.
@@ -120,7 +125,9 @@ output will not parse. (`recoverable` defaults to **true** when absent.)
 
 `GET /api/chat/{id}/stream` with `Last-Event-ID: <n>` replays everything after
 `n`, then follows the live turn. Without the header you get the whole retained
-buffer.
+buffer: up to 512 events and 4 MiB per turn (2.6.0). A finished turn's tail stays
+replayable for 10 minutes, after which `/stream` has nothing to replay and
+`/history` is the record.
 
 **Only structural events carry ids and are replayable.** Text deltas are
 best-effort: the send path drops them under queue pressure rather than stalling
@@ -147,8 +154,20 @@ States: `pending`, `running`, then `succeeded` / `failed` / `cancelled`, plus
 A turn may have executed tools with side effects, and silently re-running it
 would repeat them. Resubmitting is your decision.
 
+An app runs at most `agent.max_jobs_per_app` jobs at once (default 4; `0` is
+no limit); the rest wait as `pending` and start in order (2.6.0). A `pending`
+job has run nothing, so one still waiting when the daemon stops is resumed when
+it next starts, and one cancelled while waiting never starts.
+
 Jobs queue at background priority, so a batch never delays another app's
 interactive chat.
+
+## Admin
+
+| Route | Notes |
+|---|---|
+| `POST /api/admin/restart` | `{force?}`; refused while another app is attached or any turn is running |
+| `GET /api/admin/stats` | the daemon's growth counters (2.6.0): `private_bytes`, `turns_running`, `turns_by_app`, `jobs_by_app` and their limits, `providers` (`in_flight`, `limit`, `waiting` each), `replay` (`buffers`, `bytes`), `embed_queue` (`interactive`, `background`), `background_work`, `workspace_snapshots`. For diagnosis; the shape may grow. |
 
 ## Providers
 
