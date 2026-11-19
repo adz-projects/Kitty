@@ -174,6 +174,15 @@ fn send_refusal(status: reqwest::StatusCode, body: &str) -> StreamFailure {
             error_type: Some("turn_in_progress"),
         };
     }
+    // The engine's per-app limit on concurrent turns: Kitty has that many
+    // chats generating at once. Nothing is wrong; one has to finish first.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return StreamFailure {
+            message: "Too many chats are generating at once. Wait for one to finish, then send again."
+                .to_string(),
+            error_type: Some("app_turn_limit"),
+        };
+    }
     StreamFailure {
         message: format!("The engine refused the message ({status}): {body}"),
         error_type: None,
@@ -1570,6 +1579,16 @@ mod tests {
         assert_eq!(u["truncated"], true);
         assert_eq!(u["daemonToolCallId"], "call-9");
         assert_eq!(tool_update("bt-1", None, true, "short")["truncated"], false);
+    }
+
+    #[test]
+    fn a_429_reads_as_too_many_chats_not_raw_json() {
+        let f = send_refusal(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"x","reason":"app_turn_limit"}"#,
+        );
+        assert_eq!(f.error_type, Some("app_turn_limit"));
+        assert!(!f.message.contains('{'), "raw JSON leaked: {}", f.message);
     }
 
     #[test]
