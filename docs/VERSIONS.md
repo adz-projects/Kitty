@@ -91,6 +91,17 @@ HuggingFace `tokenizer_config.json`, and Ollama `/api/show` `capabilities`.
 | specialist `max_concurrent`; runs report `provider_id`/`model` | Per-specialist concurrency; where a run ran |
 | kitty-web `search_lang` / `country` on DuckDuckGo (`kl`) and Bing (`setlang`/`cc`) | Locale honoured without Brave |
 
+Added in daemon **2.6.0** (Kitty 1.0.11, stability under several apps). All
+additive; API version stays 2:
+
+| Surface | Used for |
+|---|---|
+| `POST /api/chat/{id}/send` → **429** `{reason: "app_turn_limit"}` + `Retry-After` past `agent.max_turns_per_app` (16) | Kitty shows "too many chats are generating" instead of an engine error (`bigtiny/stream.rs`) |
+| jobs wait `pending` past `agent.max_jobs_per_app` (4); pending jobs resume after a restart | Not used by Kitty; Bacon's batch work |
+| `GET /api/admin/stats` | Diagnosis: memory, turns and jobs per app, provider queues, replay and embedding backlog |
+| replay kept 512 events / 4 MiB per turn, 10 minutes after the turn ends | `/stream` rejoin; `/history` is the record beyond it |
+| Windows memory ceiling (half of RAM, ≥ 4 GiB; `BIGTINYV2_MEMORY_LIMIT_MB`, `0` = off) and size-rotated `daemon.log` | A runaway engine exits instead of starving the machine |
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
