@@ -4671,6 +4671,9 @@ impl AgentLoop {
         let start = Instant::now();
         let mut first_token = true;
         let mut token_count = 0;
+        // Deltas that carried output of any kind (content, reasoning, a tool
+        // call) — `finalize_rate` needs at least two to have a decode window.
+        let mut output_deltas = 0u32;
         let mut content_chars = 0usize;
         // Buffered and tokenized once at end of stream rather than per delta:
         // `count_text_tokens` runs a real BPE encode, and doing that on every
@@ -4705,6 +4708,13 @@ impl AgentLoop {
                 timing.ttfb_ms = start.elapsed().as_secs_f64() * 1000.0;
                 timing.ttft_ms = start.elapsed().as_secs_f64() * 1000.0;
                 first_token = false;
+            }
+
+            if delta.content.as_deref().is_some_and(|c| !c.is_empty())
+                || delta.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+                || delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+            {
+                output_deltas += 1;
             }
 
             if let Some(content) = delta.content.take() {
@@ -4811,7 +4821,7 @@ impl AgentLoop {
             .map(|v| v as i32)
             .unwrap_or_else(|| tokens::count_text_tokens(&reasoning_buf));
         timing.reasoning_text = reasoning_buf;
-        timing.finalize_rate();
+        timing.finalize_rate(output_deltas);
 
         Ok((content_buf, tool_calls, finish_reason, usage, timing))
     }

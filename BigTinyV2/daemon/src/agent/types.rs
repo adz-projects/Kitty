@@ -47,12 +47,25 @@ impl TimingResult {
     /// prompt processing and queueing, not generation). `None` when the
     /// window is degenerate or nothing was generated, so a caller never has
     /// to render a divide-by-zero.
-    pub fn finalize_rate(&mut self) {
+    ///
+    /// `output_deltas` is how many stream deltas carried output (content,
+    /// reasoning or a tool call). With fewer than two, the whole reply
+    /// arrived at once — a one-token answer, or a server that buffers —
+    /// and the "window" is just the gap before the closing usage chunk, a
+    /// few microseconds that turned one token into hundreds of thousands of
+    /// tok/s. Below `MIN_DECODE_WINDOW_MS` the same burst effect applies
+    /// even with several deltas, so no rate is reported then either.
+    pub fn finalize_rate(&mut self, output_deltas: u32) {
         let decode_ms = self.generation_ms - self.ttft_ms;
-        self.tokens_per_second = (decode_ms > 0.0 && self.total_tokens > 0)
-            .then(|| f64::from(self.total_tokens) / (decode_ms / 1000.0));
+        self.tokens_per_second =
+            (output_deltas >= 2 && decode_ms >= MIN_DECODE_WINDOW_MS && self.total_tokens > 0)
+                .then(|| f64::from(self.total_tokens) / (decode_ms / 1000.0));
     }
 }
+
+/// Shortest decode window a generation rate is computed over. Anything
+/// shorter is a burst delivery, not a measurement of decoding.
+const MIN_DECODE_WINDOW_MS: f64 = 50.0;
 
 #[cfg(test)]
 mod tests {
@@ -68,16 +81,21 @@ mod tests {
             total_tokens: 100,
             ..Default::default()
         };
-        t.finalize_rate();
+        t.finalize_rate(50);
         assert_eq!(t.tokens_per_second, Some(100.0));
     }
 
     #[test]
     fn a_degenerate_window_reports_nothing_rather_than_infinity() {
-        for (ttft, generation, tokens) in [
-            (2000.0, 2000.0, 100), // no decode window at all
-            (3000.0, 2000.0, 100), // first token after the call "ended"
-            (0.0, 1000.0, 0),      // nothing generated
+        for (ttft, generation, tokens, deltas) in [
+            (2000.0, 2000.0, 100, 50), // no decode window at all
+            (3000.0, 2000.0, 100, 50), // first token after the call "ended"
+            (0.0, 1000.0, 0, 0),       // nothing generated
+            // The reported bug: 1 token, the stream closing 2.2 µs after
+            // it, shown as 454545.5 tok/s.
+            (11_500.0, 11_500.002_2, 1, 1),
+            (1000.0, 1010.0, 40, 40), // a burst: all output in 10 ms
+            (1000.0, 2000.0, 40, 1),  // everything in one delta
         ] {
             let mut t = TimingResult {
                 ttft_ms: ttft,
@@ -85,8 +103,11 @@ mod tests {
                 total_tokens: tokens,
                 ..Default::default()
             };
-            t.finalize_rate();
-            assert_eq!(t.tokens_per_second, None, "{ttft}/{generation}/{tokens}");
+            t.finalize_rate(deltas);
+            assert_eq!(
+                t.tokens_per_second, None,
+                "{ttft}/{generation}/{tokens}/{deltas}"
+            );
         }
     }
 }
