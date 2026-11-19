@@ -264,8 +264,21 @@ impl ProviderQueue {
         };
 
         // `wake_next` increments the counters before signalling, so by the
-        // time this resolves the slot is already ours.
-        let _ = rx.await;
+        // time this resolves the slot is already ours. Held in a guard because
+        // this future can be cancelled at the `.await` -- a turn aborted, a
+        // recall timeout, `cancel_background` -- and if that lands after
+        // `wake_next` signalled but before we resumed, the slot was counted as
+        // ours with no permit ever built to return it. On a one-slot endpoint
+        // that wedged the provider for every app until the daemon restarted.
+        let mut pending = PendingPermit {
+            rx: Some(rx),
+            queue: self.clone(),
+            app_id: app_id.to_string(),
+        };
+        if let Some(rx) = pending.rx.as_mut() {
+            let _ = rx.await;
+        }
+        pending.rx = None; // claimed: from here the permit owns the slot
         QueuePermit {
             queue: self.clone(),
             app_id: app_id.to_string(),
@@ -290,12 +303,39 @@ pub struct QueuePermit {
 
 impl Drop for QueuePermit {
     fn drop(&mut self) {
-        let queue = self.queue.clone();
-        let app_id = std::mem::take(&mut self.app_id);
-        // `Drop` cannot await. Releasing on a spawned task means the slot is
-        // freed promptly without blocking whoever dropped the permit, which is
-        // usually a stream being torn down.
-        tokio::spawn(async move {
+        release_later(self.queue.clone(), std::mem::take(&mut self.app_id));
+    }
+}
+
+/// A waiter that has not yet claimed its slot. See `ProviderQueue::acquire`.
+struct PendingPermit {
+    rx: Option<oneshot::Receiver<()>>,
+    queue: Arc<ProviderQueue>,
+    app_id: String,
+}
+
+impl Drop for PendingPermit {
+    fn drop(&mut self) {
+        let Some(mut rx) = self.rx.take() else {
+            return;
+        };
+        // Closing first settles the race with `wake_next`: after this a send
+        // fails (and `wake_next` passes the slot on itself), so a value seen
+        // here was granted before we gave up and is ours to hand back.
+        rx.close();
+        if rx.try_recv().is_ok() {
+            release_later(self.queue.clone(), std::mem::take(&mut self.app_id));
+        }
+    }
+}
+
+/// `Drop` cannot await. Releasing on a spawned task frees the slot promptly
+/// without blocking whoever dropped the permit, which is usually a stream
+/// being torn down. Outside a runtime (process teardown) there is nobody left
+/// to wake, and `tokio::spawn` would panic there, so it is skipped.
+fn release_later(queue: Arc<ProviderQueue>, app_id: String) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
             queue.release(&app_id).await;
         });
     }
@@ -326,6 +366,33 @@ mod tests {
         }
         assert_eq!(q.in_flight().await, 8);
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_cancelled_after_being_granted_returns_the_slot() {
+        let q = queue(1);
+        let held = q.acquire("a", Priority::Interactive).await;
+
+        // Register as a waiter: one poll, which cannot be admitted.
+        let mut waiting = Box::pin(q.acquire("b", Priority::Interactive));
+        assert!(tokio::time::timeout(Duration::ZERO, &mut waiting).await.is_err());
+
+        // Release, and let `wake_next` hand the slot to the waiter...
+        drop(held);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(q.in_flight().await, 1, "the slot should now be granted to b");
+
+        // ...which is cancelled before it ever resumes to claim it.
+        drop(waiting);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(q.in_flight().await, 0, "a granted-but-unclaimed slot leaked");
+        tokio::time::timeout(Duration::from_millis(200), q.acquire("c", Priority::Interactive))
+            .await
+            .expect("the endpoint must not stay wedged");
     }
 
     #[tokio::test]
