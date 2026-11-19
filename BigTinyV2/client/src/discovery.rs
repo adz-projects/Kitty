@@ -70,6 +70,26 @@ fn rotate_logs(log: &Path, keep: usize) {
     let _ = std::fs::rename(log, numbered(1));
 }
 
+/// Rotate `log` and open a new one for the next daemon run.
+///
+/// When the rotation could not move the old log aside — typically because
+/// the previous daemon is still dying and holds it open — the old file is
+/// appended to rather than truncated. Truncating there erased exactly the
+/// record that mattered: the log of a daemon that had to be killed.
+fn open_fresh_log(log: &Path, keep: usize) -> std::io::Result<std::fs::File> {
+    rotate_logs(log, keep);
+    if !log.exists() {
+        return std::fs::File::create(log);
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(log)?;
+    let _ = writeln!(
+        file,
+        "\n===== previous log could not be rotated; a new daemon run follows ====="
+    );
+    Ok(file)
+}
+
 /// A validated, reachable daemon.
 #[derive(Debug, Clone)]
 pub struct Located {
@@ -270,8 +290,7 @@ async fn spawn_and_wait(
     // start is still diagnosable. The previous runs' logs are rotated first:
     // truncating on every spawn erased the only record of what the last run
     // did, which is how weeks of failed background work left no trace.
-    rotate_logs(&data_dir.join("daemon.log"), KEPT_DAEMON_LOGS);
-    match std::fs::File::create(data_dir.join("daemon.log")) {
+    match open_fresh_log(&data_dir.join("daemon.log"), KEPT_DAEMON_LOGS) {
         Ok(log) => {
             let errors = match log.try_clone() {
                 Ok(handle) => std::process::Stdio::from(handle),
@@ -424,6 +443,36 @@ mod tests {
         assert_eq!(read("daemon.log.1"), "third");
         assert_eq!(read("daemon.log.2"), "second");
         assert!(!dir.path().join("daemon.log.3").exists());
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_rotated_is_appended_to_not_erased() {
+        // `keep == 0` leaves the old log where it is, which is what a failed
+        // rename (a dying daemon still holding the file) looks like.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "memory allocation of 4096 bytes failed\n").unwrap();
+        {
+            use std::io::Write;
+            let mut f = open_fresh_log(&log, 0).unwrap();
+            write!(f, "new run").unwrap();
+        }
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("memory allocation of 4096 bytes failed"));
+        assert!(text.ends_with("new run"));
+    }
+
+    #[test]
+    fn a_rotated_log_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "old run").unwrap();
+        drop(open_fresh_log(&log, 2).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("daemon.log.1")).unwrap(),
+            "old run"
+        );
     }
 
     #[test]

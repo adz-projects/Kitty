@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod discovery;
 pub mod crypto;
+pub mod memory_guard;
 pub mod decider;
 pub mod embed_cache;
 pub mod env_contract;

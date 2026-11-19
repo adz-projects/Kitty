@@ -270,6 +270,11 @@ async fn async_main() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
+    // Before anything large is loaded, so the models and the DB pool all
+    // live under the ceiling. See `memory_guard` for the incident behind it.
+    bigtiny2::memory_guard::install_ceiling();
+    bigtiny2::memory_guard::spawn_watchdog();
+
     let options = RunOptions {
         host: args.host,
         port: args.port,
