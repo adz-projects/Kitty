@@ -34,7 +34,7 @@ fn format_input(text: &str) -> String {
 }
 
 enum Cmd {
-    Embed(String, mpsc::Sender<Option<Vec<f32>>>),
+    Embed(String, tokio::sync::oneshot::Sender<Option<Vec<f32>>>),
 }
 
 /// Handle to the embedding actor thread. Cheap to clone-free share via `Arc`.
@@ -43,7 +43,7 @@ enum Cmd {
 /// but not `Sync`, and `SemanticEmbedder: Send + Sync`); the lock is never held
 /// across the actual embedding work.
 pub struct LiteRtEmbedder {
-    tx: Mutex<mpsc::Sender<Cmd>>,
+    tx: Mutex<mpsc::SyncSender<Cmd>>,
 }
 
 impl LiteRtEmbedder {
@@ -60,7 +60,7 @@ impl LiteRtEmbedder {
         model_path: impl Into<String>,
         tokenizer_path: impl Into<String>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<Cmd>();
+        let (tx, rx) = mpsc::sync_channel::<Cmd>(super::EMBED_QUEUE_DEPTH);
         let lib_path = lib_path.into();
         let model_path = model_path.into();
         let tokenizer_path = tokenizer_path.into();
@@ -75,19 +75,11 @@ impl LiteRtEmbedder {
 #[async_trait]
 impl SemanticEmbedder for LiteRtEmbedder {
     async fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        let (rtx, rrx) = mpsc::channel();
-        {
-            let tx = self.tx.lock().ok()?;
-            if tx.send(Cmd::Embed(text.to_string(), rtx)).is_err() {
-                return None; // actor thread gone
-            }
-        }
-        // The actor replies on a std channel; do the blocking wait off the
-        // async runtime so a slow forward pass never stalls a worker.
-        tokio::task::spawn_blocking(move || rrx.recv().ok().flatten())
-            .await
-            .ok()
-            .flatten()
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        // Full queue or a gone actor: "unavailable" (lexical fallback). The
+        // reply is awaited directly -- no blocking-pool thread per caller.
+        super::enqueue(&self.tx, Cmd::Embed(text.to_string(), rtx))?;
+        rrx.await.ok().flatten()
     }
 }
 
@@ -173,6 +165,9 @@ fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc:
 
     tracing::info!(model = %model_path, gpu = tried_gpu, "litert embedder ready");
     for Cmd::Embed(text, reply) in rx.iter() {
+        if reply.is_closed() {
+            continue; // the caller gave up; skip the work
+        }
         let t0 = std::time::Instant::now();
         let v = embed_once(&mut it, &tok, &text);
         tracing::debug!(

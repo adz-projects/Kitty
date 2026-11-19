@@ -16,6 +16,50 @@
 //! (Android), and loaded by path. That is what removes the entire cmake / NDK /
 //! Vulkan build surface `local-engine` carried.
 
+/// Embedding requests allowed to wait for an embedder's single actor thread.
+///
+/// Several apps' recalls, ingests and learn passes all feed one thread, and
+/// the queue used to be unbounded: when they outran it, the backlog of
+/// request texts grew without limit while each caller pinned a blocking-pool
+/// thread to wait. Past this depth a request is answered "unavailable" at
+/// once, which every caller already handles with its lexical fallback.
+#[cfg(feature = "litert-embed")]
+const EMBED_QUEUE_DEPTH: usize = 128;
+
+/// Queue `cmd` for an embedder actor, or `None` when the queue is full or the
+/// actor is gone.
+#[cfg(feature = "litert-embed")]
+fn enqueue<T>(tx: &std::sync::Mutex<std::sync::mpsc::SyncSender<T>>, cmd: T) -> Option<()> {
+    use std::sync::mpsc::TrySendError;
+    match tx.lock().ok()?.try_send(cmd) {
+        Ok(()) => Some(()),
+        Err(TrySendError::Full(_)) => {
+            tracing::warn!("embedder queue full ({EMBED_QUEUE_DEPTH}); answering unavailable");
+            None
+        }
+        Err(TrySendError::Disconnected(_)) => None,
+    }
+}
+
+#[cfg(all(test, feature = "litert-embed"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_queue_refuses_instead_of_growing() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(EMBED_QUEUE_DEPTH);
+        let tx = std::sync::Mutex::new(tx);
+        for i in 0..EMBED_QUEUE_DEPTH {
+            assert!(enqueue(&tx, i).is_some());
+        }
+        assert!(enqueue(&tx, 999).is_none(), "the queue must stay bounded");
+        drop(rx);
+        let (tx2, rx2) = std::sync::mpsc::sync_channel::<usize>(1);
+        drop(rx2);
+        assert!(enqueue(&std::sync::Mutex::new(tx2), 1).is_none(), "a gone actor is unavailable");
+    }
+}
+
 #[cfg(feature = "litert-embed")]
 pub mod embedder;
 

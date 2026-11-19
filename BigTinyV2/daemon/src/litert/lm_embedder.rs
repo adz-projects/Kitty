@@ -238,11 +238,11 @@ impl Drop for Engine {
     }
 }
 
-struct Cmd(String, mpsc::Sender<Option<Vec<f32>>>);
+struct Cmd(String, tokio::sync::oneshot::Sender<Option<Vec<f32>>>);
 
 /// Handle to the LiteRT-LM embedding actor thread.
 pub struct LiteRtLmEmbedder {
-    tx: Mutex<mpsc::Sender<Cmd>>,
+    tx: Mutex<mpsc::SyncSender<Cmd>>,
 }
 
 impl LiteRtLmEmbedder {
@@ -252,7 +252,7 @@ impl LiteRtLmEmbedder {
     /// on the thread answers every request with `None`, which callers treat
     /// as "embedder unavailable" (lexical fallback), never as an error.
     pub fn spawn(lib_path: impl Into<String>, model_path: impl Into<String>) -> Self {
-        let (tx, rx) = mpsc::channel::<Cmd>();
+        let (tx, rx) = mpsc::sync_channel::<Cmd>(super::EMBED_QUEUE_DEPTH);
         let (lib_path, model_path) = (lib_path.into(), model_path.into());
         thread::Builder::new()
             .name("litert-lm-embed".into())
@@ -265,17 +265,11 @@ impl LiteRtLmEmbedder {
 #[async_trait]
 impl SemanticEmbedder for LiteRtLmEmbedder {
     async fn embed(&self, text: &str) -> Option<Vec<f32>> {
-        let (rtx, rrx) = mpsc::channel();
-        {
-            let tx = self.tx.lock().ok()?;
-            if tx.send(Cmd(text.to_string(), rtx)).is_err() {
-                return None; // actor thread gone
-            }
-        }
-        tokio::task::spawn_blocking(move || rrx.recv().ok().flatten())
-            .await
-            .ok()
-            .flatten()
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        // Full queue or a gone actor: "unavailable", which every caller
+        // already handles (lexical fallback). See `super::EMBED_QUEUE_DEPTH`.
+        super::enqueue(&self.tx, Cmd(text.to_string(), rtx))?;
+        rrx.await.ok().flatten()
     }
 }
 
@@ -294,6 +288,9 @@ fn actor(lib_path: &str, model_path: &str, rx: mpsc::Receiver<Cmd>) {
         }
     };
     for Cmd(text, reply) in rx.iter() {
+        if reply.is_closed() {
+            continue; // the caller gave up (a recall timeout); skip the work
+        }
         let trimmed = text.trim();
         if trimmed.is_empty() {
             let _ = reply.send(Some(Vec::new()));
