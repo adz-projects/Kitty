@@ -165,6 +165,19 @@ binaries still match their source (CI runs it). Full detail in
   **bot challenge** under concurrent load with an HTTP 202, which reads as an
   empty page unless detected. `plugins/kitty-web/src/ratelimit.rs` paces the
   scraped engines process-wide.
+
+  The scraper climbs a ladder when a page gives little: the page's own
+  embedded data (framework state, JSON-LD, `<noscript>`; `embedded.rs`), then
+  its AMP / WordPress REST / feed version, then — for a block, an error page
+  or a dead site, never a paywall or login — the Wayback Machine's snapshot,
+  labelled with its date (`alternates.rs`). All of it runs inside one ~27 s
+  budget so the call stays under the engine's tool timeout. Every page also
+  reports the document files it links or hides (`discover.rs`:
+  `citation_pdf_url`, file links, URLs in scripts and data attributes,
+  lead-form redirects) as `document_candidates`, and
+  `lean_web_find_document` searches for a gated report by title as a file.
+  No headless browser: a page that only renders client-side from an API it
+  calls at runtime still comes back `SCRAPE_EMPTY`.
 - **`kitty-wasm`** — same pattern. 4 tools running Python or any WASI module
   in a wasmtime sandbox with time/memory ceilings, no network, and no
   filesystem beyond explicit mounts. Its CPython guest is bundled on Windows;

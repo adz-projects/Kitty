@@ -163,6 +163,7 @@ pub fn researcher() -> Specialist {
             "lean_web_search",
             "lean_web_search_read_chunk",
             "lean_web_scrape",
+            "lean_web_find_document",
         ],
         answer_schema(props(vec![
             (

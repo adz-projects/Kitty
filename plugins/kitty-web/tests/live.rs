@@ -250,3 +250,46 @@ async fn live_scrape_reports_http_errors_structurally() {
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "SCRAPE_HTTP_ERROR");
 }
+
+/// Scrapes each URL in `KITTY_WEB_LIVE_URLS` (space-separated) and prints a
+/// summary — for checking the JavaScript and gate fallbacks against real
+/// sites by hand.
+#[tokio::test]
+#[ignore = "hits the live network"]
+async fn live_scrape_urls_from_env() {
+    let urls = std::env::var("KITTY_WEB_LIVE_URLS").unwrap_or_default();
+    for url in urls.split_whitespace() {
+        let started = std::time::Instant::now();
+        let out =
+            kitty_web::scrape::web_scrape(url, None, "markdown", 0, Some(600), false, false).await;
+        let v: Value = serde_json::from_str(&out).expect("valid JSON envelope");
+        let data = v["data"].as_str().unwrap_or("");
+        eprintln!(
+            "\n== {url} ({:.1}s)\nstatus={} code={} source={} extracted_from={} total={} message={}\ndocs={}\n{}",
+            started.elapsed().as_secs_f32(),
+            v["status"],
+            v["error_code"],
+            v["metadata"]["source"],
+            v["metadata"]["extracted_from"],
+            v["metadata"]["char_count_total"],
+            v["message"],
+            v["metadata"]["document_candidates"]
+                .as_array()
+                .or(v["document_candidates"].as_array())
+                .map(|a| a.iter().take(4).map(|d| d["url"].to_string()).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
+            data.chars().take(300).collect::<String>(),
+        );
+    }
+}
+
+/// `lean_web_find_document` for the title in `KITTY_WEB_LIVE_DOC`.
+#[tokio::test]
+#[ignore = "hits the live network"]
+async fn live_find_document_from_env() {
+    let Ok(title) = std::env::var("KITTY_WEB_LIVE_DOC") else {
+        return;
+    };
+    let out = kitty_web::docfind::find_document(&title, None, None).await;
+    eprintln!("{out}");
+}

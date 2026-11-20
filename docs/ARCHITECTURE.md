@@ -192,8 +192,12 @@ binaries match their source.
   document handles, image reading — plus 4 visualization tools (table, SVG,
   chart, Mermaid) behind their own toggle.
 - **`kitty-web`**: `lean_web_search`, `lean_web_search_read_chunk`,
-  `lean_web_scrape`. DuckDuckGo and Bing together by default (language and
-  country honoured on both); Brave when a key is configured.
+  `lean_web_scrape`, `lean_web_find_document`. DuckDuckGo and Bing together
+  by default (language and country honoured on both); Brave when a key is
+  configured. The scraper reads a JavaScript page's embedded data
+  (`embedded.rs`), falls back to its AMP/WordPress/feed version or the Wayback
+  Machine (`alternates.rs`), and lists the document files a page links or
+  hides (`discover.rs`).
 - **`kitty-wasm`**: 4 tools running Python or any WASI module in a wasmtime
   sandbox.
 

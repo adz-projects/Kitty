@@ -1658,3 +1658,55 @@ the turn's last answer. After a resume, cards are rebuilt from replayed tool
 calls whose path is inside `outputs/` (so a shell-only output has a card live
 but not after a resume), hidden if the entry is gone, and never flag the drawer.
 Descriptions are the file-type label and size, computed locally.
+
+## kitty-web reads JavaScript pages and finds gated documents
+
+`lean_web_scrape` used to give up on two kinds of page that hold their content
+in reach: a page that renders client-side, and a report page that asks for an
+email address before showing its PDF. Both are mostly answerable without a
+browser.
+
+- **Embedded data** (`embedded.rs`). When the DOM extraction is empty or under
+  500 chars, the page's own data is read instead if it carries more than twice
+  as much: JSON-LD `articleBody`, the `<noscript>` fallback, and every JSON
+  value in its scripts (`__NEXT_DATA__`, `__NUXT_DATA__`, Angular `ng-state`,
+  `window.__X__ = {…}`, `JSON.parse("…")`), walked generically with a prose
+  test rather than one parser per framework. `metadata.extracted_from` says
+  which.
+- **Root choice.** The extractor took the *first* `<article>`, which on many
+  sites is a related-story card (weforum.org: 231 chars of a 12K-char page).
+  It now takes the match with the most visible text, and moves on to the next,
+  wider root when that is still thin.
+- **Alternate versions and the archive** (`alternates.rs`). A thin page is
+  retried as its WordPress REST record, AMP page or feed entry. A 403/404/410/
+  429/451/5xx, an unreachable site, a bot check or an error page — never a
+  401/402 or a page the check calls a paywall — is retried from the Wayback
+  Machine: `GET https://archive.org/wayback/available?url=…` →
+  `archived_snapshots.closest.{available,status,timestamp}`, then the raw
+  snapshot `https://web.archive.org/web/{timestamp}id_/{url}` (the `id_` form
+  serves the page as archived, without the toolbar or rewritten links). The
+  result carries `metadata.source = "wayback"`, `snapshot_date`, and a message
+  saying it is an archived copy that may be out of date. The page's URL is
+  sent to archive.org only in these failure cases.
+- **HTTP 202 with an empty page is a bot check** (AWS WAF on imdb.com, the same
+  shape DuckDuckGo uses), not `SCRAPE_EMPTY`.
+- **Time budget.** Fallbacks run only inside 27 s from the start of the call
+  (10 s per fetch, none started with under 3 s left), under the engine's 30 s
+  tool timeout. The page's own fetch keeps its 30 s timeout, so a page that is
+  slow on its own still leaves no room for a fallback.
+- **Document candidates** (`discover.rs`). Every page reports up to 8 files it
+  points at — `citation_pdf_url`, links to pdf/docx/xlsx/csv, URLs in scripts
+  and data attributes, and lead-form redirect targets (`redirectUrl`,
+  `followupUrl`, `retURL`, …) — under `metadata.document_candidates` on a
+  success, or top-level `document_candidates` on an error (a gated page the
+  check calls a paywall still names its PDF).
+- **`lean_web_find_document(title, publisher?, file_type?)`**, a new tool
+  (the researcher specialist is allowed it): searches `"title" filetype:pdf`
+  and the plain title, ranks direct file links first by title overlap, and
+  collapses one file served with different query strings.
+- **SSRF fix.** The 192.0.0.0/24 reservation was checked as a `/16`, which
+  refused all of 192.0.0.0/16 — including WordPress VIP (192.0.64.0/18), where
+  pewresearch.org and many news sites live.
+
+Not covered: a page that renders only from an API it calls at runtime
+(data.census.gov) still returns `SCRAPE_EMPTY`; that needs a headless browser.

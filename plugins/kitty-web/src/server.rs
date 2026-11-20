@@ -1,4 +1,4 @@
-//! rmcp server exposing the three web tools.
+//! rmcp server exposing the web tools.
 //!
 //! Tool names are byte-identical to `kitty_docs_web.py`'s registrations —
 //! adaptive-pathway keys learned routing preferences on the literal name
@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::config::InProcessConfig;
 use crate::envelope::error_response;
-use crate::{scrape, search};
+use crate::{docfind, scrape, search};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WebSearchRequest {
@@ -65,6 +65,16 @@ pub struct WebScrapeRequest {
     pub include_links: Option<bool>,
     /// Favor precision over recall in body extraction. Default favors recall.
     pub favor_precision: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDocumentRequest {
+    /// The document's title, as exactly as you know it.
+    pub title: String,
+    /// Optional publisher or author organization, to narrow the search.
+    pub publisher: Option<String>,
+    /// File type to look for: "pdf" (default), "docx", "xlsx", "xls" or "csv".
+    pub file_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +194,7 @@ impl KittyWebServer {
 
     #[tool(
         name = "lean_web_scrape",
-        description = "Scrapes a URL into clean Markdown (or plain text) for an LLM to read. offset and the response's metadata.next_offset page through long pages by markdown block, without severing a table or heading mid-cut. A URL that returns a document or text file rather than a page (pdf, docx, xlsx, xls, csv, tsv, txt, md, json, xml, yaml, toml, log) is downloaded to the cache and its local path is returned as cached_path, along with a file_type and a hint naming the reader to call on it next (lean_pdf_read_text, lean_word_read_text, lean_excel_inspect, or lean_file_read). Types nothing can read (archives, executables, media) are still refused. favor_precision=True favors precision over recall; the default favors recall, since documentation/API-reference pages often lose sidebars and short definition blocks under the precision-favoring mode."
+        description = "Scrapes a URL into clean Markdown (or plain text) for an LLM to read. offset and the response's metadata.next_offset page through long pages by markdown block, without severing a table or heading mid-cut. A page whose content is loaded by JavaScript is read from the data it ships (framework state, JSON-LD, noscript; metadata.extracted_from says which), or from its AMP, WordPress API or feed version (metadata.source). A blocked, broken or vanished page may be answered from the Wayback Machine; the message then gives the snapshot date. Document files the page links or hides (e.g. a report behind an email form) are listed in document_candidates. A URL that returns a document or text file rather than a page (pdf, docx, xlsx, xls, csv, tsv, txt, md, json, xml, yaml, toml, log) is downloaded to the cache and its local path is returned as cached_path, along with a file_type and a hint naming the reader to call on it next (lean_pdf_read_text, lean_word_read_text, lean_excel_inspect, or lean_file_read). Types nothing can read (archives, executables, media) are still refused. favor_precision=True favors precision over recall; the default favors recall, since documentation/API-reference pages often lose sidebars and short definition blocks under the precision-favoring mode."
     )]
     pub async fn web_scrape(&self, Parameters(req): Parameters<WebScrapeRequest>) -> String {
         guarded_async(scrape::web_scrape(
@@ -195,6 +205,22 @@ impl KittyWebServer {
             req.max_chars.map(|c| c as usize),
             req.include_links.unwrap_or(false),
             req.favor_precision.unwrap_or(false),
+        ))
+        .await
+    }
+
+    #[tool(
+        name = "lean_web_find_document",
+        description = "Finds a named report, paper or dataset as a downloadable file, by searching for its title as a file (\"title\" filetype:pdf) and as a plain query. Use it when a page gates a document behind an email form or login, or the link you have is dead: the same file is often published elsewhere (the publisher's CDN, a repository, a press kit). Results are ranked direct file links first, by how much of the title they match; download one with lean_web_scrape. A copy found elsewhere can be a different edition, so check it."
+    )]
+    pub async fn web_find_document(
+        &self,
+        Parameters(req): Parameters<FindDocumentRequest>,
+    ) -> String {
+        guarded_async(docfind::find_document(
+            &req.title,
+            req.publisher.as_deref(),
+            req.file_type.as_deref(),
         ))
         .await
     }
@@ -224,13 +250,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_surface_is_exactly_the_three_web_tools() {
+    fn tool_surface_is_exactly_the_web_tools() {
         // Pinned deliberately: these names are what adaptive-pathway's
         // learned routing is keyed on, and what `kitty_docs_web.py`
         // registered. Adding a tool here is fine; renaming one is not.
         assert_eq!(
             KittyWebServer::new().tool_names(),
             vec![
+                "lean_web_find_document".to_string(),
                 "lean_web_scrape".to_string(),
                 "lean_web_search".to_string(),
                 "lean_web_search_read_chunk".to_string(),

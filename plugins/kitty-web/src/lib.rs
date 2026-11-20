@@ -12,8 +12,12 @@
 //! Python originals, so this is a drop-in swap from the model's point of
 //! view — see `server.rs` and `envelope.rs` for why both are load-bearing.
 
+pub mod alternates;
 pub mod config;
 pub mod decider;
+pub mod discover;
+pub mod docfind;
+pub mod embedded;
 pub mod envelope;
 pub mod paths;
 pub mod query_filter;

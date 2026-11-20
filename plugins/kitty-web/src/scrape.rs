@@ -281,16 +281,28 @@ pub fn extract_markdown(
         &CONTENT_SELECTORS
     };
 
+    // Within a selector the element with the most visible text wins: the
+    // first `<article>` on a page is as often a related-story card as the
+    // story. A root that comes out thin does not end the search either — the
+    // next, wider selector is tried, and the fullest result kept.
+    let visible_len = |el: scraper::ElementRef| -> usize {
+        el.descendants()
+            .filter(|n| !excluded.contains(&n.id()))
+            .filter_map(|n| n.value().as_text().map(|t| t.trim().len()))
+            .sum()
+    };
+    let mut best: Option<(String, usize)> = None;
     for candidate in roots {
         let Ok(sel) = Selector::parse(candidate) else {
             continue;
         };
-        let Some(root) = document.select(&sel).next() else {
+        let Some(root) = document
+            .select(&sel)
+            .filter(|el| !excluded.contains(&el.id()))
+            .max_by_key(|el| visible_len(*el))
+        else {
             continue;
         };
-        if excluded.contains(&root.id()) {
-            continue;
-        }
         let cleaned_html = serialize_without(root, &excluded);
         let converter = htmd::HtmlToMarkdown::builder()
             .skip_tags(vec!["script", "style", "noscript"])
@@ -299,16 +311,51 @@ pub fn extract_markdown(
             continue;
         };
         let md = md.trim();
-        if !md.is_empty() {
-            let md = if include_links {
-                md.to_string()
-            } else {
-                strip_markdown_links(md)
-            };
+        if md.is_empty() {
+            continue;
+        }
+        let md = if include_links {
+            md.to_string()
+        } else {
+            strip_markdown_links(md)
+        };
+        let len = markdown_to_text(&md).chars().count();
+        if len >= crate::embedded::THIN_TEXT_CHARS {
             return Some((md, meta));
         }
+        if best.as_ref().is_none_or(|(_, b)| len > *b) {
+            best = Some((md, len));
+        }
     }
-    None
+    best.map(|(md, _)| (md, meta))
+}
+
+/// The page's content as Markdown, with where it came from: `html` (the
+/// DOM extraction above), or — when that is empty or thin — the page's
+/// embedded data (`json-ld`, `noscript`, `script-data`; see `embedded.rs`)
+/// if that carries clearly more.
+pub fn extract_page(
+    html: &str,
+    favor_precision: bool,
+    include_links: bool,
+) -> Option<(String, PageMeta, &'static str)> {
+    use crate::embedded::{extract_embedded, plain_len, THIN_TEXT_CHARS};
+
+    let dom = extract_markdown(html, favor_precision, include_links);
+    let dom_len = dom.as_ref().map_or(0, |(md, _)| plain_len(md));
+    if dom_len >= THIN_TEXT_CHARS {
+        return dom.map(|(md, meta)| (md, meta, "html"));
+    }
+    if let Some(found) = extract_embedded(html, include_links) {
+        if plain_len(&found.markdown) > dom_len.saturating_mul(2) {
+            let meta = match dom {
+                Some((_, meta)) => meta,
+                None => extract_metadata(&scraper::Html::parse_document(html)),
+            };
+            return Some((found.markdown, meta, found.source));
+        }
+    }
+    dom.map(|(md, meta)| (md, meta, "html"))
 }
 
 fn collect_subtree(el: scraper::ElementRef, out: &mut std::collections::HashSet<ego_tree::NodeId>) {
@@ -700,6 +747,28 @@ fn ssrf_blocked(reason: &str) -> String {
     )
 }
 
+/// How a scrape is to be rendered — the tool's parameters past the URL.
+#[derive(Debug, Clone)]
+pub struct ScrapeOpts {
+    pub query: Option<String>,
+    pub output_format: String,
+    pub offset: usize,
+    pub max_chars: Option<usize>,
+    pub include_links: bool,
+    pub favor_precision: bool,
+}
+
+/// The whole call's time budget. The engine gives an MCP tool call 30 s;
+/// the fallbacks (alternate versions, the archive) only run in whatever is
+/// left of this after the page itself, so a slow site never turns into a
+/// tool timeout.
+const SCRAPE_BUDGET: Duration = Duration::from_secs(27);
+
+/// Per-request cap for a fallback fetch, and the least time worth starting
+/// one with.
+const FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
+const FALLBACK_MIN: Duration = Duration::from_secs(3);
+
 #[allow(clippy::too_many_arguments)]
 pub async fn web_scrape(
     url: &str,
@@ -710,39 +779,175 @@ pub async fn web_scrape(
     include_links: bool,
     favor_precision: bool,
 ) -> String {
-    let stripped_url = url.split('?').next().unwrap_or(url);
-    let stripped_url = stripped_url.split('#').next().unwrap_or(stripped_url);
+    let opts = ScrapeOpts {
+        query: query.map(str::to_string),
+        output_format: output_format.to_string(),
+        offset,
+        max_chars,
+        include_links,
+        favor_precision,
+    };
+    let deadline = tokio::time::Instant::now() + SCRAPE_BUDGET;
 
     // SSRF guard (audit #109): the URL is model-supplied, so the scheme and
     // the host's resolved IPs are validated before any request goes out, and
-    // again on every redirect hop via the custom policy below.
-    // `spawn_blocking` keeps the blocking DNS lookup off the reactor.
-    let parsed_url = match url::Url::parse(url) {
-        Ok(u) => u,
+    // again on every redirect hop via the client's policy.
+    if let Err(envelope) = check_target(url).await {
+        return envelope;
+    }
+    let client = match scrape_client() {
+        Ok(c) => c,
         Err(e) => {
             return error_response(
                 "SCRAPE_NETWORK_ERROR",
-                "Failed to communicate with the server.",
-                Some(&format!("invalid URL: {e}")),
-                Some("Check the URL's spelling and scheme."),
+                "Failed to build the HTTP client.",
+                Some(&e),
+                Some("Check host connectivity, or try a different URL."),
             );
         }
     };
-    let check_target = parsed_url.clone();
-    match crate::config::spawn_blocking(move || crate::ssrf::check_url(&check_target)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(reason)) => return ssrf_blocked(&reason),
-        Err(e) => {
+
+    let response = match send(&client, url, None).await {
+        Ok(r) => r,
+        Err(SendError::Blocked(reason)) => return ssrf_blocked(&reason),
+        Err(SendError::Timeout(detail)) => {
             return error_response(
-                "SCRAPE_NETWORK_ERROR",
-                "Failed to validate the URL.",
-                Some(&e.to_string()),
-                Some("Retry the request."),
+                "SCRAPE_TIMEOUT",
+                "Request timed out.",
+                Some(&format!("{url}: {detail}")),
+                Some("The server is slow or unreachable. Try again or use lean_web_search for a similar page."),
             );
+        }
+        Err(SendError::Network(detail)) => {
+            let failed = error_response(
+                "SCRAPE_NETWORK_ERROR",
+                "Failed to communicate with the server.",
+                Some(&format!("{url}: {detail}")),
+                Some("Check host connectivity, or try a different URL."),
+            );
+            // A site that no longer resolves or answers may still be in the
+            // archive.
+            return match from_archive(
+                &client,
+                url,
+                &opts,
+                deadline,
+                "the site could not be reached",
+            )
+            .await
+            {
+                Some(archived) => archived,
+                None => failed,
+            };
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        // A 403/429/503 is often a bot challenge rather than a real refusal;
+        // when the page check can tell, say so instead of a bare status.
+        let failed = match check_failed_page(response, url).await {
+            Some(checked) => checked,
+            None => error_response(
+                "SCRAPE_HTTP_ERROR",
+                &format!("HTTP {} fetching URL.", status.as_u16()),
+                Some(&format!("{url}: HTTP {status}")),
+                Some(
+                    "The page may be behind a login wall, blocked, or deleted. Try \
+                     lean_web_search for an alternative source.",
+                ),
+            ),
+        };
+        // Gone, refused or broken: an archived copy is worth a look. A login
+        // or paywall is not (401/402, or the page check said so) — that is
+        // the publisher's access decision, not a fault.
+        let archivable = matches!(status.as_u16(), 403 | 404 | 410 | 429 | 451 | 500..=599)
+            && !matches!(error_code(&failed).as_deref(), Some("SCRAPE_PAYWALL"));
+        if archivable {
+            let why = format!("the live page answered HTTP {}", status.as_u16());
+            if let Some(archived) = from_archive(&client, url, &opts, deadline, &why).await {
+                return archived;
+            }
+        }
+        return failed;
+    }
+
+    let (mut out, page) = read_response(response, url, &opts, None).await;
+    let Some(page) = page else {
+        // A download, or a response that could not be read as a page.
+        return out;
+    };
+
+    // A 202 with nothing in it is a bot check (AWS WAF and DuckDuckGo both
+    // answer that way), not an empty page — say so, which also makes the
+    // archive worth a try.
+    if status.as_u16() == 202 && error_code(&out).as_deref() == Some("SCRAPE_EMPTY") {
+        if let Some(challenge) = relabel(crate::decider::PageKind::Challenge, url) {
+            out = challenge;
+        }
+    } else if opts.offset == 0 {
+        out = check_rendered_page(out, url, &page.html_head).await;
+    }
+
+    // The page gave little or nothing: try a script-free version of the same
+    // content, then (for a block or an error page) the archive.
+    let code = error_code(&out);
+    let fallback_worthy = matches!(
+        code.as_deref(),
+        Some("SCRAPE_EMPTY" | "SCRAPE_CHALLENGE" | "SCRAPE_ERROR_PAGE")
+    ) || thin_success(&out);
+    if fallback_worthy {
+        let have = success_len(&out);
+        if let Some(alt) = from_alternates(&client, url, &page.links, &opts, deadline, have).await {
+            out = alt;
+        } else if matches!(
+            code.as_deref(),
+            Some("SCRAPE_CHALLENGE" | "SCRAPE_ERROR_PAGE")
+        ) {
+            let why = if code.as_deref() == Some("SCRAPE_CHALLENGE") {
+                "the live page answered with a bot check"
+            } else {
+                "the live page is an error page"
+            };
+            if let Some(archived) = from_archive(&client, url, &opts, deadline, why).await {
+                out = archived;
+            }
         }
     }
 
-    let client = match reqwest::Client::builder()
+    if opts.offset == 0 {
+        out = attach_documents(out, &page.links.documents);
+    }
+    out
+}
+
+/// The SSRF check on a URL about to be fetched, as the error envelope a
+/// rejection becomes. `spawn_blocking` keeps the DNS lookup off the reactor.
+async fn check_target(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| {
+        error_response(
+            "SCRAPE_NETWORK_ERROR",
+            "Failed to communicate with the server.",
+            Some(&format!("invalid URL: {e}")),
+            Some("Check the URL's spelling and scheme."),
+        )
+    })?;
+    match crate::config::spawn_blocking(move || crate::ssrf::check_url(&parsed)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(reason)) => Err(ssrf_blocked(&reason)),
+        Err(e) => Err(error_response(
+            "SCRAPE_NETWORK_ERROR",
+            "Failed to validate the URL.",
+            Some(&e.to_string()),
+            Some("Retry the request."),
+        )),
+    }
+}
+
+/// The scraper's HTTP client: every redirect hop re-validated against the
+/// SSRF policy.
+fn scrape_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -763,71 +968,67 @@ pub async fn web_scrape(
             }
         }))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return error_response(
-                "SCRAPE_NETWORK_ERROR",
-                "Failed to build the HTTP client.",
-                Some(&e.to_string()),
-                Some("Check host connectivity, or try a different URL."),
-            );
-        }
-    };
+        .map_err(|e| e.to_string())
+}
 
-    let response = match client
+enum SendError {
+    /// The redirect policy refused a hop (or the hop cap fired).
+    Blocked(String),
+    Timeout(String),
+    Network(String),
+}
+
+/// GET `url` the way a browser would ask for a page. `timeout` overrides the
+/// client's for one request (the fallbacks run on what is left of the
+/// budget).
+async fn send(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response, SendError> {
+    let mut req = client
         .get(url)
         .header("User-Agent", SCRAPE_USER_AGENT)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.5",
         )
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            if e.is_redirect() {
-                // The custom policy rejected a redirect target (or the hop
-                // cap fired): same verdict shape as a blocked initial URL.
-                return ssrf_blocked(&e.to_string());
-            }
-            if e.is_timeout() {
-                return error_response(
-                    "SCRAPE_TIMEOUT",
-                    "Request timed out.",
-                    Some(&format!("{url}: {e}")),
-                    Some("The server is slow or unreachable. Try again or use lean_web_search for a similar page."),
-                );
-            }
-            return error_response(
-                "SCRAPE_NETWORK_ERROR",
-                "Failed to communicate with the server.",
-                Some(&format!("{url}: {e}")),
-                Some("Check host connectivity, or try a different URL."),
-            );
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        // A 403/429/503 is often a bot challenge rather than a real refusal;
-        // when the page check can tell, say so instead of a bare status.
-        if let Some(checked) = check_failed_page(response, url).await {
-            return checked;
-        }
-        return error_response(
-            "SCRAPE_HTTP_ERROR",
-            &format!("HTTP {} fetching URL.", status.as_u16()),
-            Some(&format!("{url}: HTTP {status}")),
-            Some(
-                "The page may be behind a login wall, blocked, or deleted. Try \
-                 lean_web_search for an alternative source.",
-            ),
-        );
+        .header("Accept-Language", "en-US,en;q=0.9");
+    if let Some(t) = timeout {
+        req = req.timeout(t);
     }
+    req.send().await.map_err(|e| {
+        if e.is_redirect() {
+            SendError::Blocked(e.to_string())
+        } else if e.is_timeout() {
+            SendError::Timeout(e.to_string())
+        } else {
+            SendError::Network(e.to_string())
+        }
+    })
+}
 
+/// What a page read leaves for the steps after rendering.
+struct PageRead {
+    /// The opening of the HTML, for the page check.
+    html_head: String,
+    links: crate::discover::PageLinks,
+}
+
+/// Turn a successful response into the tool's envelope: a document is
+/// downloaded to the cache; an HTML page is rendered (and its links
+/// discovered, returned as `Some`). `url` is what the caller asked for — it
+/// names the cached file and fills `metadata.url`. `link_base` resolves the
+/// page's relative links when the response's own URL is the wrong base (an
+/// archived snapshot's links belong to the original site).
+async fn read_response(
+    response: reqwest::Response,
+    url: &str,
+    opts: &ScrapeOpts,
+    link_base: Option<&str>,
+) -> (String, Option<PageRead>) {
+    let stripped_url = url.split('?').next().unwrap_or(url);
+    let stripped_url = stripped_url.split('#').next().unwrap_or(stripped_url);
     let final_url = response.url().to_string();
     let content_type = response
         .headers()
@@ -840,70 +1041,20 @@ pub async fn web_scrape(
         .trim()
         .to_lowercase();
 
-    // Generalized from a PDF-only special case — see `download_kind`.
-    if let Some(kind) = download_kind(stripped_url, &content_type) {
-        let bytes = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
-            Ok(b) => b,
-            Err(BodyReadError::TooLarge) => {
-                return error_response(
-                    "SCRAPE_TOO_LARGE",
-                    &format!(
-                        "The response body exceeded the {} MiB download cap.",
-                        SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
-                    ),
-                    Some(url),
-                    Some(
-                        "The file is larger than this tool will buffer; fetch a smaller \
-                          artifact, or a paged/partial endpoint if the host offers one.",
-                    ),
-                );
-            }
-            Err(BodyReadError::Network(e)) => {
-                return error_response(
-                    "SCRAPE_NETWORK_ERROR",
-                    "Failed to download the response body.",
-                    Some(&format!("{url}: {e}")),
-                    Some("Check host connectivity, or try a different URL."),
-                );
-            }
-        };
-        let dir = cache_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return error_response(
-                "SCRAPE_NETWORK_ERROR",
-                "Could not create the cache directory for the downloaded file.",
-                Some(&e.to_string()),
-                Some("Check filesystem permissions for the user cache directory."),
-            );
+    // Generalized from a PDF-only special case — see `download_kind`. The
+    // final URL counts too: a gate or download link that redirects to
+    // `…/report.pdf` served as octet-stream is still a PDF.
+    let final_stripped = final_url.split(['?', '#']).next().unwrap_or(&final_url);
+    let kind = download_kind(stripped_url, &content_type).or_else(|| {
+        if content_type.starts_with("text/html") || content_type.starts_with("application/xhtml") {
+            None
+        } else {
+            download_kind(final_stripped, "")
         }
-        let file_path = dir.join(download_cache_filename_for(stripped_url, kind.ext));
-        if let Err(e) = std::fs::write(&file_path, &bytes) {
-            return error_response(
-                "SCRAPE_NETWORK_ERROR",
-                "Could not write the downloaded file to cache.",
-                Some(&e.to_string()),
-                Some("Check filesystem permissions for the user cache directory."),
-            );
-        }
-        return success_response(
-            json!({
-                "cached_path": file_path.to_string_lossy(),
-                "url": url,
-                "content_type": content_type,
-                "file_type": kind.ext,
-                "bytes": bytes.len(),
-            }),
-            // The source URL is named here, not just in `data.url`: a turn
-            // that downloads two documents gets two `cached_path`s and one
-            // sentence to tell them apart by, and a model reading only the
-            // message has otherwise no way to know which file is which. (A
-            // real transcript shows one concluding, wrongly, that the second
-            // download had overwritten the first.)
-            Some(&format!(
-                "{url} is a {} file, not an HTML page; downloaded to cache. {}",
-                kind.ext, kind.hint
-            )),
-            false,
+    });
+    if let Some(kind) = kind {
+        return (
+            save_download(response, url, stripped_url, &content_type, kind).await,
             None,
         );
     }
@@ -914,38 +1065,47 @@ pub async fn web_scrape(
         } else {
             &content_type
         };
-        return error_response(
-            "SCRAPE_UNSUPPORTED_CONTENT_TYPE",
-            &format!("URL did not return an HTML page (Content-Type: {shown})."),
-            Some(url),
-            Some(
-                "This tool scrapes HTML pages, and downloads document/text types \
-                 (pdf, docx, xlsx, csv, txt, md, json, xml, yaml) to the cache for \
-                 the lean_*_read tools. This type is neither, so there is nothing \
-                 that could read it — look for an HTML or document version instead.",
+        return (
+            error_response(
+                "SCRAPE_UNSUPPORTED_CONTENT_TYPE",
+                &format!("URL did not return an HTML page (Content-Type: {shown})."),
+                Some(url),
+                Some(
+                    "This tool scrapes HTML pages, and downloads document/text types \
+                     (pdf, docx, xlsx, csv, txt, md, json, xml, yaml) to the cache for \
+                     the lean_*_read tools. This type is neither, so there is nothing \
+                     that could read it — look for an HTML or document version instead.",
+                ),
             ),
+            None,
         );
     }
 
     let html = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(BodyReadError::TooLarge) => {
-            return error_response(
-                "SCRAPE_TOO_LARGE",
-                &format!(
-                    "The response body exceeded the {} MiB download cap.",
-                    SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
+            return (
+                error_response(
+                    "SCRAPE_TOO_LARGE",
+                    &format!(
+                        "The response body exceeded the {} MiB download cap.",
+                        SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
+                    ),
+                    Some(url),
+                    Some("Fetch a smaller page, or page through a lighter endpoint."),
                 ),
-                Some(url),
-                Some("Fetch a smaller page, or page through a lighter endpoint."),
+                None,
             );
         }
         Err(BodyReadError::Network(e)) => {
-            return error_response(
-                "SCRAPE_NETWORK_ERROR",
-                "Failed to read the response body.",
-                Some(&format!("{url}: {e}")),
-                Some("Check host connectivity, or try a different URL."),
+            return (
+                error_response(
+                    "SCRAPE_NETWORK_ERROR",
+                    "Failed to read the response body.",
+                    Some(&format!("{url}: {e}")),
+                    Some("Check host connectivity, or try a different URL."),
+                ),
+                None,
             );
         }
     };
@@ -956,36 +1116,387 @@ pub async fn web_scrape(
 
     // Extraction/serialization is CPU-bound DOM work — keep it off the
     // reactor (audit #113). Owned copies cross the thread boundary.
-    let (url_owned, query_owned, format_owned) = (
-        url.to_string(),
-        query.map(str::to_string),
-        output_format.to_string(),
-    );
+    let (url_owned, opts_owned) = (url.to_string(), opts.clone());
+    let base = link_base.unwrap_or(&final_url).to_string();
     let rendered = crate::config::spawn_blocking(move || {
-        render_scrape_result(
+        let links = crate::discover::discover(&html, &base);
+        let out = render_scrape_result(
             &html,
             &url_owned,
             &final_url,
             &content_type,
-            query_owned.as_deref(),
-            &format_owned,
-            offset,
-            max_chars,
-            include_links,
-            favor_precision,
-        )
+            opts_owned.query.as_deref(),
+            &opts_owned.output_format,
+            opts_owned.offset,
+            opts_owned.max_chars,
+            opts_owned.include_links,
+            opts_owned.favor_precision,
+        );
+        (out, links)
     })
     .await;
     match rendered {
-        Ok(s) if offset == 0 => check_rendered_page(s, url, &html_head).await,
-        Ok(s) => s,
-        Err(e) => error_response(
-            "INTERNAL_PANIC",
-            "An internal error occurred while processing this request.",
-            Some(&e.to_string()),
-            Some("Retry with a different URL; if this persists, the page's markup may be hitting a parser edge case."),
+        Ok((out, links)) => (out, Some(PageRead { html_head, links })),
+        Err(e) => (
+            error_response(
+                "INTERNAL_PANIC",
+                "An internal error occurred while processing this request.",
+                Some(&e.to_string()),
+                Some("Retry with a different URL; if this persists, the page's markup may be hitting a parser edge case."),
+            ),
+            None,
         ),
     }
+}
+
+/// Save a document response to the cache and say where it went.
+async fn save_download(
+    response: reqwest::Response,
+    url: &str,
+    stripped_url: &str,
+    content_type: &str,
+    kind: DownloadKind,
+) -> String {
+    let bytes = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => {
+            return error_response(
+                "SCRAPE_TOO_LARGE",
+                &format!(
+                    "The response body exceeded the {} MiB download cap.",
+                    SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
+                ),
+                Some(url),
+                Some(
+                    "The file is larger than this tool will buffer; fetch a smaller \
+                      artifact, or a paged/partial endpoint if the host offers one.",
+                ),
+            );
+        }
+        Err(BodyReadError::Network(e)) => {
+            return error_response(
+                "SCRAPE_NETWORK_ERROR",
+                "Failed to download the response body.",
+                Some(&format!("{url}: {e}")),
+                Some("Check host connectivity, or try a different URL."),
+            );
+        }
+    };
+    let dir = cache_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return error_response(
+            "SCRAPE_NETWORK_ERROR",
+            "Could not create the cache directory for the downloaded file.",
+            Some(&e.to_string()),
+            Some("Check filesystem permissions for the user cache directory."),
+        );
+    }
+    let file_path = dir.join(download_cache_filename_for(stripped_url, kind.ext));
+    if let Err(e) = std::fs::write(&file_path, &bytes) {
+        return error_response(
+            "SCRAPE_NETWORK_ERROR",
+            "Could not write the downloaded file to cache.",
+            Some(&e.to_string()),
+            Some("Check filesystem permissions for the user cache directory."),
+        );
+    }
+    success_response(
+        json!({
+            "cached_path": file_path.to_string_lossy(),
+            "url": url,
+            "content_type": content_type,
+            "file_type": kind.ext,
+            "bytes": bytes.len(),
+        }),
+        // The source URL is named here, not just in `data.url`: a turn
+        // that downloads two documents gets two `cached_path`s and one
+        // sentence to tell them apart by, and a model reading only the
+        // message has otherwise no way to know which file is which. (A
+        // real transcript shows one concluding, wrongly, that the second
+        // download had overwritten the first.)
+        Some(&format!(
+            "{url} is a {} file, not an HTML page; downloaded to cache. {}",
+            kind.ext, kind.hint
+        )),
+        false,
+        None,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Fallbacks: alternate versions and the archive
+// ---------------------------------------------------------------------------
+
+/// Time left for one more fallback fetch, or `None` when too little remains.
+fn fallback_timeout(deadline: tokio::time::Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    (left >= FALLBACK_MIN).then(|| left.min(FALLBACK_TIMEOUT))
+}
+
+/// Fetch a fallback URL (SSRF-checked like any other) and return its body as
+/// text, if it answered 2xx within the budget.
+async fn fetch_text(
+    client: &reqwest::Client,
+    url: &str,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    let timeout = fallback_timeout(deadline)?;
+    check_target(url).await.ok()?;
+    let response = send(client, url, Some(timeout)).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = read_body_capped(response, SCRAPE_MAX_BODY_BYTES)
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The page's content from a script-free version of it — its WordPress REST
+/// record, its AMP page, or its entry in the site's feed — when one renders
+/// to clearly more than the page itself gave (`have` plain-text chars).
+async fn from_alternates(
+    client: &reqwest::Client,
+    url: &str,
+    links: &crate::discover::PageLinks,
+    opts: &ScrapeOpts,
+    deadline: tokio::time::Instant,
+    have: usize,
+) -> Option<String> {
+    let good_enough = |envelope: &str| {
+        let n = success_len(envelope);
+        n >= 300 && n * 2 > have * 3
+    };
+
+    if let Some(api) = &links.wp_json {
+        if let Some(body) = fetch_text(client, api, deadline).await {
+            if let Some(html) = crate::alternates::wordpress_html(&body) {
+                let out = render_alternate(&html, url, api, opts).await;
+                if good_enough(&out) {
+                    return Some(mark_source(out, "wordpress_api", api, None));
+                }
+            }
+        }
+    }
+    if let Some(amp) = &links.amp {
+        if let Some(html) = fetch_text(client, amp, deadline).await {
+            let out = render_alternate(&html, url, amp, opts).await;
+            if good_enough(&out) {
+                return Some(mark_source(out, "amp", amp, None));
+            }
+        }
+    }
+    for feed in &links.feeds {
+        if let Some(xml) = fetch_text(client, feed, deadline).await {
+            if let Some(html) = crate::alternates::feed_entry_html(&xml, url) {
+                let out = render_alternate(&html, url, feed, opts).await;
+                if good_enough(&out) {
+                    return Some(mark_source(out, "feed", feed, None));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn render_alternate(html: &str, url: &str, source_url: &str, opts: &ScrapeOpts) -> String {
+    let (html, url, source_url, opts) = (
+        html.to_string(),
+        url.to_string(),
+        source_url.to_string(),
+        opts.clone(),
+    );
+    crate::config::spawn_blocking(move || {
+        render_scrape_result(
+            &html,
+            &url,
+            &source_url,
+            "text/html",
+            opts.query.as_deref(),
+            &opts.output_format,
+            opts.offset,
+            opts.max_chars,
+            opts.include_links,
+            opts.favor_precision,
+        )
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The Wayback Machine's closest snapshot of `url`, read like the page
+/// itself (a document snapshot is downloaded). `why` says what was wrong
+/// with the live page; the result's message names the snapshot's date, so
+/// the model knows it is reading an archived and possibly stale copy.
+async fn from_archive(
+    client: &reqwest::Client,
+    url: &str,
+    opts: &ScrapeOpts,
+    deadline: tokio::time::Instant,
+    why: &str,
+) -> Option<String> {
+    let api = url::Url::parse_with_params("https://archive.org/wayback/available", &[("url", url)])
+        .ok()?;
+    let body = fetch_text(client, api.as_str(), deadline).await?;
+    let (snapshot, timestamp) = crate::alternates::wayback_snapshot(&body, url)?;
+
+    let timeout = fallback_timeout(deadline)?;
+    check_target(&snapshot).await.ok()?;
+    let response = send(client, &snapshot, Some(timeout)).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let (out, page) = read_response(response, url, opts, Some(url)).await;
+    if error_code(&out).is_some() {
+        return None;
+    }
+    let date = crate::alternates::wayback_date(&timestamp);
+    let note =
+        format!("Archived copy from {date} (Wayback Machine): {why}. It may be out of date.");
+    let out = mark_source(out, "wayback", &snapshot, Some((&note, &date)));
+    Some(match page {
+        Some(page) if opts.offset == 0 => attach_documents(out, &page.links.documents),
+        _ => out,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Envelope helpers
+// ---------------------------------------------------------------------------
+
+/// An envelope's `error_code`, or `None` for a success.
+fn error_code(envelope: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(envelope).ok()?;
+    (v.get("status").and_then(Value::as_str) == Some("error"))
+        .then(|| {
+            v.get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten()
+}
+
+/// Plain-text chars a success carries in all (`char_count_total`, else what
+/// it returned); 0 for an error.
+fn success_len(envelope: &str) -> usize {
+    let Ok(v) = serde_json::from_str::<Value>(envelope) else {
+        return 0;
+    };
+    if v.get("status").and_then(Value::as_str) != Some("success") {
+        return 0;
+    }
+    v.pointer("/metadata/char_count_total")
+        .or_else(|| v.pointer("/metadata/char_count_returned"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+/// A success whose whole page held almost nothing (an HTML shell with a
+/// title and a cookie notice).
+fn thin_success(envelope: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(envelope) else {
+        return false;
+    };
+    v.get("status").and_then(Value::as_str) == Some("success")
+        && v.pointer("/metadata/cached_path").is_none()
+        && v.pointer("/metadata/char_count_total")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| (n as usize) < crate::embedded::THIN_TEXT_CHARS)
+}
+
+/// Record where a fallback's content came from: `metadata.source` and
+/// `metadata.source_url`, plus (for an archived copy) a message and the
+/// snapshot date. A download envelope has no metadata; one is added.
+fn mark_source(
+    envelope: String,
+    source: &str,
+    source_url: &str,
+    note: Option<(&str, &str)>,
+) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(&envelope) else {
+        return envelope;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return envelope;
+    };
+    let meta = obj
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("source".into(), json!(source));
+        meta.insert("source_url".into(), json!(source_url));
+        if let Some((_, date)) = note {
+            meta.insert("snapshot_date".into(), json!(date));
+        }
+    }
+    if let Some((message, _)) = note {
+        let combined = match obj.get("message").and_then(Value::as_str) {
+            Some(existing) if !existing.is_empty() => format!("{message} {existing}"),
+            _ => message.to_string(),
+        };
+        obj.insert("message".into(), json!(combined));
+    }
+    serde_json::to_string_pretty(&v).unwrap_or(envelope)
+}
+
+/// Put the page's document candidates on its envelope: under `metadata` on
+/// a success, at the top level on an error (an email-gated report page that
+/// the page check called a paywall still names its PDF), with a line telling
+/// the model what to do with them.
+fn attach_documents(envelope: String, documents: &[crate::discover::DocCandidate]) -> String {
+    if documents.is_empty() {
+        return envelope;
+    }
+    let Ok(mut v) = serde_json::from_str::<Value>(&envelope) else {
+        return envelope;
+    };
+    let list: Vec<Value> = documents
+        .iter()
+        .map(|d| {
+            json!({
+                "url": d.url,
+                "label": d.label,
+                "file_type": d.file_type,
+                "found_in": d.source,
+            })
+        })
+        .collect();
+    let direct = documents.iter().filter(|d| d.file_type.is_some()).count();
+    let line = if direct > 0 {
+        format!(
+            "The page links {direct} document file(s) (document_candidates); pass one's url to \
+             lean_web_scrape to download it."
+        )
+    } else {
+        "The page names where its form leads (document_candidates); that page may hold the \
+         download link."
+            .to_string()
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return envelope;
+    };
+    let is_error = obj.get("status").and_then(Value::as_str) == Some("error");
+    if is_error {
+        obj.insert("document_candidates".into(), Value::Array(list));
+        let hint = match obj.get("hint").and_then(Value::as_str) {
+            Some(h) if !h.is_empty() => format!("{line} {h}"),
+            _ => line,
+        };
+        obj.insert("hint".into(), json!(hint));
+    } else {
+        let meta = obj
+            .entry("metadata")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert("document_candidates".into(), Value::Array(list));
+        }
+        let message = match obj.get("message").and_then(Value::as_str) {
+            Some(m) if !m.is_empty() => format!("{m} {line}"),
+            _ => line,
+        };
+        obj.insert("message".into(), json!(message));
+    }
+    serde_json::to_string_pretty(&v).unwrap_or(envelope)
 }
 
 /// How much raw HTML the page check keeps for a page that extracted to
@@ -1121,7 +1632,9 @@ pub fn render_scrape_result(
 ) -> String {
     let text_mode = output_format.eq_ignore_ascii_case("text");
 
-    let Some((body_md, page_meta)) = extract_markdown(html, favor_precision, include_links) else {
+    let Some((body_md, page_meta, extracted_from)) =
+        extract_page(html, favor_precision, include_links)
+    else {
         return error_response(
             "SCRAPE_EMPTY",
             "No extractable body content found.",
@@ -1155,6 +1668,9 @@ pub fn render_scrape_result(
     base_meta.insert("sitename".into(), json!(page_meta.sitename));
     base_meta.insert("date".into(), json!(page_meta.date));
     base_meta.insert("content_type".into(), json!(content_type));
+    if extracted_from != "html" {
+        base_meta.insert("extracted_from".into(), json!(extracted_from));
+    }
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
         let result = filter_by_query(&blocks, Some(q), 50, offset);
@@ -1864,5 +2380,156 @@ mod tests {
             !data.contains('#'),
             "heading marker stripped in text mode: {data}"
         );
+    }
+
+    const SPA_PARA: &str = "The harbour authority reported that container volumes rose for the \
+        third straight quarter, driven by new transshipment contracts. Analysts expect the \
+        trend to continue as two additional berths open next spring.";
+
+    #[test]
+    fn a_javascript_shell_is_read_from_its_embedded_state() {
+        let state = serde_json::json!({"page": {"title": "Volumes rise", "body": SPA_PARA}});
+        let html = format!(
+            "<html><head><title>Ports</title></head><body><div id=root>Loading…</div>\
+             <script>window.__INITIAL_STATE__ = {state};</script></body></html>"
+        );
+        let out = render_scrape_result(
+            &html,
+            "https://p.org/a",
+            "https://p.org/a",
+            "text/html",
+            None,
+            "markdown",
+            0,
+            None,
+            false,
+            false,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "success", "{out}");
+        assert_eq!(v["metadata"]["extracted_from"], "script-data");
+        assert_eq!(v["metadata"]["title"], "Ports");
+        assert!(v["data"].as_str().unwrap().contains("transshipment"));
+    }
+
+    #[test]
+    fn a_full_dom_extraction_is_not_replaced_by_embedded_data() {
+        let body = format!("<p>{SPA_PARA}</p>").repeat(4);
+        let state = serde_json::json!({"teaser": "Something else entirely, written as a sentence that is long enough to count as prose for the walker."});
+        let html = format!(
+            "<html><body><article>{body}</article><script>window.s = {state};</script></body></html>"
+        );
+        let out = render_scrape_result(
+            &html,
+            "u",
+            "u",
+            "text/html",
+            None,
+            "markdown",
+            0,
+            None,
+            false,
+            false,
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["metadata"].get("extracted_from").is_none(), "{out}");
+        assert!(!v["data"].as_str().unwrap().contains("Something else"));
+    }
+
+    #[test]
+    fn document_candidates_land_in_metadata_or_on_the_error() {
+        let docs = vec![crate::discover::DocCandidate {
+            url: "https://p.org/r.pdf".into(),
+            label: "Report".into(),
+            source: "link",
+            file_type: Some("pdf"),
+        }];
+        let ok = attach_documents(success_response(json!("x"), None, false, None), &docs);
+        let v: Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(
+            v["metadata"]["document_candidates"][0]["url"],
+            "https://p.org/r.pdf"
+        );
+        assert!(v["message"].as_str().unwrap().contains("lean_web_scrape"));
+
+        let err = attach_documents(
+            error_response(
+                "SCRAPE_PAYWALL",
+                "Paywalled.",
+                None,
+                Some("Look elsewhere."),
+            ),
+            &docs,
+        );
+        let v: Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["document_candidates"][0]["file_type"], "pdf");
+        assert!(v["hint"].as_str().unwrap().ends_with("Look elsewhere."));
+
+        let none = success_response(json!("x"), None, false, None);
+        assert_eq!(attach_documents(none.clone(), &[]), none);
+    }
+
+    #[test]
+    fn an_archived_copy_says_so_and_when() {
+        let out = mark_source(
+            success_response(json!("x"), None, false, Some(json!({"url": "u"}))),
+            "wayback",
+            "https://web.archive.org/web/2024id_/u",
+            Some(("Archived copy from 2024-01-31.", "2024-01-31")),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["metadata"]["source"], "wayback");
+        assert_eq!(v["metadata"]["snapshot_date"], "2024-01-31");
+        assert_eq!(v["metadata"]["url"], "u");
+        assert!(v["message"].as_str().unwrap().starts_with("Archived copy"));
+    }
+
+    #[test]
+    fn thinness_and_lengths_read_from_the_envelope() {
+        let thin = success_response(
+            json!("x"),
+            None,
+            false,
+            Some(json!({"char_count_total": 120})),
+        );
+        let full = success_response(
+            json!("x"),
+            None,
+            false,
+            Some(json!({"char_count_total": 5000})),
+        );
+        let err = error_response("SCRAPE_EMPTY", "e", None, None);
+        assert!(thin_success(&thin));
+        assert!(!thin_success(&full));
+        assert!(!thin_success(&err));
+        assert_eq!(success_len(&full), 5000);
+        assert_eq!(success_len(&err), 0);
+        assert_eq!(error_code(&err).as_deref(), Some("SCRAPE_EMPTY"));
+        assert_eq!(error_code(&full), None);
+    }
+
+    #[test]
+    fn the_fullest_article_wins_over_a_leading_card() {
+        let story = format!("<p>{SPA_PARA}</p>").repeat(3);
+        let html = format!(
+            "<html><body><article><h3>Related: last year's report</h3><p>Short card.</p></article>\
+             <article><h1>Volumes rise</h1>{story}</article></body></html>"
+        );
+        let (md, _) = extract_markdown(&html, false, false).unwrap();
+        assert!(md.contains("Volumes rise"), "{md}");
+        assert!(!md.contains("Short card"), "{md}");
+    }
+
+    #[test]
+    fn a_thin_article_gives_way_to_a_fuller_main() {
+        let story = format!("<p>{SPA_PARA}</p>").repeat(3);
+        let html = format!(
+            "<html><body><main><section>{story}</section>\
+             <aside><article><p>Card.</p></article></aside>\
+             <div><article><p>Another small card, but outside the aside.</p></article></div></main></body></html>"
+        );
+        let (md, _) = extract_markdown(&html, false, false).unwrap();
+        assert!(md.contains("transshipment"), "{md}");
     }
 }

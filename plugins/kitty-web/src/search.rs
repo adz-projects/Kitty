@@ -1407,7 +1407,7 @@ async fn coequal_search(
 /// co-equal pair (DuckDuckGo + Bing) only as a failure fallback.
 /// `InvalidQuery` is a caller error and propagates directly rather than
 /// triggering a fallback.
-async fn normal_search(
+pub(crate) async fn normal_search(
     query: &str,
     count: usize,
     locale: Locale<'_>,
