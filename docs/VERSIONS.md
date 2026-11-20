@@ -102,6 +102,10 @@ additive; API version stays 2:
 | replay kept 512 events / 4 MiB per turn, 10 minutes after the turn ends | `/stream` rejoin; `/history` is the record beyond it |
 | Windows memory ceiling (half of RAM, ≥ 4 GiB; `BIGTINYV2_MEMORY_LIMIT_MB`, `0` = off) and size-rotated `daemon.log` | A runaway engine exits instead of starving the machine |
 
+Daemon **2.6.1** (Kitty 1.0.12): the builtin `researcher` specialist's
+`tool_allow` gains `lean_web_find_document`. No route changed; API version
+stays 2.
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
