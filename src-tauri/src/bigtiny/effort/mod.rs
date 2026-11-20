@@ -49,17 +49,17 @@ fn now_unix() -> i64 {
 }
 
 fn card_model(cfg: &Config, card_id: &str) -> Option<String> {
-    let p = cfg.providers.iter().find(|p| p.id == card_id)?;
-    Some(p.models.first().cloned().unwrap_or_default())
+    Some(cfg.card(card_id)?.model().to_string())
 }
 
 fn snapshot(cfg: &Config, card_id: &str) -> Option<CardSnapshot> {
-    let p = cfg.providers.iter().find(|p| p.id == card_id)?;
+    let p = cfg.card(card_id)?;
     Some(CardSnapshot {
         id: p.id.clone(),
         provider_type: p.provider_type.clone(),
         base_url: p.base_url.clone(),
-        model: p.models.first().cloned().unwrap_or_default(),
+        model: p.model().to_string(),
+        secret_account: p.secret_account().to_string(),
     })
 }
 
@@ -290,7 +290,7 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
             .map(|c| c.entries.clone())
             .unwrap_or_default()
     };
-    let api_key = crate::config::providers::get_secret_async(&card.id).await;
+    let api_key = crate::config::providers::get_secret_async(&card.secret_account).await;
     let found = match detect::detect(card, &catalog, api_key.as_deref()).await {
         Detection::Found(c) => c,
         Detection::Unknown => {
@@ -386,16 +386,13 @@ pub async fn detect_all(app: &AppHandle, only_missing: bool) {
     let ids: Vec<String> = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        cfg.providers
-            .iter()
+        cfg.cards()
+            .into_iter()
             .filter(|p| p.is_usable())
             .filter(|p| {
-                !only_missing || {
-                    let model = p.models.first().cloned().unwrap_or_default();
-                    !cfg.effort_caps.contains_key(&effort_key(&p.id, &model))
-                }
+                !only_missing || !cfg.effort_caps.contains_key(&effort_key(&p.id, p.model()))
             })
-            .map(|p| p.id.clone())
+            .map(|p| p.id)
             .collect()
     };
     for id in ids {
@@ -420,10 +417,8 @@ pub fn on_effort_rejected(app: &AppHandle, session_id: &str) {
                 c.stale = true;
             }
             let _ = crate::config::save(&cfg);
-            cfg.providers
-                .iter()
-                .find(|p| p.id == card)
-                .map(|p| p.name.clone())
+            cfg.card(&card)
+                .map(|p| p.name)
                 .unwrap_or_else(|| model.clone())
         };
         if detect_card(&app, &card).await {

@@ -75,8 +75,8 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
         let cfg = state.config.lock().unwrap();
         cfg.active_provider_id
             .as_deref()
-            .and_then(|id| cfg.providers.iter().find(|p| p.id == id && p.is_usable()))
-            .cloned()
+            .and_then(|id| cfg.card(id))
+            .filter(|p| p.is_usable())
     };
     let (provider, model) = match &card {
         Some(p) => (Some(p.id.clone()), p.models.first().cloned()),
@@ -243,12 +243,9 @@ pub async fn branch_to_provider(
     let card = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        cfg.providers
-            .iter()
-            .find(|p| p.id == provider_id && p.is_usable())
-            .cloned()
+        cfg.card(&provider_id).filter(|p| p.is_usable())
     }
-    .ok_or("That provider can't be used; choose another.")?;
+    .ok_or("That model can't be used; choose another.")?;
     crate::config::providers::test_connection(&card)
         .await
         .map_err(|e| format!("Can't switch to {} — {e}", card.name))?;

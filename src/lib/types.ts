@@ -220,7 +220,6 @@ export interface ProviderProfile {
   name: string;
   provider_type: ProviderType;
   base_url: string;
-  models: string[];
   is_trusted: boolean;
   /** Whether this provider may host specialist runs: `"preferred"`,
       `"allowed"` (the default when absent) or `"never"`. The first thing the
@@ -248,9 +247,22 @@ export interface ProviderProfile {
       self-hosted providers (see presence_penalty). */
   max_tokens: number | null;
   context_length: number | null;
-  /** Manual override that widens image support beyond name-based detection
-      (see `vision_models.ts` and the Rust field's doc comment). */
+  /** On a model card: the user marked its model as reading images, which
+      widens image support beyond name-based detection (see
+      `vision_models.ts`). Always false on a stored provider. */
   supports_vision: boolean;
+  /** Every model the provider listed (a card: its one model). */
+  models: string[];
+  /** The models the user checked: the ones in Kitty's model list. */
+  enabled_models: string[];
+  /** Each model's card id (`model -> id`). Assigned by the backend. */
+  model_ids: Record<string, string>;
+  /** Models marked as reading images (for models the catalog does not know). */
+  vision_models: string[];
+  /** Each model's known context window. */
+  context_lengths: Record<string, number>;
+  /** On a model card only: the provider it belongs to. */
+  provider_id?: string | null;
   /** Custom system prompt; `null` = the built-in default. Applied by the
       backend as the session's persona when a chat is created on (or moved
       to) this card, so scheduled runs get it too. */
@@ -277,11 +289,50 @@ export interface ProviderProfile {
   created_at: string;
 }
 
-/** ProviderProfile flattened + derived fields (mirrors Rust ProviderView). */
+/** A provider's model, described from OpenRouter's catalog
+    (`ai_models/mod.rs`). Lists arrive already ranked: intelligence less
+    age. */
+export interface ModelInfo {
+  provider_id: string;
+  provider_name: string;
+  provider_type: string;
+  model: string;
+  /** The model's card id, once it has one. */
+  card_id: string | null;
+  name: string;
+  /** Checked: in the user's model list. */
+  enabled: boolean;
+  vision: boolean;
+  in_catalog: boolean;
+  created: number | null;
+  /** $ per million output tokens. */
+  price_out_per_m: number | null;
+  /** $ per million input tokens. */
+  price_in_per_m: number | null;
+  /** '$' ≤ $3, '$$' ≤ $8, '$$$' above (per million output tokens). */
+  price_tier: '$' | '$$' | '$$$' | 'free' | null;
+  intelligence: number | null;
+  context_length: number | null;
+}
+
+/** A provider as Settings → Providers shows it (mirrors Rust
+    `ProviderAccountView`): every listed model, described and ranked. */
+export interface ProviderAccountView extends ProviderProfile {
+  network_tier: NetworkTier;
+  has_secret: boolean;
+  requires_key: boolean;
+  model_infos: ModelInfo[];
+}
+
+/** One checked model as a card (mirrors Rust ProviderView): an entry of the
+    user's model list. `name` is the model id; `info.name` the readable
+    name; `info.provider_name` its provider's. */
 export interface ProviderView extends ProviderProfile {
   network_tier: NetworkTier;
   has_secret: boolean;
+  /** The default model for new chats. */
   active: boolean;
+  info: ModelInfo;
   /** Resolved image support: the manual `supports_vision` override, else what
       the backend discovered from the provider itself (Ollama's `/api/show`
       `capabilities`, OpenRouter's `architecture.input_modalities`) and
@@ -333,28 +384,6 @@ export interface OpenRouterCredits {
   usage: number;
   is_free_tier: boolean;
   [key: string]: unknown;
-}
-
-/** Simplified cost badge shown in the model picker instead of a raw
-    $/M-token number — bucketed by percentile against the live OpenRouter
-    catalog (mirrors Rust `CostTier`), not a fixed dollar table. */
-export type CostTier = 'premium' | 'moderate' | 'economy';
-
-/** One selectable row in the provider-add model picker (mirrors Rust
-    `ModelPickerEntry`, `src-tauri/src/commands/provider.rs`). `matched:
-    false` means this model came straight from the vendor's own /v1/models
-    (the key really does grant access to it) but didn't cross-reference
-    against the cached OpenRouter catalog — cost/capability/age are all
-    `null` in that case, never fabricated. */
-export interface ModelPickerEntry {
-  id: string;
-  name: string;
-  cost_tier: CostTier | null;
-  capability_score: number | null;
-  price_rank: number | null;
-  created: number | null;
-  context_length: number | null;
-  matched: boolean;
 }
 
 /** A file attached to a chat (Round-2 item 13): UTF-8 text, or a base64 data URL. */

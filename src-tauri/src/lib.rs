@@ -4,6 +4,7 @@
 //! lifecycle, config, tray, and the global hotkey. All I/O lives here; the
 //! webview only talks to us through the commands registered below.
 
+mod ai_models;
 #[cfg(target_os = "android")]
 mod android;
 mod approvals;
@@ -270,7 +271,9 @@ pub fn run() {
             commands::list_providers,
             commands::upsert_provider,
             commands::delete_provider,
-            commands::duplicate_provider,
+            commands::list_provider_accounts,
+            ai_models::describe_provider_models,
+            ai_models::defaults::suggest_provider_model,
             commands::activate_provider,
             commands::set_session_provider,
             commands::test_active_provider_connection,
@@ -279,7 +282,6 @@ pub fn run() {
             commands::custom_openai_context_length,
             commands::openrouter_credits,
             commands::discover_provider_models,
-            commands::discover_provider_models_for_saved,
             commands::list_local_models,
             commands::get_models_disk_free,
             commands::delete_local_model,

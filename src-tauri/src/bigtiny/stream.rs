@@ -178,8 +178,9 @@ fn send_refusal(status: reqwest::StatusCode, body: &str) -> StreamFailure {
     // chats generating at once. Nothing is wrong; one has to finish first.
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return StreamFailure {
-            message: "Too many chats are generating at once. Wait for one to finish, then send again."
-                .to_string(),
+            message:
+                "Too many chats are generating at once. Wait for one to finish, then send again."
+                    .to_string(),
             error_type: Some("app_turn_limit"),
         };
     }
@@ -651,7 +652,7 @@ async fn session_card(
     };
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap();
-    cfg.providers.iter().find(|p| p.id == provider).cloned()
+    cfg.card(&provider)
 }
 
 /// The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.

@@ -209,9 +209,10 @@ pub fn start_stack(app: &AppHandle) {
         // Publishes `Ready` on every exit path from this task, including a
         // panic — see `StartupPhaseGuard`.
         let _phase = StartupPhaseGuard { app: app.clone() };
-        // Before anything reads the provider list: one card, one model, and
-        // no card of a retired type left as the default.
-        crate::config::providers::migrate_multi_model_profiles(&app).await;
+        // Before anything reads the provider list: cards of one service
+        // merged into one provider, and no card of a retired type left as
+        // the default.
+        crate::config::providers::migrate_merge_providers(&app).await;
         {
             let state = app.state::<AppState>();
             let mut cfg = state.config.lock().unwrap();

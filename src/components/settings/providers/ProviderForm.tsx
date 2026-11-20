@@ -1,23 +1,58 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Modal } from '@/components/shared/Modal';
-import type { ModelPickerEntry, ProviderProfile, ProviderType } from '@/lib/types';
+import type { ModelInfo, ProviderProfile, ProviderType } from '@/lib/types';
 import { TrustBadge } from '@/lib/provider_trust';
 import { LockIcon } from '@/components/icons/LockIcon';
 import { GlobeIcon } from '@/components/icons/GlobeIcon';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
 import { ipc } from '@/lib/ipc';
-import { ModelPicker } from './ModelPicker';
+import { modelTitle, priceHint } from '@/lib/models';
 import {
+  CTX_DETENTS,
   canSaveProvider,
   ctxLabel,
-  detentsFor,
+  hasFixedEndpoint,
+  initialChecks,
   isLocal,
   nearestCtxIndex,
-  suggestContextLength,
   tierOf,
-  usesModelPicker,
 } from './providerUtils';
 import { isAndroid } from '@/lib/platform';
+
+/** The service's own name, offered as a new provider's name. */
+const TYPE_NAME: Partial<Record<ProviderType, string>> = {
+  openrouter: 'OpenRouter',
+  anthropic: 'Anthropic',
+  openai: 'OpenAI',
+  fireworks: 'Fireworks',
+  deepinfra: 'DeepInfra',
+  ollama: 'Ollama',
+};
+
+/** A ticked box: check every listed model. */
+function CheckAllIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" strokeWidth="1.4" />
+      <path
+        d="M5 8.2l2 2 4-4.4"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** An empty box: uncheck every listed model. */
+function UncheckAllIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" strokeWidth="1.4" />
+    </svg>
+  );
+}
 
 /** Where an API key actually lives — the OS store differs per platform. */
 const SECRET_STORE_NOTE = isAndroid()
@@ -64,70 +99,143 @@ export function ProviderForm({
     }
   };
 
-  // Context-length auto-suggest (Round-6 Feature 1) — re-resolves whenever the
-  // provider type or selected model changes; never applied automatically, only
-  // offered (see the suggestion row below the slider).
-  const [suggested, setSuggested] = useState<number | null>(null);
-  const modelsKey = profile.models.join(',');
-  useEffect(() => {
-    let live = true;
-    setSuggested(null);
-    // Debounced: modelsKey changes on every keystroke in the Models field, and
-    // suggestContextLength hits a live backend lookup — without this, typing
-    // one model name fires a round-trip per character.
-    const timer = setTimeout(() => {
-      void suggestContextLength(profile).then((v) => live && setSuggested(v));
-    }, 400);
-    return () => {
-      live = false;
-      clearTimeout(timer);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile.provider_type, profile.base_url, modelsKey]);
-  const detents = detentsFor(suggested);
+  const detents = CTX_DETENTS;
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  // Provider-add redesign: key-validate-then-pick-one-model flow for every
-  // type except local/custom_openai/ollama, which keep the original
-  // base-URL + free-text-models form untouched.
-  const showModelPicker = usesModelPicker(profile.provider_type);
-  const [modelOptions, setModelOptions] = useState<ModelPickerEntry[] | null>(null);
-  const [validating, setValidating] = useState(false);
-  const [validateError, setValidateError] = useState<string | null>(null);
+  // Hosted services sit at a fixed, well-known endpoint: no URL field.
+  const fixedEndpoint = hasFixedEndpoint(profile.provider_type);
 
-  // Switching type or editing the key invalidates whatever list was already
-  // loaded — it belonged to a different key/endpoint and would silently go
-  // stale otherwise.
+  // The model list: fetched from the provider, then described and ranked
+  // against OpenRouter's catalog (`ai_models`), with the price band of each.
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [described, setDescribed] = useState<ModelInfo[]>([]);
+  const [filter, setFilter] = useState('');
+  const [typedModel, setTypedModel] = useState('');
+  const modelList = profile.models.join('\n');
   useEffect(() => {
-    setModelOptions(null);
-    setValidateError(null);
-  }, [profile.provider_type, secret]);
+    let live = true;
+    if (profile.models.length === 0) {
+      setDescribed([]);
+      return;
+    }
+    // Marks left out, so `vision` below is what the catalog says on its own.
+    void ipc
+      .describeProviderModels({ ...profile, vision_models: [] })
+      .then((list) => live && setDescribed(list))
+      .catch(() => live && setDescribed([]));
+    return () => {
+      live = false;
+    };
+    // Only a new list (or provider) changes the descriptions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelList, profile.provider_type, profile.base_url]);
+  // A different service or key: the old list belonged to another endpoint.
+  useEffect(() => setFetchError(null), [profile.provider_type, secret]);
 
-  // A blank secret is only checkable when editing an already-saved profile
-  // (falls back to the keyring-backed variant below) — a brand-new profile
-  // has nothing to validate yet.
-  const canCheckKey = secret.trim().length > 0 || Boolean(profile.id);
-
-  const checkKey = async () => {
-    setValidating(true);
-    setValidateError(null);
+  const fetchModels = async () => {
+    setFetching(true);
+    setFetchError(null);
     try {
-      const result =
-        profile.id && !secret.trim()
-          ? await ipc.discoverProviderModelsForSaved(profile.id)
-          : await ipc.discoverProviderModels(profile.provider_type, profile.base_url, secret);
-      setModelOptions(result);
+      const list = await ipc.discoverProviderModels(
+        profile.provider_type,
+        profile.base_url,
+        profile.id || null,
+        secret.trim() || null
+      );
+      // Kept models still listed stay; a hand-typed model the server does
+      // not list stays too (it may serve models it does not advertise).
+      const typed = fixedEndpoint
+        ? []
+        : profile.models.filter((m) => !list.includes(m) && profile.enabled_models.includes(m));
+      const models = [...list, ...typed];
+      const suggested = await ipc
+        .suggestProviderModel({ ...profile, models, enabled_models: models })
+        .catch(() => null);
+      onChange({
+        ...profile,
+        models,
+        enabled_models: initialChecks(models, profile.enabled_models, suggested),
+        vision_models: profile.vision_models.filter((m) => models.includes(m)),
+      });
     } catch (e) {
-      setModelOptions(null);
-      setValidateError(String(e));
+      setFetchError(String(e));
     } finally {
-      setValidating(false);
+      setFetching(false);
     }
   };
 
-  // Save stays disabled until the picker has a selection, for the new-flow
-  // types (see `canSaveProvider`'s own doc comment).
-  const canSave = canSaveProvider(profile.models);
+  const addTypedModel = () => {
+    const m = typedModel.trim();
+    if (!m) return;
+    setTypedModel('');
+    if (profile.models.includes(m)) {
+      if (!profile.enabled_models.includes(m)) {
+        set({ enabled_models: [...profile.enabled_models, m] });
+      }
+      return;
+    }
+    set({ models: [...profile.models, m], enabled_models: [...profile.enabled_models, m] });
+  };
+
+  // Described models in rank order; anything not described yet (the
+  // description is a round trip behind) at the end, as its id.
+  const ranked = useMemo(() => {
+    const known = new Set(described.map((d) => d.model));
+    return [
+      ...described.filter((d) => profile.models.includes(d.model)),
+      ...profile.models
+        .filter((m) => !known.has(m))
+        .map((m): ModelInfo => ({
+          provider_id: profile.id,
+          provider_name: profile.name,
+          provider_type: profile.provider_type,
+          model: m,
+          card_id: null,
+          name: m,
+          enabled: true,
+          vision: false,
+          in_catalog: false,
+          created: null,
+          price_out_per_m: null,
+          price_in_per_m: null,
+          price_tier: null,
+          intelligence: null,
+          context_length: null,
+        })),
+    ];
+  }, [described, profile.models, profile.id, profile.name, profile.provider_type]);
+  const shown = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return ranked;
+    return ranked.filter(
+      (m) => m.name.toLowerCase().includes(q) || m.model.toLowerCase().includes(q)
+    );
+  }, [ranked, filter]);
+
+  const isOn = (model: string) => profile.enabled_models.includes(model);
+  const toggle = (model: string, on: boolean) =>
+    set({
+      enabled_models: on
+        ? [...profile.enabled_models, model]
+        : profile.enabled_models.filter((m) => m !== model),
+    });
+  // Check / uncheck every model the filter shows (all of them when empty).
+  const setAll = (on: boolean) => {
+    const ids = new Set(shown.map((m) => m.model));
+    const rest = profile.enabled_models.filter((m) => !ids.has(m));
+    set({ enabled_models: on ? [...rest, ...ids] : rest });
+  };
+  const markVision = (model: string, on: boolean) =>
+    set({
+      vision_models: on
+        ? [...profile.vision_models, model]
+        : profile.vision_models.filter((m) => m !== model),
+    });
+  const enabledCount = profile.models.filter(isOn).length;
+
+  // A provider is saved once at least one of its models is checked.
+  const canSave = canSaveProvider(profile);
 
   return (
     <Modal title={profile.id ? 'Edit provider' : 'Add provider'} onClose={onCancel}>
@@ -141,7 +249,17 @@ export function ProviderForm({
           value={profile.provider_type}
           onChange={(e) => {
             const pt = e.target.value as ProviderType;
-            set({ provider_type: pt, base_url: DEFAULT_URL[pt] });
+            // Another service: another model list. A name the user has not
+            // changed follows the service.
+            const followName = !profile.name || profile.name === TYPE_NAME[profile.provider_type];
+            set({
+              provider_type: pt,
+              base_url: DEFAULT_URL[pt],
+              name: followName ? (TYPE_NAME[pt] ?? '') : profile.name,
+              models: [],
+              enabled_models: [],
+              vision_models: [],
+            });
           }}
         >
           {/* Retired (decision #65): only shown so an old card still says
@@ -167,12 +285,10 @@ export function ProviderForm({
           )}
         </select>
       </label>
-      {/* Hidden for every model-picker-flow type (release-fixes-2: "no need
-          to show the base URLs for OpenRouter or any of the new
-          providers") — they're all fixed, well-known endpoints the user
-          never needs to see or edit. Still shown for local/ollama/
-          custom_openai, which genuinely need an editable endpoint. */}
-      {!showModelPicker && (
+      {/* Hosted services sit at fixed, well-known endpoints the user never
+          needs to see or edit. Still shown for local/ollama/custom_openai,
+          which genuinely need an editable endpoint. */}
+      {!fixedEndpoint && (
         <label className="field">
           <span>Base URL</span>
           <input value={profile.base_url} onChange={(e) => set({ base_url: e.target.value })} />
@@ -190,55 +306,7 @@ export function ProviderForm({
         </label>
       )}
 
-      {showModelPicker ? (
-        <>
-          <label className="field">
-            <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
-            <input type="password" value={secret} onChange={(e) => onSecret(e.target.value)} />
-            <small className="muted">{SECRET_STORE_NOTE}</small>
-          </label>
-          <div className="field">
-            <span>Model</span>
-            <div className="row">
-              <button
-                type="button"
-                onClick={() => void checkKey()}
-                disabled={!canCheckKey || validating}
-              >
-                {validating ? 'Checking…' : 'Check key & load models'}
-              </button>
-            </div>
-            {validateError && (
-              <small className="chat-error" role="alert">
-                {validateError}
-              </small>
-            )}
-            {modelOptions && (
-              <ModelPicker
-                models={modelOptions}
-                value={profile.models[0] ?? null}
-                onChange={(id) => set({ models: [id] })}
-              />
-            )}
-            {!modelOptions && !validateError && !validating && (
-              <small className="muted">Check your key to see available models.</small>
-            )}
-          </div>
-        </>
-      ) : (
-        <label className="field">
-          <span>Model</span>
-          <input
-            value={profile.models[0] ?? ''}
-            onChange={(e) => set({ models: e.target.value.trim() ? [e.target.value.trim()] : [] })}
-          />
-          <small className="muted">
-            One model per provider. To use another model here, duplicate this provider.
-          </small>
-        </label>
-      )}
-
-      {!showModelPicker && needsKey && (
+      {needsKey && (
         <label className="field">
           <span>
             API key{' '}
@@ -252,6 +320,137 @@ export function ProviderForm({
           <small className="muted">{SECRET_STORE_NOTE}</small>
         </label>
       )}
+
+      <div className="field">
+        <div className="model-list-head">
+          <span>
+            Models
+            {profile.models.length > 0 && (
+              <span className="muted">
+                {' '}
+                — {enabledCount} of {profile.models.length} checked
+              </span>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() => void fetchModels()}
+            disabled={fetching || (needsKey && !keyOptional && !secret.trim() && !profile.id)}
+          >
+            {fetching
+              ? 'Fetching…'
+              : profile.models.length
+                ? 'Fetch again'
+                : needsKey && !keyOptional
+                  ? 'Check key & fetch models'
+                  : 'Fetch models'}
+          </button>
+        </div>
+        {fetchError && (
+          <small className="chat-error" role="alert">
+            {fetchError}
+          </small>
+        )}
+        {profile.models.length === 0 ? (
+          <small className="muted">
+            Fetch the provider&apos;s models, then check the ones you want in Kitty&apos;s model
+            list.
+          </small>
+        ) : (
+          <>
+            <div className="row model-list-tools">
+              <input
+                type="search"
+                aria-label="Filter models"
+                placeholder="Filter models"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              />
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => setAll(true)}
+                aria-label={filter.trim() ? 'Check all shown models' : 'Check all models'}
+                title={filter.trim() ? 'Check all shown models' : 'Check all models'}
+              >
+                <CheckAllIcon />
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => setAll(false)}
+                aria-label={filter.trim() ? 'Uncheck all shown models' : 'Uncheck all models'}
+                title={filter.trim() ? 'Uncheck all shown models' : 'Uncheck all models'}
+              >
+                <UncheckAllIcon />
+              </button>
+            </div>
+            <ul className="model-checklist" aria-label="Models in Kitty's model list">
+              {shown.map((m) => {
+                const id = `prov-model-${m.model}`;
+                const marked = profile.vision_models.includes(m.model);
+                return (
+                  <li key={m.model}>
+                    <input
+                      id={id}
+                      type="checkbox"
+                      checked={isOn(m.model)}
+                      onChange={(e) => toggle(m.model, e.target.checked)}
+                    />
+                    <label htmlFor={id} className="model-name" title={modelTitle(m)}>
+                      {m.name}
+                      {m.name !== m.model && <span className="model-id">{m.model}</span>}
+                    </label>
+                    {m.price_tier && (
+                      <span className="price-tier" title={priceHint(m) ?? undefined}>
+                        {m.price_tier}
+                      </span>
+                    )}
+                    {m.vision ? (
+                      <span className="model-vision" title="This model reads images">
+                        vision
+                      </span>
+                    ) : (
+                      <label className="vision-mark" title="Mark if this model reads images">
+                        <input
+                          type="checkbox"
+                          checked={marked}
+                          onChange={(e) => markVision(m.model, e.target.checked)}
+                        />{' '}
+                        vision
+                      </label>
+                    )}
+                  </li>
+                );
+              })}
+              {shown.length === 0 && <li className="muted">No model matches the filter.</li>}
+            </ul>
+            <small className="muted">
+              Ordered by intelligence and how recent each model is. $ is up to $3 per million output
+              tokens, $$ up to $8, $$$ more.
+            </small>
+          </>
+        )}
+        {!fixedEndpoint && (
+          <div className="row model-list-tools">
+            <input
+              aria-label="Add a model by name"
+              placeholder="Add a model by name"
+              value={typedModel}
+              onChange={(e) => setTypedModel(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addTypedModel();
+                }
+              }}
+            />
+            <button type="button" onClick={addTypedModel} disabled={!typedModel.trim()}>
+              Add
+            </button>
+          </div>
+        )}
+      </div>
 
       <div className="row">
         <button type="button" onClick={() => void testConnection()} disabled={testing}>
@@ -320,7 +519,7 @@ export function ProviderForm({
       {advancedOpen && (
         <div className="provider-advanced-body">
           <label className="field">
-            <span>Can this model use tools?</span>
+            <span>Can these models use tools?</span>
             <select
               value={
                 profile.supports_tools == null ? 'auto' : profile.supports_tools ? 'yes' : 'no'
@@ -341,18 +540,6 @@ export function ProviderForm({
               self-hosted or renamed one.
             </small>
           </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={profile.supports_vision}
-              onChange={(e) => set({ supports_vision: e.target.checked })}
-            />
-            <span>
-              This provider&apos;s models accept images — override for vision models Kitty
-              doesn&apos;t recognize by name (e.g. self-hosted or renamed).
-            </span>
-          </label>
-
           <label className="field">
             <span>Custom system prompt (optional — overrides Kitty&apos;s built-in default)</span>
             <textarea
@@ -583,18 +770,10 @@ export function ProviderForm({
                 <span className="status-badge">{ctxLabel(profile.context_length)}</span>
               </div>
             )}
-            {suggested != null && suggested !== profile.context_length && (
-              <div className="row">
-                <small className="muted">Detected context: {ctxLabel(suggested)}</small>
-                <button className="link" onClick={() => set({ context_length: suggested })}>
-                  Use this
-                </button>
-              </div>
-            )}
             {profile.context_length != null && (
               <small className="muted">
-                Used as this provider&apos;s context window, overriding the global token management
-                value in Settings → Advanced.
+                Used as the context window of every model of this provider, overriding what Kitty
+                detects for each and the global token management value in Settings → Advanced.
               </small>
             )}
           </div>

@@ -1146,7 +1146,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           // specialist chip is the sharpest case — its host is chosen for it,
           // and is rarely the head of the list.
           model: cur0.sessionModelId ?? active?.models[0] ?? null,
-          providerName: active ? active.name || active.provider_type : null,
+          providerName: active ? active.info?.provider_name || active.provider_type : null,
           providerSupportsVision: active ? active.supports_vision : false,
           providerAcceptsImages: active ? active.accepts_images : null,
           providerHasTools: active ? active.tools_supported : true,

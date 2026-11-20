@@ -1,34 +1,44 @@
 import { describe, it, expect } from 'vitest';
-import { canSaveProvider, usesModelPicker } from './providerUtils';
+import { canSaveProvider, hasFixedEndpoint, initialChecks } from './providerUtils';
 
-describe('usesModelPicker', () => {
-  it('is false for local/custom_openai/ollama — they keep the free-text form', () => {
-    expect(usesModelPicker('local')).toBe(false);
-    expect(usesModelPicker('custom_openai')).toBe(false);
-    expect(usesModelPicker('ollama')).toBe(false);
+describe('hasFixedEndpoint', () => {
+  it('is false for local/custom_openai/ollama — they need an editable URL', () => {
+    expect(hasFixedEndpoint('local')).toBe(false);
+    expect(hasFixedEndpoint('custom_openai')).toBe(false);
+    expect(hasFixedEndpoint('ollama')).toBe(false);
   });
 
-  it('is true for every hosted type the new flow covers', () => {
-    expect(usesModelPicker('openrouter')).toBe(true);
-    expect(usesModelPicker('anthropic')).toBe(true);
-    expect(usesModelPicker('openai')).toBe(true);
-    expect(usesModelPicker('fireworks')).toBe(true);
-    expect(usesModelPicker('deepinfra')).toBe(true);
+  it('is true for every hosted service', () => {
+    for (const t of ['openrouter', 'anthropic', 'openai', 'fireworks', 'deepinfra'] as const) {
+      expect(hasFixedEndpoint(t)).toBe(true);
+    }
   });
 });
 
 describe('canSaveProvider', () => {
-  it('requires exactly one non-empty model', () => {
-    expect(canSaveProvider([])).toBe(false);
-    expect(canSaveProvider(['anthropic/claude-sonnet-5'])).toBe(true);
+  it('needs at least one checked, listed model', () => {
+    expect(canSaveProvider({ models: [], enabled_models: [] })).toBe(false);
+    expect(canSaveProvider({ models: ['a', 'b'], enabled_models: [] })).toBe(false);
+    expect(canSaveProvider({ models: ['a', 'b'], enabled_models: ['gone'] })).toBe(false);
+    expect(canSaveProvider({ models: ['a', 'b'], enabled_models: ['b'] })).toBe(true);
+  });
+});
+
+describe('initialChecks', () => {
+  const many = Array.from({ length: 30 }, (_, i) => `m${i}`);
+
+  it('checks every model of a short list', () => {
+    expect(initialChecks(['a', 'b'], [], null)).toEqual(['a', 'b']);
   });
 
-  it('rejects more than one model (duplicate the card instead)', () => {
-    expect(canSaveProvider(['model-a', 'model-b'])).toBe(false);
+  it('checks only the suggested model of a long list', () => {
+    expect(initialChecks(many, [], 'm7')).toEqual(['m7']);
+    expect(initialChecks(many, [], null)).toEqual([]);
+    expect(initialChecks(many, [], 'not-listed')).toEqual([]);
   });
 
-  it('rejects a single blank/whitespace-only model', () => {
-    expect(canSaveProvider([''])).toBe(false);
-    expect(canSaveProvider(['   '])).toBe(false);
+  it('keeps what was checked and is still listed', () => {
+    expect(initialChecks(many, ['m3', 'gone'], 'm7')).toEqual(['m3']);
+    expect(initialChecks(['a', 'b'], ['b'], null)).toEqual(['b']);
   });
 });

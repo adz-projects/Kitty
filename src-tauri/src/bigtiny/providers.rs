@@ -70,12 +70,12 @@ async fn sync_providers(app: &AppHandle, only: Option<&str>) -> Result<(), Strin
     let (profiles, default_id, anthropic_thinking, delegate_effort) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
+        // One engine row per checked model (its card).
         let profiles = cfg
-            .providers
-            .iter()
+            .cards()
+            .into_iter()
             .filter(|p| p.is_usable())
             .filter(|p| only.map_or(true, |id| p.id == id))
-            .cloned()
             .collect::<Vec<_>>();
         let anthropic_thinking = profiles
             .iter()
@@ -104,7 +104,7 @@ async fn sync_providers(app: &AppHandle, only: Option<&str>) -> Result<(), Strin
     };
     let mut cards = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let api_key = get_secret_async(&profile.id).await;
+        let api_key = get_secret_async(profile.secret_account()).await;
         let mut body = provider_body(&profile, catalog.as_ref(), api_key);
         // Detected per card+model by `bigtiny::effort`; tells the engine
         // whether this Claude takes adaptive thinking + `output_config.effort`
@@ -418,6 +418,7 @@ mod tests {
             supports_tools: None,
             disabled_reason: None,
             created_at: String::new(),
+            ..Default::default()
         }
     }
 

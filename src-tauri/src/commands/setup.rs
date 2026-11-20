@@ -72,7 +72,7 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
         let active = cfg
             .active_provider_id
             .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+            .and_then(|id| cfg.card(id))
             .filter(|p| p.is_usable());
         let memory = state.memory_status.lock().unwrap();
         let wants_memory = cfg.adaptive_pathway_enabled
@@ -97,7 +97,7 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
             // tokio worker, and Windows Credential Manager access is
             // synchronous OS IPC that would otherwise block it. A keyless
             // provider (a self-hosted endpoint) is fine without one (#64).
-            if p.requires_key() && get_secret_async(&p.id).await.is_none() {
+            if p.requires_key() && get_secret_async(p.secret_account()).await.is_none() {
                 issues.push(format!("\"{}\" doesn't have an API key stored.", p.name));
             }
         }

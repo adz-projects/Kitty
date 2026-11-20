@@ -104,11 +104,9 @@ fn card_fields(app: &AppHandle, provider_id: Option<&str>) -> Result<Value, Stri
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             let card = cfg
-                .providers
-                .iter()
-                .find(|p| p.id == id && p.is_usable())
-                .cloned()
-                .ok_or("That provider can't be used; choose another.")?;
+                .card(id)
+                .filter(|p| p.is_usable())
+                .ok_or("That model can't be used; choose another.")?;
             Some(card)
         }
         None => None,
@@ -318,10 +316,10 @@ async fn migrate_one(
     let card = task.model_id.as_deref().and_then(|model| {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        cfg.providers
-            .iter()
-            .find(|p| p.is_usable() && p.models.iter().any(|m| m == model))
-            .map(|p| p.id.clone())
+        cfg.cards()
+            .into_iter()
+            .find(|p| p.is_usable() && p.model() == model)
+            .map(|p| p.id)
     });
     // A one-shot whose time has passed still runs once, at the next start.
     let mut body = json!({

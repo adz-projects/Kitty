@@ -43,6 +43,8 @@ pub struct CardSnapshot {
     pub provider_type: String,
     pub base_url: String,
     pub model: String,
+    /// Where the card's key is stored: its provider's id.
+    pub secret_account: String,
 }
 
 fn now_unix() -> i64 {

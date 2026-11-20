@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { ProviderView, Specialist, SpecialistRun } from '@/lib/types';
+import { cardLabel, groupByProvider } from '@/lib/models';
 import { DelegateRunRow } from './DelegateRunRow';
 import { Modal } from '@/components/shared/Modal';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
@@ -173,11 +174,6 @@ export function Specialists() {
       setError(String(e));
     }
   };
-
-  // Models come from the provider profile itself rather than a second lookup:
-  // the daemon's provider row is keyed by the Kitty profile id (see
-  // `bigtiny::providers`), and the profile already carries its model list.
-  const models = providers.find((p) => p.id === form.provider)?.models ?? [];
 
   const openNew = () => {
     setForm(blankForm());
@@ -498,38 +494,31 @@ export function Specialists() {
             </small>
           </div>
           <div className="field">
-            <span>Provider (optional)</span>
+            <span>Model (optional)</span>
+            {/* Each entry is one checked model (its card: the engine row the
+                specialist is pinned to), so the model comes with it. */}
             <select
               value={form.provider}
-              onChange={(e) => setForm({ ...form, provider: e.target.value, model: '' })}
+              onChange={(e) => {
+                const card = providers.find((p) => p.id === e.target.value);
+                setForm({ ...form, provider: e.target.value, model: card?.models[0] ?? '' });
+              }}
             >
               <option value="">Whatever this chat is using</option>
-              {providers.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
+              {groupByProvider(providers).map((g) => (
+                <optgroup key={g.providerId} label={g.provider}>
+                  {g.cards.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {cardLabel(p)}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
             <small className="muted">
               Pin a cheaper or faster model for work that does not need your main one.
             </small>
           </div>
-          {form.provider && (
-            <div className="field">
-              <span>Model (optional)</span>
-              <select
-                value={form.model}
-                onChange={(e) => setForm({ ...form, model: e.target.value })}
-              >
-                <option value="">That provider&apos;s default</option>
-                {models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
           <div className="field">
             <span>Answer schema (optional)</span>
             <textarea

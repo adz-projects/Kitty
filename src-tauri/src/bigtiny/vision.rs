@@ -53,11 +53,11 @@ fn model_key(provider_id: &str, model: &str) -> String {
 /// same reason as its twin in `context_window`, and like it, keyed by the
 /// chat's own card rather than the default one.
 fn card(cfg: &Config, card_id: &str) -> Option<(String, String, String, bool)> {
-    let p = cfg.providers.iter().find(|p| p.id == card_id)?;
+    let p = cfg.card(card_id)?;
     Some((
         p.provider_type.clone(),
         p.base_url.clone(),
-        p.models.first().cloned().unwrap_or_default(),
+        p.model().to_string(),
         p.supports_vision,
     ))
 }
@@ -195,8 +195,10 @@ mod tests {
 
     /// Default card `a`, and a chat pinned to card `b` on a different model.
     fn two_cards() -> Config {
+        let mut providers = vec![profile("a", "small-model"), profile("b", "big-model")];
+        crate::config::providers::upgrade_to_model_lists(&mut providers);
         Config {
-            providers: vec![profile("a", "small-model"), profile("b", "big-model")],
+            providers,
             active_provider_id: Some("a".into()),
             ..Config::default()
         }
@@ -221,14 +223,20 @@ mod tests {
             .insert(model_key("a", "small-model"), false);
         cfg.model_vision.insert(model_key("b", "big-model"), true);
         assert_eq!(card(&cfg, "b").map(|c| c.2), Some("big-model".to_string()));
-        assert_eq!(vision_for_profile(&cfg, &cfg.providers[1]), Some(true));
-        assert_eq!(vision_for_profile(&cfg, &cfg.providers[0]), Some(false));
+        assert_eq!(
+            vision_for_profile(&cfg, &cfg.card("b").unwrap()),
+            Some(true)
+        );
+        assert_eq!(
+            vision_for_profile(&cfg, &cfg.card("a").unwrap()),
+            Some(false)
+        );
     }
 
     #[test]
     fn the_manual_flag_is_read_from_the_chats_card() {
         let mut cfg = two_cards();
-        cfg.providers[1].supports_vision = true;
+        cfg.providers[1].vision_models = vec!["big-model".into()];
         assert_eq!(card(&cfg, "b").map(|c| c.3), Some(true));
         assert_eq!(card(&cfg, "a").map(|c| c.3), Some(false));
         assert!(card(&cfg, "missing").is_none());

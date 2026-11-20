@@ -56,11 +56,11 @@ fn plausible(n: u32) -> Option<u32> {
 /// its own card (`effort::resolve_session_card`), and the default card's
 /// window is the wrong answer for any chat pinned elsewhere.
 fn card(cfg: &Config, card_id: &str) -> Option<(String, String, String, Option<u32>)> {
-    let p = cfg.providers.iter().find(|p| p.id == card_id)?;
+    let p = cfg.card(card_id)?;
     Some((
         p.provider_type.clone(),
         p.base_url.clone(),
-        p.models.first().cloned().unwrap_or_default(),
+        p.model().to_string(),
         p.context_length,
     ))
 }
@@ -183,13 +183,7 @@ fn write_onto_card(cfg: &mut Config, card_id: &str) -> bool {
     let Some(resolved) = resolved_context_length(cfg, card_id) else {
         return false;
     };
-    match cfg.providers.iter_mut().find(|p| p.id == card_id) {
-        Some(p) if p.context_length != Some(resolved) => {
-            p.context_length = Some(resolved);
-            true
-        }
-        _ => false,
-    }
+    cfg.set_card_context_length(card_id, resolved)
 }
 
 /// First-turn confirmation, the counterpart to
@@ -243,8 +237,10 @@ mod tests {
 
     /// Default card `a`, and a chat pinned to card `b` on a different model.
     fn two_cards() -> Config {
+        let mut providers = vec![profile("a", "small-model"), profile("b", "big-model")];
+        crate::config::providers::upgrade_to_model_lists(&mut providers);
         Config {
-            providers: vec![profile("a", "small-model"), profile("b", "big-model")],
+            providers,
             active_provider_id: Some("a".into()),
             ..Config::default()
         }
@@ -295,9 +291,9 @@ mod tests {
 
         assert_eq!(resolved_context_length(&cfg, "b"), Some(200_000));
         assert!(write_onto_card(&mut cfg, "b"));
-        assert_eq!(cfg.providers[1].context_length, Some(200_000));
+        assert_eq!(cfg.card("b").unwrap().context_length, Some(200_000));
         // The default card is untouched.
-        assert_eq!(cfg.providers[0].context_length, None);
+        assert_eq!(cfg.card("a").unwrap().context_length, None);
         // Already written: a second confirmation changes nothing.
         assert!(!write_onto_card(&mut cfg, "b"));
     }

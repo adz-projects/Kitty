@@ -51,7 +51,7 @@ fn tags_response_has_tag(json: &serde_json::Value, tag: &str) -> bool {
 /// the manual "Retry connection check" command. `Ok(())` means the profile
 /// looks usable; `Err(String)` is a human-readable reason to show the user.
 pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
-    let key = get_secret_async(&profile.id).await;
+    let key = get_secret_async(profile.secret_account()).await;
     test_connection_with_key(profile, key).await
 }
 
@@ -75,7 +75,13 @@ pub async fn test_connection_with_key(
             if !probe_version(&client, &profile.base_url).await {
                 return Err(format!("couldn't reach Ollama at {}", profile.base_url));
             }
-            if let Some(model) = profile.models.first() {
+            // A card's model, or every checked model of a provider.
+            let models: Vec<&String> = if profile.provider_id.is_some() {
+                profile.models.iter().collect()
+            } else {
+                profile.checked_models().collect()
+            };
+            for model in models {
                 if !has_model_tag(&client, &profile.base_url, model).await {
                     return Err(format!(
                         "Ollama is reachable, but \"{model}\" isn't installed"
@@ -151,6 +157,16 @@ pub async fn test_connection_with_key(
 mod tests {
     use super::*;
 
+    trait Upgraded {
+        fn upgraded(self) -> Self;
+    }
+    impl Upgraded for ProviderProfile {
+        fn upgraded(mut self) -> Self {
+            crate::config::providers::upgrade_to_model_lists(std::slice::from_mut(&mut self));
+            self
+        }
+    }
+
     /// Deliberately omits `id`/`name`/`provider_type`/`base_url`/`models` —
     /// callers fill those in per test. Every other field is a plausible
     /// unconfigured default (`ProviderProfile` has no `Default` impl).
@@ -183,7 +199,9 @@ mod tests {
             supports_tools: None,
             disabled_reason: None,
             created_at: String::new(),
+            ..Default::default()
         }
+        .upgraded()
     }
 
     /// A fresh, never-`set_secret`-called profile id — `get_secret_async`

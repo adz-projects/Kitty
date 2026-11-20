@@ -6,6 +6,7 @@ import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { useChatStore } from '@/stores/chatStore';
 import { useBranchToProvider } from './BranchToProvider';
+import { groupByProvider, modelLabel, modelTitle } from '@/lib/models';
 
 /** This chat's provider card, with a popover to change it (shown in both the
     overlay and the full window). Only this chat changes — the default for new
@@ -49,7 +50,7 @@ export function ProviderBadge() {
       ? (providers.find((p) => p.id === sessionProviderId) ?? providers.find((p) => p.active))
       : providers.find((p) => p.active);
   const activeId = active?.id;
-  const label = active ? active.name || active.provider_type : 'No provider';
+  const label = active ? active.info.name : 'No model';
   const icon = active ? (
     <TrustIcon tier={active.network_tier} isTrusted={active.is_trusted} />
   ) : (
@@ -89,8 +90,8 @@ export function ProviderBadge() {
         onClick={() => setOpen((o) => !o)}
         title={
           locked
-            ? 'This chat’s provider — click to continue the conversation on another one'
-            : 'This chat’s provider — click to switch'
+            ? 'This chat’s model — click to continue the conversation on another one'
+            : 'This chat’s model — click to switch'
         }
         disabled={busy || branchFlow.busy}
       >
@@ -103,26 +104,32 @@ export function ProviderBadge() {
       {open && (
         <div ref={popoverRef} className="mode-popover provider-popover" role="menu" style={style}>
           {locked && <div className="muted popover-heading">Continue this chat on…</div>}
-          {providers
-            .filter((p) => !p.disabled_reason && !(locked && p.id === activeId))
-            .map((p) => (
-              <button
-                key={p.id}
-                role="menuitemradio"
-                aria-checked={p.id === activeId}
-                className={`provider-option${p.id === activeId ? ' active' : ''}`}
-                title={p.base_url}
-                onClick={() => void switchTo(p.id)}
-              >
-                {/* Icon and name are separate flex children rather than one run
-                  of inline content, so a name too long for the row wraps to a
-                  hanging indent under the name instead of under the icon
-                  (see `.provider-option` in base.css). */}
-                <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
-                <span className="provider-option-name">{p.name || p.provider_type}</span>
-              </button>
-            ))}
-          {providers.length === 0 && <span className="muted">No providers configured</span>}
+          {/* The model list: every checked model, ranked, under its provider. */}
+          {groupByProvider(
+            providers.filter((p) => !p.disabled_reason && !(locked && p.id === activeId))
+          ).map((g) => (
+            <div key={g.providerId} role="group" aria-label={g.provider}>
+              <div className="muted popover-heading provider-group-heading">{g.provider}</div>
+              {g.cards.map((p) => (
+                <button
+                  key={p.id}
+                  role="menuitemradio"
+                  aria-checked={p.id === activeId}
+                  className={`provider-option${p.id === activeId ? ' active' : ''}`}
+                  title={modelTitle(p.info)}
+                  onClick={() => void switchTo(p.id)}
+                >
+                  {/* Icon and name are separate flex children rather than one
+                    run of inline content, so a name too long for the row
+                    wraps to a hanging indent under the name instead of under
+                    the icon (see `.provider-option` in base.css). */}
+                  <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
+                  <span className="provider-option-name">{modelLabel(p.info)}</span>
+                </button>
+              ))}
+            </div>
+          ))}
+          {providers.length === 0 && <span className="muted">No models set up</span>}
         </div>
       )}
       {branchFlow.gate}

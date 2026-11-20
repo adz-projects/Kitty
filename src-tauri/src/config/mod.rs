@@ -78,9 +78,16 @@ pub struct Config {
     /// about, which is when the import is offered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v1_import_state: Option<String>,
-    /// Provider profiles (metadata only; secrets live in the keyring).
+    /// Providers, each with its models (metadata only; secrets live in the
+    /// keyring). Their checked models are the model cards
+    /// (`Config::cards`).
     pub providers: Vec<ProviderProfile>,
-    /// Id of the default provider profile (new chats use it), if any.
+    /// Layout of `providers`: 0 = one model per card (before providers held
+    /// many), brought up at load and merged at startup
+    /// (`providers::SCHEMA_*`). Field-level default so an old file reads 0.
+    #[serde(default)]
+    pub providers_schema: u32,
+    /// The default model: the card id new chats start on, if any.
     pub active_provider_id: Option<String>,
     /// The default was cleared because it can no longer be used (a retired
     /// provider type); the UI asks the user to choose another. Cleared when
@@ -456,6 +463,7 @@ impl Default for Config {
             notifications: NotificationPrefs::default(),
             remember_overlay_position: true,
             providers: Vec::new(),
+            providers_schema: crate::config::providers::SCHEMA_MERGED,
             active_provider_id: None,
             needs_default_provider: false,
             handoff_gate_choice: None,
@@ -772,13 +780,15 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_theme_default_to_light(migrate_model_tags_to_gguf(
-                migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(migrate_kitty_split_enabled(
-                    migrate_replacement_mcp_enabled(migrate_bigtiny_launch_command(
-                        migrate_hotkeys(config, &text),
+            Ok(migrate_provider_model_lists(
+                migrate_theme_default_to_light(migrate_model_tags_to_gguf(
+                    migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
+                        migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
+                            migrate_bigtiny_launch_command(migrate_hotkeys(config, &text)),
+                        )),
                     )),
-                ))),
-            )))
+                )),
+            ))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
@@ -1225,6 +1235,17 @@ fn migrate_kitty_wasm_enabled(mut config: Config) -> Config {
 /// the value naturally becomes `"light"` on disk the next time anything
 /// calls `save` (Settings → Appearance's own Save, or any other section's),
 /// matching how `migrate_hotkeys` above handles its own one-time reshape.
+/// One-model cards become providers holding model lists, each card's id now
+/// its model's (`providers::upgrade_to_model_lists`); the merge of cards of
+/// one service waits for startup, where keys can be read.
+fn migrate_provider_model_lists(mut config: Config) -> Config {
+    if config.providers_schema < crate::config::providers::SCHEMA_MODEL_LISTS {
+        crate::config::providers::upgrade_to_model_lists(&mut config.providers);
+        config.providers_schema = crate::config::providers::SCHEMA_MODEL_LISTS;
+    }
+    config
+}
+
 fn migrate_theme_default_to_light(mut config: Config) -> Config {
     if config.theme == "default" {
         config.theme = "light".to_string();

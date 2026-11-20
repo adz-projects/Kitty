@@ -1,31 +1,41 @@
 // Pure helpers shared by Providers.tsx (the list) and ProviderForm.tsx (the
-// add/edit modal): network-tier classification, context-length detents, and
-// the blank-profile/context-length-suggestion helpers.
+// add/edit modal): network-tier classification, context-length detents, the
+// blank profile, and which models a fresh fetch starts with checked.
 
-import { ipc } from '@/lib/ipc';
-import {
-  ANTHROPIC_CONTEXT_TABLE,
-  CUSTOM_OPENAI_CONTEXT_TABLE,
-  lookupContextLength,
-} from '@/lib/context_length_table';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
 import type { NetworkTier, ProviderProfile, ProviderType } from '@/lib/types';
 
-/** Provider types that keep the original free-text base-URL/models form
-    (provider-add redesign): `local` has nothing to validate a key against,
-    `custom_openai` is a hand-configured endpoint that may not even
-    implement `/v1/models`, and `ollama` takes no API key at all. Every
-    other type gets the key-validate-then-pick-one-model flow. */
-export const LEGACY_FORM_TYPES: ProviderType[] = ['local', 'custom_openai', 'ollama'];
+/** Provider types at a fixed, well-known endpoint: their base URL is never
+    shown. `local`, `custom_openai` and `ollama` need an editable one. */
+export const EDITABLE_URL_TYPES: ProviderType[] = ['local', 'custom_openai', 'ollama'];
 
-export function usesModelPicker(providerType: ProviderType): boolean {
-  return !LEGACY_FORM_TYPES.includes(providerType);
+export function hasFixedEndpoint(providerType: ProviderType): boolean {
+  return !EDITABLE_URL_TYPES.includes(providerType);
 }
 
-/** One provider card, one model: every type needs exactly one non-empty
-    model. To use a second model from the same provider, duplicate the card. */
-export function canSaveProvider(models: string[]): boolean {
-  return models.length === 1 && Boolean(models[0]?.trim());
+/** A provider is worth saving once at least one of its models is checked. */
+export function canSaveProvider(profile: Pick<ProviderProfile, 'models' | 'enabled_models'>) {
+  return profile.models.some((m) => m.trim() && profile.enabled_models.includes(m));
+}
+
+/** Above this many models a fresh fetch starts with only the suggested model
+    checked: a long catalog (OpenRouter, OpenAI) would otherwise flood every
+    model menu. A short list (a self-hosted server, Anthropic) starts all
+    checked. */
+export const CHECK_ALL_UP_TO = 20;
+
+/** The models checked after a fetch: what was checked before and is still
+    listed, plus — for a provider with nothing checked yet — every model of a
+    short list, or the suggested one of a long list. */
+export function initialChecks(
+  listed: string[],
+  previouslyChecked: string[],
+  suggested: string | null
+): string[] {
+  const kept = previouslyChecked.filter((m) => listed.includes(m));
+  if (kept.length > 0) return kept;
+  if (listed.length <= CHECK_ALL_UP_TO) return [...listed];
+  return suggested && listed.includes(suggested) ? [suggested] : [];
 }
 
 // Context-length detents (item 28): not linearly spaced, so the slider indexes
@@ -58,49 +68,6 @@ export function detentsFor(suggested: number | null): number[] {
   return [...CTX_DETENTS, suggested].sort((a, b) => a - b);
 }
 
-/** Best-effort context-window suggestion for the model currently selected on
-    `profile`, per provider type (Round-6 Feature 1): OpenRouter queries live;
-    Anthropic/custom_openai use a small hardcoded table. `null` when nothing is
-    known — the field stays fully manual in that case, which is now also what
-    an Ollama profile gets: the live lookup went with managed Ollama, and
-    probing an arbitrary self-hosted server from here isn't worth a round trip
-    the user can shortcut by typing the number. */
-export async function suggestContextLength(profile: ProviderProfile): Promise<number | null> {
-  const model = profile.models[0];
-  if (!model) return null;
-  try {
-    switch (profile.provider_type) {
-      case 'openrouter':
-        return await ipc.openrouterContextLength(model);
-      case 'anthropic':
-        return lookupContextLength(ANTHROPIC_CONTEXT_TABLE, model);
-      case 'openai':
-        return lookupContextLength(CUSTOM_OPENAI_CONTEXT_TABLE, model);
-      case 'custom_openai': {
-        // Try a live lookup against the server itself first (many self-hosted
-        // OpenAI-compatible servers expose it via /props or /v1/models); fall
-        // back to the same hardcoded table OpenAI uses when that comes up empty.
-        const live = await ipc.customOpenaiContextLength(profile.base_url, model);
-        return live ?? lookupContextLength(CUSTOM_OPENAI_CONTEXT_TABLE, model);
-      }
-      case 'local': {
-        // The GGUF header already carries the trained context window, parsed at
-        // download time — no probe, just find the installed model and read it.
-        const models = await ipc.listLocalModels();
-        const m = models.find((x) => x.id === model || x.file === model);
-        return m?.info?.context_length ?? null;
-      }
-      case 'ollama':
-        // A remote Ollama the user runs themselves — ask it directly.
-        return await ipc.ollamaContextLength(profile.base_url, model);
-      default:
-        return null;
-    }
-  } catch {
-    return null;
-  }
-}
-
 /** Client-side mirror of providers::network_tier_for — only used to detect
     loopback (which is always "local"/trusted). */
 export function tierOf(url: string): NetworkTier {
@@ -125,6 +92,10 @@ export const blank = (): ProviderProfile => ({
   provider_type: 'openrouter',
   base_url: DEFAULT_URL.openrouter,
   models: [],
+  enabled_models: [],
+  model_ids: {},
+  vision_models: [],
+  context_lengths: {},
   is_trusted: false,
   temperature: null,
   top_p: null,

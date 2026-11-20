@@ -86,6 +86,7 @@ describe('canConnect', () => {
     expect(canConnect(profile({}), 'sk-1')).toBe(true);
     expect(canConnect(profile({ provider_type: 'custom_openai' }), '')).toBe(true);
     expect(canConnect(profile({ id: 'p1' }), '')).toBe(true);
-    expect(canConnect(profile({ models: [] }), 'sk-1')).toBe(false);
+    // The model list is fetched on Connect, so no model is needed up front.
+    expect(canConnect(profile({ models: [] }), 'sk-1')).toBe(true);
   });
 });

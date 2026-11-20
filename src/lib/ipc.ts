@@ -41,7 +41,8 @@ import type {
   TranscriptRow,
   SubagentStatusEvent,
   LocalModel,
-  ModelPickerEntry,
+  ModelInfo,
+  ProviderAccountView,
   OpenRouterCredits,
   PathInfo,
   StagedAttachment,
@@ -412,14 +413,21 @@ export const ipc = {
       `outputs_snapshot`. */
   outputsSnapshot: (path: string) => invoke<OutputSnapshotEntry[]>('outputs_snapshot', { path }),
   // Providers
+  /** The user's model list: every checked model as a card, ranked. */
   listProviders: () => invoke<ProviderView[]>('list_providers'),
+  /** The providers themselves, each with its ranked model list. */
+  listProviderAccounts: () => invoke<ProviderAccountView[]>('list_provider_accounts'),
+  /** Describe and rank a provider form's model list against the catalog. */
+  describeProviderModels: (profile: ProviderProfile) =>
+    invoke<ModelInfo[]>('describe_provider_models', { profile }),
+  /** The model a provider suggests (the default-model pick), or null. */
+  suggestProviderModel: (profile: ProviderProfile) =>
+    invoke<string | null>('suggest_provider_model', { profile }),
   upsertProvider: (profile: ProviderProfile, secret: string | null) =>
     invoke<ProviderProfile>('upsert_provider', { profile, secret }),
-  /** Returns the default card afterwards (promoted if this was the default). */
+  /** Returns the default model's card afterwards (another model takes over
+      if the default was one of this provider's). */
   deleteProvider: (id: string) => invoke<string | null>('delete_provider', { id }),
-  /** Copy a provider card (fresh id, same key, "(copy)" name) — how a user
-      adds a second model from the same provider. */
-  duplicateProvider: (id: string) => invoke<ProviderProfile>('duplicate_provider', { id }),
   activateProvider: (id: string | null, sessionId?: string | null) =>
     invoke<void>('activate_provider', { id, sessionId: sessionId ?? null }),
   setSessionProvider: (sessionId: string, providerId: string, model?: string | null) =>
@@ -489,16 +497,20 @@ export const ipc = {
     invoke<number | null>('custom_openai_context_length', { baseUrl, model }),
   openrouterCredits: (providerId: string) =>
     invoke<OpenRouterCredits>('openrouter_credits', { providerId }),
-  /** Validate an in-progress (unsaved) provider's API key and list its
-      available models, ranked/cost-tagged against the cached OpenRouter
-      catalog where possible. Never touches the keyring — `secret` is the
-      raw, unsaved form value. */
-  discoverProviderModels: (providerType: string, baseUrl: string, secret: string) =>
-    invoke<ModelPickerEntry[]>('discover_provider_models', { providerType, baseUrl, secret }),
-  /** Same, but for an already-saved profile whose key field was left blank
-      ("leave blank to keep") — reads the secret from the keyring instead. */
-  discoverProviderModelsForSaved: (providerId: string) =>
-    invoke<ModelPickerEntry[]>('discover_provider_models_for_saved', { providerId }),
+  /** Check a provider's key and list the model ids it offers. `secret` is
+      the raw form value; when blank, a saved provider's stored key is used. */
+  discoverProviderModels: (
+    providerType: string,
+    baseUrl: string,
+    providerId: string | null,
+    secret: string | null
+  ) =>
+    invoke<string[]>('discover_provider_models', {
+      providerType,
+      baseUrl,
+      providerId,
+      secret,
+    }),
   // MCP servers — daemon-global, live over REST (BigTiny; no restart needed
   // to add/edit/delete/toggle).
   listMcpServers: () => invoke<McpServer[]>('list_mcp_servers'),
@@ -879,3 +891,4 @@ export const windowReady = (): Promise<void> => invoke<void>('window_ready');
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());
+

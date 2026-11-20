@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import type { ProviderProfile, ProviderType } from '@/lib/types';
-import { DEFAULT_URL, DEFAULT_MODEL } from '@/lib/provider_defaults';
+import { DEFAULT_URL } from '@/lib/provider_defaults';
+import { initialChecks } from '@/components/settings/providers/providerUtils';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
 
 const TYPE_LABEL: Record<ProviderType, string> = {
@@ -31,7 +32,11 @@ function blankApiKeyProfile(type: ProviderType): ProviderProfile {
     name: TYPE_LABEL[type],
     provider_type: type,
     base_url: DEFAULT_URL[type],
-    models: DEFAULT_MODEL[type] ? [DEFAULT_MODEL[type]!] : [],
+    models: [],
+    enabled_models: [],
+    model_ids: {},
+    vision_models: [],
+    context_lengths: {},
     is_trusted: FIRST_PARTY.includes(type),
     temperature: null,
     top_p: null,
@@ -57,20 +62,21 @@ function hostOf(url: string): string {
   }
 }
 
-/** Whether the step can save: a model, and a key unless the endpoint needs
-    none (a custom server) or one is already saved (repair edits the existing
-    card). Pure. */
+/** Whether the step can save: a key unless the endpoint needs none (a
+    custom server) or one is already saved (repair edits the existing
+    provider). The model list is fetched on Connect. Pure. */
 export function canConnect(profile: ProviderProfile, secret: string): boolean {
   const keyOptional = profile.provider_type === 'custom_openai' || profile.id !== '';
-  return !!profile.models[0]?.trim() && (keyOptional || secret.trim().length > 0);
+  return keyOptional || secret.trim().length > 0;
 }
 
-/** The API-key wizard path: pick a provider, paste a key, name a model —
-    reuses the exact same save/activate infra as Settings → Providers, just
-    trimmed to the handful of fields a first-run newcomer actually needs.
+/** The API-key wizard path: pick a provider and paste a key. Connect checks
+    the key, fetches the provider's models, checks them the way Settings →
+    Providers does (a short list all, a long one just the suggested model)
+    and makes the suggested model — or one typed in — the default.
 
-    In repair it edits the existing default card rather than adding another
-    one (#63); the key can be left blank to keep the saved one. */
+    In repair it edits the provider of the default model rather than adding
+    another one (#63); the key can be left blank to keep the saved one. */
 export function ApiKeyStep({
   onBack,
   onNext,
@@ -84,16 +90,21 @@ export function ApiKeyStep({
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [typedModel, setTypedModel] = useState('');
 
   const set = (patch: Partial<ProviderProfile>) => setProfile((p) => ({ ...p, ...patch }));
 
   useEffect(() => {
     if (!repair) return;
-    void ipc
-      .listProviders()
-      .then((list) => {
-        const current = list.find((p) => p.active && !p.disabled_reason);
-        if (current) setProfile({ ...current });
+    void Promise.all([ipc.listProviders(), ipc.listProviderAccounts()])
+      .then(([cards, accounts]) => {
+        const current = cards.find((p) => p.active && !p.disabled_reason);
+        const account = accounts.find((a) => a.id === current?.provider_id);
+        if (account) {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const { network_tier, has_secret, requires_key, model_infos, ...stored } = account;
+          setProfile(stored);
+        }
       })
       .catch(() => {});
   }, [repair]);
@@ -116,9 +127,32 @@ export function ApiKeyStep({
     try {
       // Checked before anything is saved: a wrong key or URL should be fixed
       // here, not discovered in the first chat.
-      await ipc.testProviderDraft(profile, secret.trim() ? secret : null);
-      const saved = await ipc.upsertProvider(profile, secret || null);
-      await ipc.setDefaultProvider(saved.id);
+      const key = secret.trim() ? secret : null;
+      await ipc.testProviderDraft(profile, key);
+      const typed = typedModel.trim();
+      let listed: string[] = [];
+      try {
+        listed = await ipc.discoverProviderModels(
+          profile.provider_type,
+          profile.base_url,
+          profile.id || null,
+          key
+        );
+      } catch (e) {
+        // A server that lists nothing still works with a model named here.
+        if (!typed) throw e;
+      }
+      const models = typed && !listed.includes(typed) ? [...listed, typed] : listed;
+      const suggested =
+        typed ||
+        (await ipc
+          .suggestProviderModel({ ...profile, models, enabled_models: models })
+          .catch(() => null));
+      const checked = initialChecks(models, profile.enabled_models, suggested);
+      const enabled = suggested && !checked.includes(suggested) ? [...checked, suggested] : checked;
+      const saved = await ipc.upsertProvider({ ...profile, models, enabled_models: enabled }, key);
+      const card = suggested ? saved.model_ids[suggested] : undefined;
+      if (card) await ipc.setDefaultProvider(card);
       onNext();
     } catch (e) {
       setError(String(e));
@@ -186,13 +220,15 @@ export function ApiKeyStep({
       </label>
 
       <label className="field">
-        <span>Model</span>
+        <span>Model (optional)</span>
         <input
-          value={profile.models[0] ?? ''}
-          onChange={(e) => set({ models: [e.target.value] })}
+          value={typedModel}
+          placeholder="Kitty picks one from the provider's list"
+          onChange={(e) => setTypedModel(e.target.value)}
         />
         <small className="muted">
-          You can change this any time from Settings → Providers once you're chatting.
+          Kitty fetches the provider&apos;s models and starts you on a strong, sensibly priced one.
+          Check more models, or choose another default, in Settings → Providers.
         </small>
       </label>
 

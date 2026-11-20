@@ -1,11 +1,14 @@
-//! Provider card commands: list/create/update/duplicate/delete, choosing the
-//! default card (Settings) and a chat's card (the chat badge), and the
-//! connection test. Every change is mirrored to the engine by
-//! `bigtiny::providers::sync_all_providers`.
+//! Provider commands. Settings → Providers lists, saves and deletes
+//! *providers* (a service, its key, and the models the user checked); the
+//! rest of Kitty works with *model cards*, one per checked model
+//! (`ProviderProfile::cards`): the model list a chat, a scheduled task or a
+//! specialist picks from, and the default model. Every change is mirrored to
+//! the engine by `bigtiny::providers::sync_all_providers`.
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::ai_models::{self, ModelInfo};
 use crate::config;
 use crate::config::providers::{self, NetworkTier, ProviderProfile};
 use crate::config::Config;
@@ -13,58 +16,85 @@ use crate::openrouter;
 use crate::openrouter::catalog;
 use crate::state::AppState;
 
-/// A provider profile plus derived fields the UI needs.
+/// One model card plus derived fields the UI needs: an entry of the user's
+/// model list.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderView {
     #[serde(flatten)]
     pub profile: ProviderProfile,
     pub network_tier: NetworkTier,
     pub has_secret: bool,
+    /// The default model (new chats start on it).
     pub active: bool,
-    /// Resolved image support for this profile's model: the manual
-    /// `supports_vision` override, else what `bigtiny::vision` discovered and
-    /// remembered. `None` means no evidence either way, and the frontend
-    /// falls back to the name patterns in `vision_models.ts`.
-    ///
-    /// Distinct from the flattened `supports_vision` field, which is only the
-    /// user's manual override — a `Some(false)` here is a real negative from
-    /// the provider and does turn image affordances off.
+    /// Resolved image support for this card's model: the user's vision mark,
+    /// else what `bigtiny::vision` discovered and remembered. `None` means no
+    /// evidence either way, and the frontend falls back to the name patterns
+    /// in `vision_models.ts`.
     pub accepts_images: Option<bool>,
     /// Whether this card's model can call tools: the `supports_tools`
     /// override, else detected (`ProviderProfile::tools_supported`).
     pub tools_supported: bool,
-    /// This card's detected reasoning ladder, for the Settings row
-    /// (`bigtiny::effort`).
+    /// This card's detected reasoning ladder (`bigtiny::effort`).
     pub effort: crate::bigtiny::effort::EffortSummary,
+    /// The model, described and priced from OpenRouter's catalog.
+    pub info: ModelInfo,
+}
+
+/// A provider as Settings → Providers shows it: its whole model list,
+/// described and ranked.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderAccountView {
+    #[serde(flatten)]
+    pub profile: ProviderProfile,
+    pub network_tier: NetworkTier,
+    pub has_secret: bool,
+    pub requires_key: bool,
+    /// Every listed model, checked or not, ranked.
+    pub model_infos: Vec<ModelInfo>,
 }
 
 /// Async — `has_secret` is a blocking Windows Credential Manager IPC call per
-/// profile, so this runs off the main thread and offloads each lookup through
-/// `get_secret_async` (a `list_providers` call with many profiles would
-/// otherwise block the command thread for the full round of OS dialogs).
-async fn provider_views(
+/// provider, so this runs off the main thread and offloads each lookup
+/// through `get_secret_async`.
+async fn card_views(
     cfg: &Config,
     catalog: Option<&catalog::OpenRouterCatalog>,
     detecting: &std::collections::HashSet<String>,
 ) -> Vec<ProviderView> {
-    let mut views = Vec::with_capacity(cfg.providers.len());
-    let detecting = detecting.clone();
-    for p in &cfg.providers {
-        let has_secret = providers::get_secret_async(&p.id).await.is_some();
-        views.push(ProviderView {
-            network_tier: p.network_tier(),
-            has_secret,
-            active: cfg.active_provider_id.as_deref() == Some(&p.id),
-            accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, p),
-            tools_supported: p.tools_supported(catalog),
-            effort: crate::bigtiny::effort::summary_for_profile(cfg, p, &detecting),
-            profile: p.clone(),
-        });
+    let entries = catalog.map(|c| c.entries.as_slice()).unwrap_or(&[]);
+    let now = ai_models::now_unix();
+    let mut views = Vec::new();
+    for provider in &cfg.providers {
+        let has_secret = providers::get_secret_async(&provider.id).await.is_some();
+        for card in provider.cards() {
+            let mut info = ai_models::describe(provider, card.model(), entries);
+            info.card_id = Some(card.id.clone());
+            views.push(ProviderView {
+                network_tier: card.network_tier(),
+                has_secret,
+                active: cfg.active_provider_id.as_deref() == Some(&card.id),
+                accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, &card),
+                tools_supported: card.tools_supported(catalog),
+                effort: crate::bigtiny::effort::summary_for_profile(cfg, &card, detecting),
+                info,
+                profile: card,
+            });
+        }
     }
+    let mut infos: Vec<ModelInfo> = views.iter().map(|v| v.info.clone()).collect();
+    ai_models::rank(&mut infos, now);
+    let order = |v: &ProviderView| {
+        infos
+            .iter()
+            .position(|i| i.card_id == v.info.card_id)
+            .unwrap_or(usize::MAX)
+    };
+    views.sort_by_key(order);
     views
 }
 
-/// List provider profiles with derived tier / secret / active flags.
+/// The user's model list: every checked model of every provider, as cards,
+/// ranked by intelligence and age.
 #[tauri::command]
 pub async fn list_providers(
     state: tauri::State<'_, AppState>,
@@ -74,16 +104,37 @@ pub async fn list_providers(
     let cfg = state.config.lock().unwrap().clone();
     let catalog = state.openrouter_catalog.lock().unwrap().clone();
     let detecting = state.effort_detecting.lock().unwrap().clone();
-    Ok(provider_views(&cfg, catalog.as_ref(), &detecting).await)
+    Ok(card_views(&cfg, catalog.as_ref(), &detecting).await)
 }
 
-/// Create or update a provider card. `secret`, when present, is stored in the
-/// keyring only (never in config.json). Returns the saved card (with id).
+/// The providers themselves (Settings → Providers), each with its ranked
+/// model list.
+#[tauri::command]
+pub async fn list_provider_accounts(app: AppHandle) -> Result<Vec<ProviderAccountView>, String> {
+    let catalog = ai_models::catalog(&app).await;
+    let cfg = app.state::<AppState>().config.lock().unwrap().clone();
+    let now = ai_models::now_unix();
+    let mut out = Vec::with_capacity(cfg.providers.len());
+    for p in &cfg.providers {
+        out.push(ProviderAccountView {
+            network_tier: p.network_tier(),
+            has_secret: providers::get_secret_async(&p.id).await.is_some(),
+            requires_key: p.requires_key(),
+            model_infos: ai_models::provider_models(p, &catalog, now),
+            profile: p.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Create or update a provider. `secret`, when present, is stored in the
+/// keyring only (never in config.json). Returns the saved provider (with id
+/// and its models' card ids).
 ///
-/// Every card is mirrored to the engine at once (`sync_all_providers`), so an
-/// edit to any card - not only the default - takes effect on its next turn.
-/// Best-effort on the engine round-trip: the card is already saved, and the
-/// next attach syncs again.
+/// Every model card is mirrored to the engine at once
+/// (`sync_all_providers`), so a change takes effect on the next turn.
+/// Best-effort on the engine round-trip: the provider is already saved, and
+/// the next attach syncs again.
 #[tauri::command]
 pub async fn upsert_provider(
     app: AppHandle,
@@ -99,6 +150,9 @@ pub async fn upsert_provider(
     if profile.provider_type == "local" {
         return Err("The \"On this device\" provider type is no longer supported.".into());
     }
+    // Only a stored provider is saved here, never a card.
+    profile.provider_id = None;
+    profile.supports_vision = false;
     if let Some(s) = secret {
         if !s.is_empty() {
             // Async write: `set_secret` is blocking Windows Credential
@@ -106,54 +160,92 @@ pub async fn upsert_provider(
             providers::set_secret_async(&profile.id, &s).await?;
         }
     }
-    let detect_effort;
-    {
+    let catalog = ai_models::catalog(&app).await;
+    let now = ai_models::now_unix();
+    let (saved, detect) = {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
-        // Re-detect the reasoning ladder when what decides it changed (type,
-        // endpoint, model) or the card has none yet.
-        let model = profile.models.first().cloned().unwrap_or_default();
-        let has_caps = cfg
-            .effort_caps
-            .contains_key(&crate::bigtiny::effort::effort_key(&profile.id, &model));
-        match cfg.providers.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => {
-                detect_effort = !has_caps
-                    || existing.provider_type != profile.provider_type
-                    || existing.base_url != profile.base_url
-                    || existing.models.first() != profile.models.first();
-                *existing = profile.clone();
+        let old_cards = cfg
+            .providers
+            .iter()
+            .find(|p| p.id == profile.id)
+            .map(|p| p.cards())
+            .unwrap_or_default();
+        let index = match cfg.providers.iter().position(|p| p.id == profile.id) {
+            Some(i) => {
+                // Card ids are the config's, never the form's.
+                profile.model_ids = cfg.providers[i].model_ids.clone();
+                cfg.providers[i] = profile.clone();
+                i
             }
             None => {
-                detect_effort = true;
+                profile.model_ids.clear();
                 cfg.providers.push(profile.clone());
+                cfg.providers.len() - 1
             }
+        };
+        providers::assign_model_ids(&mut cfg.providers, index);
+        let saved = cfg.providers[index].clone();
+        // Re-detect the reasoning ladder of a card whose endpoint changed, or
+        // that has none yet.
+        let detect: Vec<String> = saved
+            .cards()
+            .into_iter()
+            .filter(|card| {
+                let has_caps = cfg
+                    .effort_caps
+                    .contains_key(&crate::bigtiny::effort::effort_key(&card.id, card.model()));
+                let moved = old_cards
+                    .iter()
+                    .find(|o| o.id == card.id)
+                    .map_or(true, |o| {
+                        o.provider_type != card.provider_type || o.base_url != card.base_url
+                    });
+                !has_caps || moved
+            })
+            .map(|card| card.id)
+            .collect();
+        // No default yet (the first provider), or the default was unchecked:
+        // the provider's suggested model takes over.
+        let suggested = ai_models::defaults::pick(
+            &saved.provider_type,
+            &saved.base_url,
+            &ai_models::provider_models(&saved, &catalog, now),
+            true,
+            now,
+        )
+        .and_then(|m| saved.model_ids.get(&m).cloned());
+        cfg.repair_default(suggested);
+        if cfg.active_provider_id.is_some() {
+            cfg.needs_default_provider = false;
         }
         config::save(&cfg).map_err(|e| e.to_string())?;
-    }
-    if detect_effort {
+        (saved, detect)
+    };
+    for id in &detect {
         // Background: detection may probe a self-hosted server or HuggingFace,
-        // and saving a card must not wait on that. Settings and open chats
-        // refresh on `provider://effort-detected`.
-        crate::bigtiny::effort::spawn_detect(&app, &profile.id);
+        // and saving must not wait on that. Settings and open chats refresh
+        // on `provider://effort-detected`.
+        crate::bigtiny::effort::spawn_detect(&app, id);
     }
-
     if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
         tracing::warn!(
             "provider {} saved but failed to sync to the engine: {e}",
-            profile.id
+            saved.id
         );
     }
     // Probe image support now rather than waiting for the first turn, so the
     // composer offers (or hides) the attach controls correctly from the
-    // moment the card is saved — for any card, since any chat may be pinned
-    // to it. Best-effort and already cached after the first success.
-    crate::bigtiny::vision::ensure_vision_cached(&app, &profile.id).await;
-    Ok(profile)
+    // moment the model is checked. Best-effort and cached after the first
+    // success.
+    for card in saved.cards() {
+        crate::bigtiny::vision::ensure_vision_cached(&app, &card.id).await;
+    }
+    Ok(saved)
 }
 
-/// Re-detect one card's reasoning levels (Settings → Providers → Re-detect).
-/// The old ladder stays until the new detection succeeds.
+/// Re-detect one card's reasoning levels. The old ladder stays until the new
+/// detection succeeds.
 #[tauri::command]
 pub async fn redetect_effort(app: AppHandle, provider_id: String) -> Result<(), String> {
     crate::bigtiny::effort::detect_card(&app, &provider_id).await;
@@ -161,48 +253,17 @@ pub async fn redetect_effort(app: AppHandle, provider_id: String) -> Result<(), 
 }
 
 /// Re-detect every card's reasoning levels (Settings → Providers →
-/// Re-detect all).
+/// Re-detect reasoning).
 #[tauri::command]
 pub async fn redetect_effort_all(app: AppHandle) -> Result<(), String> {
     crate::bigtiny::effort::detect_all(&app, false).await;
     Ok(())
 }
 
-/// Copy a provider card — the way to use a second model from the same
-/// provider, since each card holds exactly one. The copy gets a fresh id, the
-/// source's secret, and a "(copy)" name; it is never the default.
-#[tauri::command]
-pub async fn duplicate_provider(app: AppHandle, id: String) -> Result<ProviderProfile, String> {
-    let mut copy = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.providers
-            .iter()
-            .find(|p| p.id == id)
-            .cloned()
-            .ok_or_else(|| "That provider no longer exists.".to_string())?
-    };
-    copy.id = format!("prof_{}", chrono::Utc::now().timestamp_millis());
-    copy.name = format!("{} (copy)", copy.name);
-    copy.created_at = chrono::Utc::now().to_rfc3339();
-    if let Some(secret) = providers::get_secret_checked(&id).await? {
-        providers::set_secret_async(&copy.id, &secret).await?;
-    }
-    {
-        let state = app.state::<AppState>();
-        let mut cfg = state.config.lock().unwrap();
-        cfg.providers.push(copy.clone());
-        config::save(&cfg).map_err(|e| e.to_string())?;
-    }
-    if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
-        tracing::warn!("duplicated provider {} but failed to sync it: {e}", copy.id);
-    }
-    Ok(copy)
-}
-
-/// Delete a provider card: its key, its config entry and its row in the
-/// engine. Deleting the default promotes the next usable card (decision #5)
-/// and returns its id, so the UI can say which one it is now.
+/// Delete a provider: its key, its config entry and its models' rows in the
+/// engine. When the default model was one of its models, the next usable
+/// model takes over; returns the default's card id, so the UI can say which
+/// one it is now.
 ///
 /// `async` for a platform reason, not a performance one: a *synchronous*
 /// `#[tauri::command]` runs on the main thread, and on Android the secret
@@ -219,16 +280,13 @@ pub async fn delete_provider(app: AppHandle, id: String) -> Result<Option<String
             return Ok(cfg.active_provider_id.clone());
         };
         cfg.providers.remove(index);
-        if cfg.active_provider_id.as_deref() == Some(&id) {
-            cfg.active_provider_id = providers::next_default(&cfg.providers, index);
-            cfg.needs_default_provider =
-                cfg.active_provider_id.is_none() && !cfg.providers.is_empty();
-        }
+        cfg.repair_default(None);
+        cfg.needs_default_provider = false;
         config::save(&cfg).map_err(|e| e.to_string())?;
         cfg.active_provider_id.clone()
     };
-    // Removes the row (and the key the engine held for it) and sets the
-    // promoted default.
+    // Removes the rows (and the keys the engine held for them) and sets the
+    // new default.
     if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
         tracing::warn!("deleted provider {id} but failed to sync the engine: {e}");
     }
@@ -418,14 +476,17 @@ pub async fn openrouter_credits(
     state: tauri::State<'_, AppState>,
     provider_id: String,
 ) -> Result<serde_json::Value, String> {
+    // A provider's id, or one of its cards'.
     let profile = {
         let cfg = state.config.lock().unwrap();
         cfg.providers
             .iter()
             .find(|p| p.id == provider_id)
+            .or_else(|| cfg.provider_of_card(&provider_id))
             .cloned()
             .ok_or("no such provider profile")?
     };
+    let provider_id = profile.id.clone();
     if profile.provider_type != "openrouter" {
         return Err("not an OpenRouter profile".into());
     }
@@ -435,107 +496,72 @@ pub async fn openrouter_credits(
     openrouter::get_credits(&key).await
 }
 
-/// One selectable row in the provider-add model picker (mirrors TS
-/// `ModelPickerEntry`, `src/lib/types.ts`). `matched: false` means the id
-/// came straight from the vendor's own key-validation response (the key
-/// really does grant access to it) but didn't cross-reference against the
-/// cached OpenRouter catalog — every ranking field is `None` in that case,
-/// never fabricated.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelPickerEntry {
-    pub id: String,
-    pub name: String,
-    pub cost_tier: Option<catalog::CostTier>,
-    pub capability_score: Option<f64>,
-    pub price_rank: Option<f64>,
-    pub created: Option<i64>,
-    pub context_length: Option<u32>,
-    pub matched: bool,
-}
-
-/// Validate an in-progress (unsaved) provider profile's API key and return
-/// its available models, ranked/cost-tagged where possible. Never touches
-/// the keyring — the profile doesn't exist yet, so `secret` is the raw,
-/// unsaved form value, and it's never logged.
+/// Check a provider's key and list the models it offers, for its checklist
+/// (the form then describes and ranks them: `describe_provider_models`).
+/// `secret` is the raw, unsaved form value; when it is blank and the
+/// provider is saved (`provider_id`), the stored key is used. Never logged.
+/// Never fabricates entries.
 #[tauri::command]
 pub async fn discover_provider_models(
     state: tauri::State<'_, AppState>,
     provider_type: String,
     base_url: String,
-    secret: String,
-) -> Result<Vec<ModelPickerEntry>, String> {
-    discover_models_internal(&state, &provider_type, &base_url, &secret).await
-}
-
-/// Same as `discover_provider_models`, but for an already-saved profile
-/// whose key the user left blank while editing ("leave blank to keep",
-/// `ProviderForm.tsx`) — reads `provider_type`/`base_url` from the saved
-/// profile and the secret from the keyring instead of taking them as params.
-#[tauri::command]
-pub async fn discover_provider_models_for_saved(
-    state: tauri::State<'_, AppState>,
-    provider_id: String,
-) -> Result<Vec<ModelPickerEntry>, String> {
-    let (provider_type, base_url) = {
-        let cfg = state.config.lock().unwrap();
-        let p = cfg
-            .providers
-            .iter()
-            .find(|p| p.id == provider_id)
-            .ok_or("no such provider profile")?;
-        (p.provider_type.clone(), p.base_url.clone())
+    provider_id: Option<String>,
+    secret: Option<String>,
+) -> Result<Vec<String>, String> {
+    let typed = secret
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let key = match (typed, provider_id.filter(|id| !id.is_empty())) {
+        (Some(k), _) => Some(k),
+        (None, Some(id)) => providers::get_secret_async(&id).await,
+        (None, None) => None,
     };
-    let secret = providers::get_secret_async(&provider_id)
-        .await
-        .ok_or("no API key stored for this profile — edit it and add one")?;
-    discover_models_internal(&state, &provider_type, &base_url, &secret).await
+    let mut models = discover_models(&state, &provider_type, &base_url, key.as_deref()).await?;
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        return Err("The provider listed no models.".into());
+    }
+    Ok(models)
 }
 
-/// Shared per-provider-type dispatch behind both commands above. Always
-/// starts by refreshing the OpenRouter catalog cache if it's stale — this
-/// (opening Add/Edit Provider) is what keeps the catalog from going stale
-/// over a long-running session, not a background timer.
-async fn discover_models_internal(
+/// Per-type dispatch behind [`discover_provider_models`]. Starts by
+/// refreshing the OpenRouter catalog cache if it is stale — opening a
+/// provider's form is what keeps the catalog from going stale over a
+/// long-running session, not a background timer.
+async fn discover_models(
     state: &AppState,
     provider_type: &str,
     base_url: &str,
-    secret: &str,
-) -> Result<Vec<ModelPickerEntry>, String> {
+    key: Option<&str>,
+) -> Result<Vec<String>, String> {
     catalog::ensure_catalog_fresh(state).await;
-    let catalog_entries: Vec<catalog::OpenRouterCatalogEntry> = state
-        .openrouter_catalog
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|c| c.entries.clone())
-        .unwrap_or_default();
-
+    let need_key = || key.ok_or_else(|| "Enter the provider's API key first.".to_string());
     match provider_type {
         "openrouter" => {
-            // The credits endpoint is the validation step — the catalog
-            // itself needs no key at all, so this is purely "does this key
-            // work", not a second data source.
-            openrouter::get_credits(secret).await?;
-            Ok(catalog_entries
-                .iter()
-                .map(|e| ModelPickerEntry {
-                    id: e.id.clone(),
-                    name: e.name.clone(),
-                    cost_tier: e.cost_tier,
-                    capability_score: e.intelligence_index,
-                    price_rank: e.price_rank,
-                    created: e.created,
-                    context_length: e.context_length,
-                    matched: true,
-                })
-                .collect())
+            // The credits endpoint is the key check — the catalog itself
+            // needs no key, so it is the model list.
+            openrouter::get_credits(need_key()?).await?;
+            let ids: Vec<String> = state
+                .openrouter_catalog
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.entries.iter().map(|e| e.id.clone()).collect())
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Err("OpenRouter's model list could not be loaded — try again.".into());
+            }
+            Ok(ids)
         }
         "anthropic" => {
-            let client = crate::util::http_client();
-            let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-            let resp = client
-                .get(url)
-                .header("x-api-key", secret)
+            let resp = crate::util::http_client()
+                .get(format!(
+                    "{}/v1/models?limit=1000",
+                    base_url.trim_end_matches('/')
+                ))
+                .header("x-api-key", need_key()?)
                 .header("anthropic-version", "2023-06-01")
                 .timeout(std::time::Duration::from_secs(15))
                 .send()
@@ -545,32 +571,57 @@ async fn discover_models_internal(
                 return Err(classify_key_error(resp.status(), "Anthropic"));
             }
             let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(merge_with_catalog(
-                parse_anthropic_models(&json),
-                &catalog_entries,
-            ))
+            Ok(ids_of(&json["data"], "id"))
         }
-        "openai" | "fireworks" | "deepinfra" => {
-            let client = crate::util::http_client();
-            let url = format!("{}/models", base_url.trim_end_matches('/'));
-            let resp = client
-                .get(url)
-                .bearer_auth(secret)
-                .timeout(std::time::Duration::from_secs(15))
+        "ollama" => {
+            let resp = crate::util::http_client()
+                .get(format!("{}/api/tags", base_url.trim_end_matches('/')))
+                .timeout(std::time::Duration::from_secs(10))
                 .send()
                 .await
-                .map_err(|e| format!("could not reach the provider: {e}"))?;
+                .map_err(|e| format!("could not reach Ollama: {e}"))?;
             if !resp.status().is_success() {
-                return Err(classify_key_error(resp.status(), "The provider"));
+                return Err(format!("Ollama answered {}", resp.status()));
             }
             let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(merge_with_catalog(
-                parse_openai_compat_models(&json),
-                &catalog_entries,
-            ))
+            Ok(ids_of(&json["models"], "name"))
         }
-        other => Err(format!("model discovery isn't available for \"{other}\"")),
+        // OpenAI and every OpenAI-compatible service: `GET /models`. A
+        // schemeless self-hosted entry fans out to https-then-http.
+        _ => {
+            let mut attempts: Vec<(String, String)> = Vec::new();
+            for base in providers::endpoint::candidates(base_url) {
+                let mut req = crate::util::http_client()
+                    .get(format!("{base}/models"))
+                    .timeout(std::time::Duration::from_secs(15));
+                if let Some(k) = key {
+                    req = req.bearer_auth(k);
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let json: serde_json::Value =
+                            resp.json().await.map_err(|e| e.to_string())?;
+                        return Ok(ids_of(&json["data"], "id"));
+                    }
+                    // A reachable endpoint that refuses us: a key problem,
+                    // which the other scheme will not fix.
+                    Ok(resp) => return Err(classify_key_error(resp.status(), "The provider")),
+                    Err(e) => attempts.push((base, providers::endpoint::humanize(&e))),
+                }
+            }
+            Err(providers::endpoint::unreachable_message(&attempts))
+        }
     }
+}
+
+fn ids_of(list: &serde_json::Value, field: &str) -> Vec<String> {
+    list.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m[field].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn classify_key_error(status: reqwest::StatusCode, who: &str) -> String {
@@ -579,88 +630,6 @@ fn classify_key_error(status: reqwest::StatusCode, who: &str) -> String {
     } else {
         format!("{who} returned {status}")
     }
-}
-
-/// `(id, display_name, created_unix)` per model. Anthropic's own timestamp
-/// field is `created_at` (RFC3339), not a unix int — parsed opportunistically
-/// so an unmatched Anthropic model can still sort under "Newest".
-fn parse_anthropic_models(json: &serde_json::Value) -> Vec<(String, Option<String>, Option<i64>)> {
-    json.get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    let id = m.get("id").and_then(|v| v.as_str())?.to_string();
-                    let name = m
-                        .get("display_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let created = m
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|dt| dt.timestamp());
-                    Some((id, name, created))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `(id, None, created_unix)` per model — the standard OpenAI-compatible
-/// `/models` shape has no human-readable name field, only `id`/`created`/
-/// `owned_by`.
-fn parse_openai_compat_models(
-    json: &serde_json::Value,
-) -> Vec<(String, Option<String>, Option<i64>)> {
-    json.get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    let id = m.get("id").and_then(|v| v.as_str())?.to_string();
-                    let created = m.get("created").and_then(|v| v.as_i64());
-                    Some((id, None, created))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Cross-reference each raw `(id, name?, created?)` against the cached
-/// OpenRouter catalog. A model with no match still appears — `matched:
-/// false`, ranking fields all `None` — never hidden, never fabricated. The
-/// vendor's own name/created (when given) always wins over the catalog's.
-fn merge_with_catalog(
-    raw: Vec<(String, Option<String>, Option<i64>)>,
-    catalog_entries: &[catalog::OpenRouterCatalogEntry],
-) -> Vec<ModelPickerEntry> {
-    raw.into_iter()
-        .map(
-            |(id, name_opt, created_opt)| match catalog::match_in_catalog(&id, catalog_entries) {
-                Some(e) => ModelPickerEntry {
-                    name: name_opt.unwrap_or_else(|| e.name.clone()),
-                    cost_tier: e.cost_tier,
-                    capability_score: e.intelligence_index,
-                    price_rank: e.price_rank,
-                    created: created_opt.or(e.created),
-                    context_length: e.context_length,
-                    matched: true,
-                    id,
-                },
-                None => ModelPickerEntry {
-                    name: name_opt.unwrap_or_else(|| id.clone()),
-                    cost_tier: None,
-                    capability_score: None,
-                    price_rank: None,
-                    created: created_opt,
-                    context_length: None,
-                    matched: false,
-                    id,
-                },
-            },
-        )
-        .collect()
 }
 
 /// Check that a provider card works: reachable, and its key accepted. Used by
@@ -673,9 +642,9 @@ pub async fn test_provider_connection(
 ) -> Result<(), String> {
     let profile = {
         let cfg = state.config.lock().unwrap();
-        cfg.providers.iter().find(|p| p.id == id).cloned()
+        cfg.card(&id)
     };
-    let profile = profile.ok_or("That provider no longer exists.")?;
+    let profile = profile.ok_or("That model is no longer available.")?;
     providers::test_connection(&profile).await
 }
 
@@ -692,7 +661,9 @@ pub async fn test_provider_draft(
         .filter(|s| !s.is_empty());
     let key = match typed {
         Some(k) => Some(k),
-        None if !profile.id.is_empty() => providers::get_secret_async(&profile.id).await,
+        None if !profile.id.is_empty() => {
+            providers::get_secret_async(profile.secret_account()).await
+        }
         None => None,
     };
     providers::test_connection_with_key(&profile, key).await
@@ -706,9 +677,7 @@ pub async fn test_active_provider_connection(
 ) -> Result<(), String> {
     let profile = {
         let cfg = state.config.lock().unwrap();
-        cfg.active_provider_id
-            .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+        cfg.active_provider_id.as_ref().and_then(|id| cfg.card(id))
     };
     match profile {
         Some(p) => providers::test_connection(&p).await,
@@ -720,11 +689,8 @@ fn usable_profile(app: &AppHandle, id: &str) -> Result<ProviderProfile, String> 
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap();
     let profile = cfg
-        .providers
-        .iter()
-        .find(|p| p.id == id)
-        .cloned()
-        .ok_or("That provider no longer exists.")?;
+        .card(id)
+        .ok_or("That model is no longer available — check it under Settings → Providers.")?;
     if !profile.is_usable() {
         return Err(format!(
             "{} can no longer be used; choose another provider.",
@@ -776,7 +742,7 @@ pub async fn set_chat_provider(
     providers::test_connection(&profile)
         .await
         .map_err(|e| format!("Can't switch to {} — {e}", profile.name))?;
-    let model = profile.models.first().cloned().unwrap_or_default();
+    let model = profile.model().to_string();
     crate::bigtiny::providers::set_session_provider(&app, &session_id, &profile.id, &model).await;
     if let Err(e) = crate::bigtiny::sessions::update_persona_override(
         &app,
