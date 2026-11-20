@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { MessageItem } from './MessageItem';
 import { ThinkingIndicator, type ProgressStage } from './ThinkingIndicator';
 import type { Message } from '@/stores/chatStore';
+import { useFindStore } from '@/stores/findStore';
 
 // Below this many messages we render plainly (the well-tested path); beyond it
 // we virtualize so a 500+ message session scrolls smoothly (Phase 8).
@@ -36,7 +37,10 @@ export function MessageList({
   const scrollRef = useRef<HTMLDivElement>(null);
   const savedScrollRef = useRef<number | null>(null);
   const carry: ScrollCarry = { scrollRef, savedScrollRef };
-  if (messages.length > VIRTUALIZE_THRESHOLD) {
+  // While the find bar is open every message is rendered, so every match is
+  // in the page to be found and scrolled to (`FindBar`).
+  const finding = useFindStore((s) => s.open);
+  if (messages.length > VIRTUALIZE_THRESHOLD && !finding) {
     return <VirtualList messages={messages} stage={stage} carry={carry} />;
   }
   return <PlainList messages={messages} empty={empty} stage={stage} carry={carry} />;

@@ -66,6 +66,10 @@ windows = { version = "0.58", features = [
     # cross-platform crate's abstraction buys nothing here).
     "Win32_Graphics_Gdi",
 ] }
+# The WebView2 context-menu bridge (`context_menu.rs`): the same versions
+# wry uses, so the COM interfaces are the ones Tauri's webview hands over.
+webview2-com = "0.38"
+windows-core = "0.61"
 # Same version tauri-plugin-notification vendors transitively. Used directly
 # (Round-3 item 27) because the plugin's own show() discards the toast
 # activation handle, giving us no way to detect a notification click.

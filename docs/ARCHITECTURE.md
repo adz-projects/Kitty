@@ -58,15 +58,27 @@ lib.rs (app setup, window creation, generate_handler! list;
   │                     running elsewhere), notices, tool results
   │     turn_text.rs   how a user turn is laid out (documents, file list) and
   │                     parsed back for replay
-  │     providers.rs   sync every provider card into the engine
+  │     providers.rs   sync every model card (checked model) into the engine
   │     specialists.rs, mcp.rs (bundled servers self-heal), pathway.rs,
   │     memorabilia.rs, effort/ (ladder, detect), vision.rs, context_window.rs
   │
   ├─► config/                                app config (%APPDATA%/Kitty/config.json;
   │     mod.rs         Config, load/save,      app-private dir on Android);
   │                     patch (merge patch)     every save emits config://changed
-  │     providers/     provider cards: network tier, secrets, endpoint scheme
-  │                     probing, connection test
+  │     providers/     providers and their model cards (one per checked
+  │                     model, `Config::cards`), the one-card-per-model →
+  │                     provider migration, network tier, secrets, endpoint
+  │                     scheme probing, connection test
+  │
+  ├─► ai_models/                             a provider's models described from the
+  │     mod.rs         OpenRouter catalog: ranked (intelligence less age),
+  │                     $/$$/$$$ price bands
+  │     defaults.rs    the suggested model (the first default, and the one
+  │                     checked when a long list is fetched)
+  │
+  ├─► context_menu.rs                        WebView2's own right-click menu
+  │                                           suppressed and bridged to Kitty's;
+  │                                           browser keys off [Windows]
   │
   ├─► models/                                helper-model downloads (no AppHandle):
   │     download.rs    resumable HuggingFace fetch: .part + sha256 + rename,
@@ -152,7 +164,9 @@ windows/{hub,overlay,screenshot-select}/App.tsx  one entry point per window labe
   │                          `outputs/` folder; never opens by itself
   ├─► components/shared/     Dialog (focus trap, Escape/Back), ConfirmDialog
   │                          (confirmDialog(), typed confirmation), Banner,
-  │                          ErrorDetail, StackStatusView
+  │                          ErrorDetail, StackStatusView, ContextMenu (the
+  │                          window's one right-click menu; surfaces register
+  │                          with `lib/contextMenu.ts`)
   ├─► components/wizard/     first run; repair opens at the broken step
   │
   ├─► stores/                zustand — render state only (rule 3)
@@ -215,8 +229,10 @@ Settings. Memorabilia and specialists are off on Android.
 1. **Conversations, schedules, providers as the engine uses them, MCP
    registrations, approval rules** → the engine. The frontend's `messages[]`
    is a reconstruction from `chat://*` events, never persisted app-side.
-   Provider cards are Kitty's (`config.json` + secret store), and every one is
-   synced into the engine.
+   Providers are Kitty's (`config.json` + secret store). A provider holds the
+   models it offers and the ones the user checked; each checked model is a
+   *model card* with a stable id of its own, and every card is synced into the
+   engine as one provider row (chats, schedules and specialists pin a card).
 2. **Settings** → `config.json`, written through `patch_config` (only the
    fields that changed), with `config://changed` telling every window.
 3. **Secrets** → never `config.json`, never the webview. Desktop: Windows
@@ -225,3 +241,23 @@ Settings. Memorabilia and specialists are off on Android.
    (`encryption.key.dpapi`). Android: AES-256-GCM under a non-exportable
    AndroidKeyStore key (`src/android/secrets.rs` over `SecretStore.kt`), which
    also holds the in-process engine's key.
+
+## Cross-cutting: right-click menus and Ctrl+F
+
+WebView2's own menu never shows (`src-tauri/src/context_menu.rs`, after
+Bacon's). Each window's `ContextMenuRequested` is handled in Rust (`Handled`
+plus a deferral) and the native items worth keeping — spelling suggestions,
+Add to dictionary, Cut/Copy/Paste, Paste as plain text, Select all — go to that
+window as `context-menu://requested`; `ContextMenu.tsx` draws Kitty's menu and
+answers with `context_menu_choose(id | null)`, so a native item is run by
+WebView2 itself. **Never `preventDefault` the DOM `contextmenu` event on
+Windows** (WebView2 would not raise the request). Surfaces register providers
+on their element (`registerContextMenu` / `useContextMenu`): messages (link,
+code block, copy, branch, regenerate, export, find), chat-list rows, output and
+artifact cards. Anything else gets the native editing items in a field, Copy on
+a selection, and otherwise no menu. Android keeps the system's long-press.
+
+Browser accelerator keys are off, so Ctrl+F is Kitty's: it opens the chat's
+find bar (`FindBar.tsx`, `lib/findInPage.ts`), which paints matches with the
+CSS Custom Highlight API and renders every message while open (no
+virtualization), so every match can be found.

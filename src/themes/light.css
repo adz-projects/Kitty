@@ -23,6 +23,9 @@
   --chat-strong: #403d3a;
   --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
   --selection: #e5e0d3;
+  --find-match: #f0dd9a;
+  --find-current: #d9a52b;
+  --find-current-text: #262422;
   --overlay-opacity: 1;
   --overlay-shadow: 0 1px 2px rgba(38, 36, 34, 0.08), 0 10px 28px rgba(38, 36, 34, 0.13);
   --ok: #3f6b3a;

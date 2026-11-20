@@ -11,6 +11,7 @@ mod approvals;
 mod bigtiny;
 mod commands;
 mod config;
+mod context_menu;
 // Global hotkeys and the tray both exist only on desktop: Android has no
 // OS-wide shortcut registration and `tauri::tray` is itself gated on
 // `all(desktop, feature = "tray-icon")`. See docs/ANDROID.md D23/§2.5.
@@ -272,6 +273,7 @@ pub fn run() {
             commands::upsert_provider,
             commands::delete_provider,
             commands::list_provider_accounts,
+            context_menu::context_menu_choose,
             ai_models::describe_provider_models,
             ai_models::defaults::suggest_provider_model,
             commands::activate_provider,

@@ -8,6 +8,7 @@ import { ChatTranscript } from './ChatTranscript';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { isAndroid } from '@/lib/platform';
+import { FindBar } from './FindBar';
 import { SubagentChip } from './SubagentChip';
 import { ChatHeaderControls } from './ChatHeaderControls';
 import { FileChips } from './FileChips';
@@ -292,6 +293,7 @@ export function ChatView({ headerSlot }: { headerSlot?: HTMLElement | null } = {
       )}
 
       <ChatTranscript />
+      <FindBar />
 
       {pendingApprovals
         .filter((a) => a.session_id === sessionId)

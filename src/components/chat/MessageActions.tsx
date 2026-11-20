@@ -8,6 +8,9 @@ import { MessageInfo } from './MessageInfo';
 import { BranchIcon } from '@/components/icons/BranchIcon';
 import { RefreshIcon } from '@/components/icons/RefreshIcon';
 import { CopyIcon } from '@/components/icons/CopyIcon';
+import { ipc } from '@/lib/ipc';
+import { registerContextMenu, type MenuEntry, type ProvidedMenu } from '@/lib/contextMenu';
+import { useFindStore } from '@/stores/findStore';
 
 /** Branch / Export / Regenerate / Copy / info for one message. Regenerate
  * appears on the latest answer only, and Branch/Regenerate wait while the chat
@@ -87,10 +90,92 @@ function useMessageActionHandlers(message: Message, index: number) {
 
 const BUSY_TITLE = 'Wait for the reply to finish';
 
+/** A message's right-click menu: the link or code block clicked, then the
+    message's own actions (the same as its hover row), then Find. A text
+    selection gets the native Copy first (`resolveMenu`). Pure, so the
+    target is passed in. */
+export function messageMenu(
+  target: Element,
+  message: Message,
+  actions: Pick<Handlers, 'busy' | 'chatBusy' | 'canRegenerate'> & {
+    copy: () => void;
+    branch: () => void;
+    exportFromHere: () => void;
+    regenerate: () => void;
+    find: () => void;
+    copyText: (text: string) => void;
+    openLink: (href: string) => void;
+  }
+): ProvidedMenu {
+  const groups: MenuEntry[][] = [];
+  const link = target.closest('a[href]');
+  const href = link?.getAttribute('href') ?? '';
+  if (link && /^(https?|mailto):/i.test(href)) {
+    groups.push([
+      { kind: 'item', label: 'Open link', run: () => actions.openLink(href) },
+      {
+        kind: 'item',
+        label: href.startsWith('mailto:') ? 'Copy email address' : 'Copy link address',
+        run: () => actions.copyText(href.replace(/^mailto:/i, '')),
+      },
+    ]);
+  }
+  const code = target.closest('pre');
+  if (code) {
+    groups.push([
+      { kind: 'item', label: 'Copy code', run: () => actions.copyText(code.textContent ?? '') },
+    ]);
+  }
+  const waiting = actions.busy || actions.chatBusy;
+  const own: MenuEntry[] = [
+    {
+      kind: 'item',
+      label: message.role === 'assistant' ? 'Copy message as Markdown' : 'Copy message',
+      run: actions.copy,
+    },
+    { kind: 'item', label: 'Branch from here', run: actions.branch, disabled: waiting },
+  ];
+  if (message.role === 'assistant' && actions.canRegenerate) {
+    own.push({ kind: 'item', label: 'Regenerate', run: actions.regenerate, disabled: waiting });
+  }
+  own.push({
+    kind: 'item',
+    label: 'Export from here…',
+    run: actions.exportFromHere,
+    disabled: actions.busy,
+  });
+  groups.push(own);
+  groups.push([{ kind: 'item', label: 'Find in chat', shortcut: 'Ctrl+F', run: actions.find }]);
+  return { groups };
+}
+
+function copyText(text: string) {
+  void navigator.clipboard.writeText(text).catch(() => {
+    /* clipboard may be unavailable */
+  });
+}
+
 function DesktopMessageActions({ message, actions }: { message: Message; actions: Handlers }) {
   const { busy, chatBusy, copied } = actions;
+  // Right-clicking anywhere on the message offers the same actions as this
+  // row, plus the link or code block under the pointer.
+  const rowRef = useRef<HTMLDivElement>(null);
+  const latest = useRef(actions);
+  latest.current = actions;
+  useEffect(() => {
+    const el = rowRef.current?.closest('.msg');
+    if (!el) return;
+    return registerContextMenu(el, (ctx) =>
+      messageMenu(ctx.target, message, {
+        ...latest.current,
+        find: () => useFindStore.getState().show(),
+        copyText,
+        openLink: (href) => void ipc.openUrl(href).catch(() => {}),
+      })
+    );
+  }, [message]);
   return (
-    <div className="msg-actions">
+    <div className="msg-actions" ref={rowRef}>
       <button
         title={chatBusy ? BUSY_TITLE : 'Branch a new session from here'}
         disabled={busy || chatBusy}

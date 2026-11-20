@@ -25,6 +25,7 @@ import {
 import { isAndroid } from '@/lib/platform';
 import { relativeTime } from '@/lib/relativeTime';
 import { SessionKebabMenu } from './SessionKebabMenu';
+import { useContextMenu } from '@/components/shared/ContextMenu';
 import { SessionSelectionBar } from './SessionSelectionBar';
 import type { SessionSummary } from '@/lib/types';
 import { FolderIcon } from '@/components/icons/FolderIcon';
@@ -776,9 +777,55 @@ function SessionRow({
   useEffect(() => {
     if (dragging) didDrag.current = true;
   }, [dragging]);
+  // Right-click: the same actions as the ⋮ menu, plus a new window.
+  const rowRef = useRef<HTMLDivElement>(null);
+  useContextMenu(rowRef, () =>
+    isAndroid() || selectionMode
+      ? null
+      : {
+          groups: [
+            [
+              { kind: 'item', label: 'Open', run: () => rowRef.current?.click() },
+              {
+                kind: 'item',
+                label: 'Open in new window',
+                run: () =>
+                  void ipc
+                    .openNewChatWindow({
+                      session_id: s.sessionId,
+                      cwd: s.cwd,
+                      provider_id: s.providerId || undefined,
+                      model: s.modelId || undefined,
+                    })
+                    .catch(() => {}),
+              },
+            ],
+            [
+              {
+                kind: 'item',
+                label: 'Rename…',
+                run: () => {
+                  setRenameValue(s.title);
+                  setRenaming(true);
+                },
+              },
+              { kind: 'item', label: 'Export as ChatML…', run: () => void exportOne(s) },
+            ],
+            [
+              {
+                kind: 'item',
+                label: 'Delete…',
+                danger: true,
+                run: () => setConfirmingDelete(true),
+              },
+            ],
+          ],
+        }
+  );
 
   return (
     <div
+      ref={rowRef}
       className={`session-item${active ? ' active' : ''}${dragging ? ' dragging' : ''}${resuming ? ' resuming' : ''}${selectionMode ? ' selectable' : ''}${selected ? ' selected' : ''}`}
       onClick={() => {
         if (didDrag.current) return;

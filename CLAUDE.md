@@ -221,10 +221,20 @@ engine-managed) and why mixing them is a bug.
   while Kitty's process is alive, and one that fell due meanwhile runs when
   Kitty next opens (headless runs: `docs/BACKLOG.md`). Settings shows the last
   run with a link to its chat, and "Run now". Failures notify.
-- **Providers** — each card is one provider + one model (Duplicate to add
-  another model); every card is synced into the engine, and the default is
-  just a flag. A chat stays on its card; moving it is a branch onto another
-  card, through the handoff gate when the target is less trusted.
+- **Providers** (`config/providers/`, `ai_models/`, Settings → Providers) —
+  a provider is one service and key with the models it offers; the user
+  fetches them and checks the ones for Kitty's model list. Each checked model
+  is a *model card* with a stable id (`ProviderProfile::model_ids`), and every
+  card is synced into the engine as its own provider row. Model lists are
+  ranked by intelligence less age and marked `$`/`$$`/`$$$` by output price
+  (OpenRouter's catalog). The default model is chosen from a dropdown at the
+  top of the panel; the first provider fills it in. A chat stays on its card;
+  moving it is a branch onto another card, through the handoff gate when the
+  target is less trusted.
+- **Right-click menus and Ctrl+F** (`context_menu.rs`, `lib/contextMenu.ts`,
+  `FindBar.tsx`) — Kitty draws its own menus, keeping WebView2's spelling and
+  editing items; browser keys are off and Ctrl+F finds in the chat. See
+  `docs/ARCHITECTURE.md`.
 - **Decision model** (`lifecycle/decider.rs`, `commands/decider.rs`,
   `components/settings/DecisionModel.tsx`; engine `BigTinyV2/daemon/src/decider/`)
   — an optional small classifier (Liquid d1 on a `llama-server`, dialect

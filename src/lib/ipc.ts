@@ -4,6 +4,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import type { MenuRequest } from '@/lib/contextMenu';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import type {
   AdaptivePathwayEmbeddingStatusPayload,
@@ -415,6 +417,9 @@ export const ipc = {
   // Providers
   /** The user's model list: every checked model as a card, ranked. */
   listProviders: () => invoke<ProviderView[]>('list_providers'),
+  /** Answer this window's right-click: the native item picked, or null. */
+  contextMenuChoose: (commandId: number | null) =>
+    invoke<void>('context_menu_choose', { commandId }),
   /** The providers themselves, each with its ranked model list. */
   listProviderAccounts: () => invoke<ProviderAccountView[]>('list_provider_accounts'),
   /** Describe and rank a provider form's model list against the catalog. */
@@ -892,3 +897,7 @@ export const windowReady = (): Promise<void> => invoke<void>('window_ready');
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());
 
+/** A right-click in THIS window (the WebView2 bridge, `context_menu.rs`):
+    only this window's. */
+export const onContextMenuRequested = (cb: (p: MenuRequest) => void): Promise<UnlistenFn> =>
+  getCurrentWebviewWindow().listen<MenuRequest>('context-menu://requested', (e) => cb(e.payload));

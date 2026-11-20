@@ -37,6 +37,9 @@ apply at runtime with no rebuild.
 | `--reading-max-width` / `--reading-line-height` | Width of the chat column (default `44rem`) and the leading of chat text (default `1.6`). |
 | `--chat-font-size` | Size of chat text: the user's turns and the answer's prose (default `0.90625rem`, 14.5px, chosen for Open Sans; a serif reading face wants about a quarter more). |
 | `--selection`   | Text-selection background. Defaults to the system highlight.  |
+| `--find-match`  | Background of every match while finding in a chat (Ctrl+F). Defaults to `--selection`. |
+| `--find-current` | Background of the current match. Defaults to `--accent`. |
+| `--find-current-text` | Text colour of the current match. Defaults to `--accent-text`. |
 | `--ok-bg` / `--warn-bg` / `--danger-bg` | Tinted backgrounds for success, warning and error panels. Default to `--surface-2` or none. |
 
 ## Figures

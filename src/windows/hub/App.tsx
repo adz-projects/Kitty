@@ -14,6 +14,9 @@ import { useStackStore } from '@/stores/stackStore';
 import { drainIncoming } from '@/lib/incoming';
 import { ApprovalModal } from '@/components/chat/ApprovalModal';
 import { useChatStore } from '@/stores/chatStore';
+import { ContextMenu } from '@/components/shared/ContextMenu';
+import { useFindStore } from '@/stores/findStore';
+import { isFindKey } from '@/lib/contextMenu';
 
 /** The hub window (docs/ANDROID.md §8.1): one window routing between chat,
     settings and setup, where there used to be three.
@@ -70,6 +73,18 @@ export function App() {
   // half-configured app.
   useBackDismiss(android && (view === 'settings' || view === 'sessions'), () => goto('chat'));
 
+  // Ctrl+F: find in the chat on screen. The browser's own find is off
+  // (`context_menu.rs`); elsewhere (Settings, setup) it does nothing.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!isFindKey(e)) return;
+      e.preventDefault();
+      if (useRouteStore.getState().view === 'chat') useFindStore.getState().show();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   return (
     <>
       <TitleBar actionsRef={setTitleBarSlot} searchRef={setSearchSlot} />
@@ -94,6 +109,7 @@ export function App() {
         onScreenSessionId={view === 'chat' ? sessionId : null}
         canOpenChat={view === 'chat'}
       />
+      <ContextMenu />
     </>
   );
 }

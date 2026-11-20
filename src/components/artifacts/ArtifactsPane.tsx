@@ -12,6 +12,8 @@ import { useRouteStore } from '@/stores/routeStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import type { FileEntry } from '@/lib/types';
+import { useContextMenu } from '@/components/shared/ContextMenu';
+import { fileMenu } from '@/lib/contextMenu';
 
 const POLL_INTERVAL_MS = 5000;
 /** How often the folder is rescanned while no turn is running. */
@@ -230,9 +232,19 @@ function ArtifactCard({ entry, android }: { entry: FileEntry; android: boolean }
     }
   };
   const description = describeOutput({ name: entry.name, isDir: entry.is_dir, size: entry.size });
+  const cardRef = useRef<HTMLDivElement>(null);
+  useContextMenu(cardRef, () =>
+    android
+      ? null
+      : fileMenu({
+          open: () => void act(ipc.openPath(entry.path), 'open it'),
+          reveal: () => void act(ipc.revealPath(entry.path), 'show it'),
+          copyPath: () => void act(navigator.clipboard.writeText(entry.path), 'copy its path'),
+        })
+  );
 
   return (
-    <div className="artifact-card">
+    <div className="artifact-card" ref={cardRef}>
       <div className="artifact-name" title={entry.path}>
         {entry.is_dir ? <FolderIcon /> : <DocumentIcon />} <span>{entry.name}</span>
       </div>

@@ -158,6 +158,7 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .skip_taskbar(true)
         .visible(false)
         .build()?;
+    crate::context_menu::install(&win);
     place_overlay_bottom_right(&win);
     #[cfg(desktop)]
     {
@@ -680,6 +681,7 @@ fn ensure_window(
     #[cfg(desktop)]
     let builder = builder.decorations(false);
     let win = builder.build()?;
+    crate::context_menu::install(&win);
     #[cfg(debug_assertions)]
     spawn_load_watchdog(app, win.clone(), label.to_string());
     Ok(win)

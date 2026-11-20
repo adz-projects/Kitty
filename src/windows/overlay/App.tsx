@@ -13,6 +13,9 @@ import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { DoubleChevronIcon } from '@/components/icons/DoubleChevronIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import type { StackStatus } from '@/lib/types';
+import { ContextMenu } from '@/components/shared/ContextMenu';
+import { useFindStore } from '@/stores/findStore';
+import { isFindKey } from '@/lib/contextMenu';
 
 const DEGRADED: StackStatus[] = ['backend_down'];
 
@@ -25,8 +28,15 @@ export function App() {
     void init();
     void initAdaptivePathway();
     // Escape hides the overlay when it has focus (CLAUDE.md Phase 0).
+    // Ctrl+F finds in the chat (the browser's own find is off).
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') void ipc.hideOverlay();
+      if (isFindKey(e)) {
+        e.preventDefault();
+        useFindStore.getState().show();
+      } else if (e.key === 'Escape' && !e.defaultPrevented) {
+        // The find bar's and the menu's own Escape close them, not the overlay.
+        void ipc.hideOverlay();
+      }
     };
     window.addEventListener('keydown', onKey);
     const unlisten = onNewSessionRequest(() => void useChatStore.getState().newSession());
@@ -110,6 +120,7 @@ export function App() {
       </div>
       <ConfirmHost />
       <ApprovalModal onScreenSessionId={degraded || bootSpinner ? null : sessionId} />
+      <ContextMenu />
     </div>
   );
 }

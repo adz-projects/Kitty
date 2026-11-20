@@ -1,4 +1,6 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { useContextMenu } from '@/components/shared/ContextMenu';
+import { fileMenu } from '@/lib/contextMenu';
 import { ipc } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
 import { describeOutput, outputKey } from '@/lib/outputs';
@@ -61,9 +63,19 @@ function OutputCard({ output }: { output: OutputRef }) {
       setError(`Couldn't ${what}: ${String(e)}`);
     }
   };
+  const cardRef = useRef<HTMLDivElement>(null);
+  useContextMenu(cardRef, () =>
+    android
+      ? null
+      : fileMenu({
+          open: () => void act(ipc.openPath(output.path), 'open it'),
+          reveal: () => void act(ipc.revealPath(output.path), 'show it'),
+          copyPath: () => void act(navigator.clipboard.writeText(output.path), 'copy its path'),
+        })
+  );
 
   return (
-    <div className="output-card">
+    <div className="output-card" ref={cardRef}>
       <div className="output-card-main">
         <span className="output-card-icon" aria-hidden="true">
           {output.isDir ? <FolderIcon /> : <DocumentIcon />}

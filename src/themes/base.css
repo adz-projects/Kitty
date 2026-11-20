@@ -2803,65 +2803,77 @@ button.link {
   white-space: nowrap;
 }
 
-/* Model picker (provider-add redesign) — filter chips, search, and a
-   single-select scrollable list, shown once a key validates. */
-.model-picker {
+/* Settings → Providers: a provider's models, each checked into Kitty's
+   model list or not, ranked, with their price band. */
+.model-list-head {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
 }
-.model-picker-filters button {
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text-muted);
-  border-radius: 999px;
-  padding: 4px 10px;
-  font-size: var(--fs-sm);
-  cursor: pointer;
+.model-list-tools {
+  margin: 6px 0;
+  flex-wrap: nowrap;
 }
-.model-picker-filters button.active {
-  background: var(--surface-2);
-  color: var(--accent);
-  border-color: var(--accent);
-  font-weight: 500;
+.model-list-tools input {
+  flex: 1;
+  min-width: 0;
 }
-.model-picker-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 260px;
+.model-checklist {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  max-height: 18rem;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 4px;
 }
-/* `.provider-row` (Settings → Providers) gives the base layout/active-state
-   look; this modifier turns it into a clickable, keyboard-focusable option
-   — it's a <button>, not a <div>, so it needs its own reset for text
-   alignment and full width. */
-.model-picker-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  width: 100%;
-  text-align: left;
-  cursor: pointer;
-}
-.model-picker-row:hover {
-  background: var(--surface-2);
-}
-.model-picker-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-.model-picker-meta {
+.model-checklist li {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-shrink: 0;
+  padding: 4px 10px;
   font-size: var(--fs-sm);
+}
+.model-checklist li:hover {
+  background: var(--surface-2);
+}
+.model-checklist .model-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.model-checklist .model-id {
+  margin-left: 8px;
+  color: var(--text-muted);
+  font-size: var(--fs-xs, var(--fs-sm));
+}
+.model-checklist .price-tier {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 2.4em;
+  text-align: right;
+}
+.model-checklist .model-vision,
+.model-checklist .vision-mark {
+  color: var(--text-muted);
+  font-size: var(--fs-xs, var(--fs-sm));
+  white-space: nowrap;
+}
+.default-model-field select {
+  max-width: 100%;
+}
+
+/* A provider's name over its models in a chat's model menu. */
+.provider-group-heading {
+  padding-top: 6px;
+}
+.provider-popover {
+  max-height: min(70vh, 480px);
+  overflow-y: auto;
 }
 
 /* Ollama */
@@ -3574,4 +3586,90 @@ button.link {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   font-size: 11px;
+}
+
+/* Kitty's right-click menu (ContextMenu.tsx): above dialogs; groups split by
+   a rule; the keyboard's item marked like hover. */
+.context-menu {
+  position: fixed;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  max-width: 340px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--overlay-shadow);
+  font-family: var(--font-family);
+  font-size: var(--fs-sm);
+}
+.context-menu-group {
+  display: flex;
+  flex-direction: column;
+}
+.context-menu-group + .context-menu-group {
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+.context-menu button {
+  display: flex;
+  align-items: baseline;
+  gap: 24px;
+  width: 100%;
+  text-align: left;
+  padding: 5px 10px;
+  border: none;
+  background: none;
+  color: inherit;
+  border-radius: var(--radius-sm);
+}
+.context-menu button:hover,
+.context-menu button.active {
+  background: var(--surface-2);
+}
+.context-menu button[aria-disabled='true'] {
+  color: var(--text-muted);
+  cursor: default;
+  background: none;
+}
+.context-menu-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-menu-keys {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.context-menu .danger-item {
+  color: var(--danger);
+}
+
+/* Find in this chat (Ctrl+F): docked under the transcript. */
+.find-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.find-bar input {
+  flex: 1;
+  min-width: 0;
+}
+.find-count {
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+::highlight(kitty-find) {
+  background-color: var(--find-match, var(--selection));
+}
+::highlight(kitty-find-current) {
+  background-color: var(--find-current, var(--accent));
+  color: var(--find-current-text, var(--accent-text));
 }
