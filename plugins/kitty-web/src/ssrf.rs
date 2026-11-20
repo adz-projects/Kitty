@@ -94,7 +94,7 @@ fn ipv4_is_public(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()        // 255.255.255.255
         || ip.is_documentation()    // 192.0.2/24, 198.51.100/24, 203.0.113/24
         || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 CGNAT
-        || (a == 192 && b == 0)     // 192.0.0.0/24 IETF protocol assignments
+        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 IETF protocol assignments
         || (a == 192 && b == 88 && c == 99) // 192.88.99.0/24 6to4 relay anycast
         || (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 benchmarking
         || a >= 240) // 240.0.0.0/4 reserved
@@ -210,6 +210,16 @@ mod tests {
         assert!(blocked("http://255.255.255.255/"));
         assert!(blocked("http://[2001:db8::1]/"));
         assert!(blocked("http://[ff02::1]/"));
+        assert!(blocked("http://192.0.0.8/"));
+    }
+
+    /// 192.0.0.0/24 is reserved, but the rest of 192.0/16 is ordinary public
+    /// space — WordPress VIP (192.0.64.0/18) hosts many news sites there,
+    /// and a `/16` check used to refuse every one of them.
+    #[test]
+    fn the_rest_of_192_0_slash_16_is_public() {
+        assert!(!blocked("http://192.0.66.2/"));
+        assert!(!blocked("http://192.0.1.1/"));
     }
 
     /// The gap `to_ipv4_mapped` alone left open: three other IPv6 formats
