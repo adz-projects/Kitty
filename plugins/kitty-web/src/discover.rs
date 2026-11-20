@@ -351,6 +351,45 @@ fn overlap(title: &HashSet<String>, text: &str) -> usize {
     words(text).intersection(title).count()
 }
 
+/// Longest `<meta http-equiv="refresh">` delay still treated as a redirect.
+/// Download pages say "your file will start in 5 seconds"; a news page that
+/// reloads itself every few minutes is not a redirect.
+const MAX_REFRESH_DELAY_SECS: f64 = 10.0;
+
+/// Where a `<meta http-equiv="refresh" content="N; url=…">` sends the
+/// reader, when it does so within a few seconds and somewhere other than
+/// the page itself.
+pub fn meta_refresh(html: &str, base: &str) -> Option<String> {
+    let base_url = Url::parse(base).ok()?;
+    let document = Html::parse_document(html);
+    let sel = Selector::parse("meta[http-equiv]").expect("static selector");
+    let content = document
+        .select(&sel)
+        .find(|m| {
+            m.value()
+                .attr("http-equiv")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("refresh"))
+        })?
+        .value()
+        .attr("content")?;
+    let (delay, rest) = match content.split_once([';', ',']) {
+        Some((d, r)) => (d, r),
+        None => (content, ""),
+    };
+    let delay: f64 = delay.trim().parse().ok()?;
+    if !(0.0..=MAX_REFRESH_DELAY_SECS).contains(&delay) {
+        return None;
+    }
+    let rest = rest.trim();
+    let target = match rest.split_once('=') {
+        Some((k, v)) if k.trim().eq_ignore_ascii_case("url") => v,
+        _ => rest,
+    };
+    let target = target.trim().trim_matches(['"', '\'']).trim();
+    let resolved = resolve(&base_url, target)?;
+    (key(&resolved) != key(base)).then_some(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +478,33 @@ mod tests {
             Some("pdf")
         );
         assert_eq!(doc_ext_in("https://x.org/pdfs/viewer"), None);
+    }
+
+    #[test]
+    fn a_quick_meta_refresh_is_a_redirect() {
+        let page = |content: &str| {
+            format!(
+                r#"<html><head><meta http-equiv="Refresh" content="{content}"></head><body>Redirecting…</body></html>"#
+            )
+        };
+        assert_eq!(
+            meta_refresh(&page("0; url=/files/report.pdf"), BASE).as_deref(),
+            Some("https://example.org/files/report.pdf")
+        );
+        assert_eq!(
+            meta_refresh(&page("5;URL='https://cdn.example.net/r.pdf'"), BASE).as_deref(),
+            Some("https://cdn.example.net/r.pdf")
+        );
+        // A self-reload, a slow auto-refresh and a bare delay are not.
+        assert_eq!(
+            meta_refresh(&page("0; url=state-of-ports-2026"), BASE),
+            None
+        );
+        assert_eq!(meta_refresh(&page("300; url=/other"), BASE), None);
+        assert_eq!(meta_refresh(&page("30"), BASE), None);
+        assert_eq!(
+            meta_refresh("<html><body>No refresh</body></html>", BASE),
+            None
+        );
     }
 }

@@ -1710,3 +1710,25 @@ browser.
 
 Not covered: a page that renders only from an API it calls at runtime
 (data.census.gov) still returns `SCRAPE_EMPTY`; that needs a headless browser.
+
+### Fetch fixes
+
+- **HTTP/2.** reqwest's `default-features = false` had turned it off, so the
+  scraper sent a Chrome user agent over HTTP/1.1. Measured on 25 sites with
+  identical headers: offering HTTP/2 turned a 403 into a 200 on weforum.org,
+  homedepot.com, linkedin.com and quora.com, and made mckinsey.com answer
+  instead of hang; reuters.com's HTTP/2 endpoint failed at the connection, so
+  a connection error is retried once over HTTP/1.1. No site went from 2xx to
+  an error.
+- **Cookies within a call.** A jar per client, and a client per call (never
+  persisted), for sites that set a cookie and redirect to themselves.
+- **Charsets** (`decode.rs`). Pages were read as UTF-8 regardless; now a BOM,
+  then the header's `charset`, then a `<meta>`/XML declaration in the first
+  4 KiB, then UTF-8 if valid, else windows-1252. Applies to pages, fallback
+  fetches and the page check.
+- **Meta refresh.** A page that gave nothing worth keeping and redirects with
+  `<meta http-equiv="refresh">` within 10 s is followed (2 hops at most);
+  `metadata.source = "meta_refresh"`. A refresh to a document downloads it.
+- **Page response cap.** The page gets 15 s to start answering (the body of a
+  large download keeps the client's 30 s), and a timeout now tries the
+  archive with what is left of the budget.

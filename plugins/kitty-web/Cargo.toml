@@ -45,7 +45,13 @@ base64 = "0.22"
 # webpki roots, so there's no platform certificate-store integration needed —
 # the known tradeoff is that user-installed/corporate MITM CAs won't be
 # trusted.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+# `cookies`: a jar per scrape call (never shared across calls or persisted),
+# for sites that set a cookie and redirect to themselves. `http2`: offered
+# through ALPN, as every browser does; a Chrome user agent speaking only
+# HTTP/1.1 is a mismatch some firewalls flag.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "cookies", "http2"] }
+# Decoding pages that are not UTF-8 (`src/decode.rs`).
+encoding_rs = "0.8"
 scraper = "0.24"
 htmd = "0.2"
 # `scraper` does not re-export `ego_tree`, but its `Html` tree is built from

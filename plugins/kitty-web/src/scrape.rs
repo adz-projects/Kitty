@@ -769,6 +769,16 @@ const SCRAPE_BUDGET: Duration = Duration::from_secs(27);
 const FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 const FALLBACK_MIN: Duration = Duration::from_secs(3);
 
+/// How long the page itself gets to start answering. Past this the archive
+/// is tried with what remains of the budget, instead of the whole call
+/// waiting out the client's 30 s and leaving nothing for a fallback. Only
+/// the response's arrival is bounded here; a large document already
+/// arriving keeps the client's own timeout for its body.
+const PAGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `<meta http-equiv="refresh">` redirects followed, at most.
+const MAX_REFRESH_HOPS: usize = 2;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn web_scrape(
     url: &str,
@@ -795,7 +805,7 @@ pub async fn web_scrape(
     if let Err(envelope) = check_target(url).await {
         return envelope;
     }
-    let client = match scrape_client() {
+    let mut client = match scrape_client(false) {
         Ok(c) => c,
         Err(e) => {
             return error_response(
@@ -807,16 +817,36 @@ pub async fn web_scrape(
         }
     };
 
-    let response = match send(&client, url, None).await {
+    let mut sent = send_page(&client, url).await;
+    // A site whose HTTP/2 endpoint fails outright still answers HTTP/1.1.
+    if matches!(sent, Err(SendError::Network(_))) {
+        if let Ok(h1) = scrape_client(true) {
+            sent = send_page(&h1, url).await;
+            client = h1;
+        }
+    }
+    let response = match sent {
         Ok(r) => r,
         Err(SendError::Blocked(reason)) => return ssrf_blocked(&reason),
         Err(SendError::Timeout(detail)) => {
-            return error_response(
+            let failed = error_response(
                 "SCRAPE_TIMEOUT",
                 "Request timed out.",
                 Some(&format!("{url}: {detail}")),
                 Some("The server is slow or unreachable. Try again or use lean_web_search for a similar page."),
             );
+            return match from_archive(
+                &client,
+                url,
+                &opts,
+                deadline,
+                "the live page did not answer in time",
+            )
+            .await
+            {
+                Some(archived) => archived,
+                None => failed,
+            };
         }
         Err(SendError::Network(detail)) => {
             let failed = error_response(
@@ -872,7 +902,37 @@ pub async fn web_scrape(
         return failed;
     }
 
-    let (mut out, page) = read_response(response, url, &opts, None).await;
+    let (mut out, mut page) = read_response(response, url, &opts, None).await;
+
+    // A stub that redirects with `<meta http-equiv="refresh">` (a download
+    // page's "your file will start shortly", an old URL's forwarding page)
+    // is followed when it gave nothing worth keeping itself.
+    let mut hops = 0;
+    while let Some(target) = page.as_ref().and_then(|p| p.refresh.clone()) {
+        if hops >= MAX_REFRESH_HOPS || !(error_code(&out).is_some() || thin_success(&out)) {
+            break;
+        }
+        hops += 1;
+        let Some(timeout) = fallback_timeout(deadline) else {
+            break;
+        };
+        if check_target(&target).await.is_err() {
+            break;
+        }
+        let Ok(next) = send(&client, &target, Some(timeout)).await else {
+            break;
+        };
+        if !next.status().is_success() {
+            break;
+        }
+        let (next_out, next_page) = read_response(next, url, &opts, None).await;
+        if error_code(&next_out).is_some() && error_code(&out).is_none() {
+            break;
+        }
+        out = mark_source(next_out, "meta_refresh", &target, None);
+        page = next_page;
+    }
+
     let Some(page) = page else {
         // A download, or a response that could not be read as a page.
         return out;
@@ -946,8 +1006,21 @@ async fn check_target(url: &str) -> Result<(), String> {
 
 /// The scraper's HTTP client: every redirect hop re-validated against the
 /// SSRF policy.
-fn scrape_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+///
+/// HTTP/2 is offered by default (several sites refuse an HTTP/1.1 client that
+/// claims to be Chrome); `http1_only` is the retry for the few whose HTTP/2
+/// endpoint fails outright.
+fn scrape_client(http1_only: bool) -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder();
+    let builder = if http1_only {
+        builder.http1_only()
+    } else {
+        builder
+    };
+    builder
+        // One jar per client, and a client per call: cookies a site sets
+        // while redirecting reach its next hop, and nothing outlives the call.
+        .cookie_store(true)
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -969,6 +1042,18 @@ fn scrape_client() -> Result<reqwest::Client, String> {
         }))
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// The page's own request: `send`, bounded by `PAGE_RESPONSE_TIMEOUT` until
+/// the response starts.
+async fn send_page(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, SendError> {
+    match tokio::time::timeout(PAGE_RESPONSE_TIMEOUT, send(client, url, None)).await {
+        Ok(result) => result,
+        Err(_) => Err(SendError::Timeout(format!(
+            "no response within {} s",
+            PAGE_RESPONSE_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 enum SendError {
@@ -1013,6 +1098,8 @@ struct PageRead {
     /// The opening of the HTML, for the page check.
     html_head: String,
     links: crate::discover::PageLinks,
+    /// Where the page's `<meta http-equiv="refresh">` sends the reader.
+    refresh: Option<String>,
 }
 
 /// Turn a successful response into the tool's envelope: a document is
@@ -1030,11 +1117,14 @@ async fn read_response(
     let stripped_url = url.split('?').next().unwrap_or(url);
     let stripped_url = stripped_url.split('#').next().unwrap_or(stripped_url);
     let final_url = response.url().to_string();
-    let content_type = response
+    let content_type_header = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
+        .to_string();
+    let charset = crate::decode::header_charset(&content_type_header);
+    let content_type = content_type_header
         .split(';')
         .next()
         .unwrap_or("")
@@ -1082,7 +1172,7 @@ async fn read_response(
     }
 
     let html = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Ok(b) => crate::decode::decode_text(&b, charset.as_deref()),
         Err(BodyReadError::TooLarge) => {
             return (
                 error_response(
@@ -1120,6 +1210,7 @@ async fn read_response(
     let base = link_base.unwrap_or(&final_url).to_string();
     let rendered = crate::config::spawn_blocking(move || {
         let links = crate::discover::discover(&html, &base);
+        let refresh = crate::discover::meta_refresh(&html, &final_url);
         let out = render_scrape_result(
             &html,
             &url_owned,
@@ -1132,11 +1223,18 @@ async fn read_response(
             opts_owned.include_links,
             opts_owned.favor_precision,
         );
-        (out, links)
+        (out, links, refresh)
     })
     .await;
     match rendered {
-        Ok((out, links)) => (out, Some(PageRead { html_head, links })),
+        Ok((out, links, refresh)) => (
+            out,
+            Some(PageRead {
+                html_head,
+                links,
+                refresh,
+            }),
+        ),
         Err(e) => (
             error_response(
                 "INTERNAL_PANIC",
@@ -1233,6 +1331,15 @@ fn fallback_timeout(deadline: tokio::time::Instant) -> Option<Duration> {
     (left >= FALLBACK_MIN).then(|| left.min(FALLBACK_TIMEOUT))
 }
 
+/// The `charset` a response's `Content-Type` header declares.
+fn charset_of(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::decode::header_charset)
+}
+
 /// Fetch a fallback URL (SSRF-checked like any other) and return its body as
 /// text, if it answered 2xx within the budget.
 async fn fetch_text(
@@ -1246,10 +1353,11 @@ async fn fetch_text(
     if !response.status().is_success() {
         return None;
     }
+    let charset = charset_of(&response);
     let body = read_body_capped(response, SCRAPE_MAX_BODY_BYTES)
         .await
         .ok()?;
-    Some(String::from_utf8_lossy(&body).into_owned())
+    Some(crate::decode::decode_text(&body, charset.as_deref()))
 }
 
 /// The page's content from a script-free version of it — its WordPress REST
@@ -1606,8 +1714,9 @@ async fn check_rendered_page(rendered: String, url: &str, html_head: &str) -> St
 /// `None` keeps the plain HTTP error.
 async fn check_failed_page(response: reqwest::Response, url: &str) -> Option<String> {
     let decider = crate::decider::Decider::current("page_classify")?;
+    let charset = charset_of(&response);
     let body = read_body_capped(response, PAGE_HEAD_CHARS).await.ok()?;
-    let html = String::from_utf8_lossy(&body);
+    let html = crate::decode::decode_text(&body, charset.as_deref());
     let (kind, _) = decider
         .classify_page(&title_of(&html), &rough_text(&html))
         .await?;

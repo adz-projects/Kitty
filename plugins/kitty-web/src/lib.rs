@@ -15,6 +15,7 @@
 pub mod alternates;
 pub mod config;
 pub mod decider;
+pub mod decode;
 pub mod discover;
 pub mod docfind;
 pub mod embedded;

@@ -293,3 +293,43 @@ async fn live_find_document_from_env() {
     let out = kitty_web::docfind::find_document(&title, None, None).await;
     eprintln!("{out}");
 }
+
+/// Status codes for `KITTY_WEB_LIVE_URLS` over HTTP/1.1 only and with HTTP/2
+/// offered, same headers — to see whether offering HTTP/2 changes how sites
+/// answer the scraper.
+#[tokio::test]
+#[ignore = "hits the live network"]
+async fn live_http1_vs_http2() {
+    let urls = std::env::var("KITTY_WEB_LIVE_URLS").unwrap_or_default();
+    let build = |h1: bool| {
+        let b = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
+        let b = if h1 { b.http1_only() } else { b };
+        b.build().unwrap()
+    };
+    let (h1, h2) = (build(true), build(false));
+    for url in urls.split_whitespace() {
+        let mut line = format!("{url}:");
+        for (name, c) in [("h1", &h1), ("h2", &h2)] {
+            let r = c
+                .get(url)
+                .header("User-Agent", kitty_web::scrape::SCRAPE_USER_AGENT)
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+                )
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .send()
+                .await;
+            match r {
+                Ok(r) => line += &format!(" {name}={} ({:?})", r.status().as_u16(), r.version()),
+                Err(e) => {
+                    line += &format!(
+                        " {name}=ERR({})",
+                        if e.is_timeout() { "timeout" } else { "net" }
+                    )
+                }
+            }
+        }
+        eprintln!("{line}");
+    }
+}

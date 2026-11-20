@@ -171,7 +171,11 @@ binaries still match their source (CI runs it). Full detail in
   its AMP / WordPress REST / feed version, then — for a block, an error page
   or a dead site, never a paywall or login — the Wayback Machine's snapshot,
   labelled with its date (`alternates.rs`). All of it runs inside one ~27 s
-  budget so the call stays under the engine's tool timeout. Every page also
+  budget so the call stays under the engine's tool timeout; the page itself
+  gets 15 s to start answering. The fetch offers HTTP/2 (retrying HTTP/1.1
+  when that fails outright), keeps a cookie jar for the one call, follows a
+  quick `<meta http-equiv="refresh">`, and decodes pages in their declared
+  charset (`decode.rs`). Every page also
   reports the document files it links or hides (`discover.rs`:
   `citation_pdf_url`, file links, URLs in scripts and data attributes,
   lead-form redirects) as `document_candidates`, and
