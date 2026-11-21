@@ -73,7 +73,8 @@ export function canConnect(profile: ProviderProfile, secret: string): boolean {
 /** The API-key wizard path: pick a provider and paste a key. Connect checks
     the key, fetches the provider's models, checks them the way Settings →
     Providers does (a short list all, a long one just the suggested model)
-    and makes the suggested model — or one typed in — the default.
+    and makes a setup for the suggested model — or one typed in — the
+    default.
 
     In repair it edits the provider of the default model rather than adding
     another one (#63); the key can be left blank to keep the saved one. */
@@ -151,8 +152,26 @@ export function ApiKeyStep({
       const checked = initialChecks(models, profile.enabled_models, suggested);
       const enabled = suggested && !checked.includes(suggested) ? [...checked, suggested] : checked;
       const saved = await ipc.upsertProvider({ ...profile, models, enabled_models: enabled }, key);
-      const card = suggested ? saved.model_ids[suggested] : undefined;
-      if (card) await ipc.setDefaultProvider(card);
+      if (suggested) {
+        // The provider's first save made a setup for Kitty's own pick; a
+        // model typed here gets one of its own. Either becomes the default.
+        const setups = await ipc.listProviders();
+        const existing = setups.find(
+          (c) => c.info.provider_id === saved.id && c.models[0] === suggested
+        );
+        const id =
+          existing?.id ??
+          (
+            await ipc.upsertSetup({
+              id: '',
+              name: '',
+              provider_id: saved.id,
+              model: suggested,
+              created_at: '',
+            })
+          ).id;
+        await ipc.setDefaultProvider(id);
+      }
       onNext();
     } catch (e) {
       setError(String(e));
@@ -228,7 +247,7 @@ export function ApiKeyStep({
         />
         <small className="muted">
           Kitty fetches the provider&apos;s models and starts you on a strong, sensibly priced one.
-          Check more models, or choose another default, in Settings → Providers.
+          Check more models in Settings → Providers, and make setups of them in Settings → Setups.
         </small>
       </label>
 

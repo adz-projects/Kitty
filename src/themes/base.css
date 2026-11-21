@@ -2838,6 +2838,14 @@ button.link {
 .model-checklist li:hover {
   background: var(--surface-2);
 }
+/* The list sits inside a `.field`, whose inputs stretch to full width:
+   its checkboxes keep their own size, or they squeeze the names away. */
+.model-checklist input[type='checkbox'] {
+  width: auto;
+  flex: none;
+  padding: 0;
+  margin: 0;
+}
 .model-checklist .model-name {
   flex: 1;
   min-width: 0;
@@ -2856,6 +2864,11 @@ button.link {
   font-variant-numeric: tabular-nums;
   min-width: 2.4em;
   text-align: right;
+}
+.model-checklist .model-used-by {
+  color: var(--accent);
+  font-size: var(--fs-xs, var(--fs-sm));
+  white-space: nowrap;
 }
 .model-checklist .model-vision,
 .model-checklist .vision-mark {
@@ -3007,12 +3020,12 @@ button.link {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 20px;
-  max-width: 440px;
-  width: 90%;
+  max-width: 600px;
+  width: 92%;
   /* The provider form (temperature/context/system-prompt fields) can outgrow
      a short settings window — cap the modal and let it scroll internally
      rather than spilling past the window's edges. */
-  max-height: min(85vh, 640px);
+  max-height: min(88vh, 760px);
   overflow-y: auto;
   overscroll-behavior: contain;
   display: flex;

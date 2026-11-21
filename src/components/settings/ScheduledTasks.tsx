@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ipc, onScheduledTasksChanged, pickFolder } from '@/lib/ipc';
 import type { ProviderView, Schedule, ScheduledTask } from '@/lib/types';
-import { cardLabel, groupByProvider } from '@/lib/models';
+import { setupTitle } from '@/components/settings/setups/setupUtils';
 import { Modal } from '@/components/shared/Modal';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { relativeTime } from '@/lib/relativeTime';
@@ -347,25 +347,21 @@ export function ScheduledTasks() {
             </div>
           </div>
           <div className="field">
-            <span>Model (optional)</span>
+            <span>Setup (optional)</span>
             <select
               value={form.providerId}
               onChange={(e) => setForm({ ...form, providerId: e.target.value })}
             >
-              <option value="">The default model when it runs</option>
-              {groupByProvider(providers).map((g) => (
-                <optgroup key={g.providerId} label={g.provider}>
-                  {g.cards.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {cardLabel(p)}
-                    </option>
-                  ))}
-                </optgroup>
+              <option value="">The default setup when it runs</option>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id} title={setupTitle(p)}>
+                  {p.name}
+                </option>
               ))}
             </select>
             <small className="muted">
-              Pin a model so this task always runs on it, with its provider&apos;s system prompt,
-              even if you change the default later.
+              Pin a setup so this task always runs on it, with its system prompt, even if you change
+              the default later.
             </small>
           </div>
           <div className="field">

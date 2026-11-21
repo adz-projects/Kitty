@@ -87,7 +87,16 @@ pub struct Config {
     /// (`providers::SCHEMA_*`). Field-level default so an old file reads 0.
     #[serde(default)]
     pub providers_schema: u32,
-    /// The default model: the card id new chats start on, if any.
+    /// The setups chats run on (`providers::setups`), in the order the
+    /// model menus list them.
+    #[serde(default)]
+    pub setups: Vec<crate::config::providers::Setup>,
+    /// Whether checked models were turned into setups
+    /// (`providers::migrate_to_setups`). Field-level default so an older
+    /// file reads `false`.
+    #[serde(default)]
+    pub setups_migrated: bool,
+    /// The default setup: the one new chats start on, if any.
     pub active_provider_id: Option<String>,
     /// The default was cleared because it can no longer be used (a retired
     /// provider type); the UI asks the user to choose another. Cleared when
@@ -464,6 +473,8 @@ impl Default for Config {
             remember_overlay_position: true,
             providers: Vec::new(),
             providers_schema: crate::config::providers::SCHEMA_MERGED,
+            setups: Vec::new(),
+            setups_migrated: true,
             active_provider_id: None,
             needs_default_provider: false,
             handoff_gate_choice: None,
@@ -1243,6 +1254,7 @@ fn migrate_provider_model_lists(mut config: Config) -> Config {
         crate::config::providers::upgrade_to_model_lists(&mut config.providers);
         config.providers_schema = crate::config::providers::SCHEMA_MODEL_LISTS;
     }
+    crate::config::providers::migrate_to_setups(&mut config);
     config
 }
 

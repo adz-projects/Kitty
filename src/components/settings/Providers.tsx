@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ipc, onEffortDetected } from '@/lib/ipc';
-import { effortSummaryText } from '@/lib/effort';
+import { ipc } from '@/lib/ipc';
 import { Modal } from '@/components/shared/Modal';
 import type {
   OpenRouterCredits,
@@ -9,7 +8,6 @@ import type {
   ProviderView,
 } from '@/lib/types';
 import { TrustIcon, trustKind } from '@/lib/provider_trust';
-import { cardLabel, groupByProvider, modelTitle } from '@/lib/models';
 import { ProviderTypeIcon, providerTypeLabel } from '@/components/icons/ProviderTypeIcon';
 import { KeyIcon } from '@/components/icons/KeyIcon';
 import { PencilIcon } from '@/components/icons/PencilIcon';
@@ -26,8 +24,8 @@ function profileOf(p: ProviderAccountView): ProviderProfile {
   return profile;
 }
 
-/** Settings → Providers: the default model for new chats, and the providers
-    whose checked models make up Kitty's model list. */
+/** Settings → Providers: the services Kitty talks to, each with its key and
+    the models checked for use in setups (Settings → Setups). */
 export function Providers({ highlight }: { highlight: string | null }) {
   const [accounts, setAccounts] = useState<ProviderAccountView[]>([]);
   const [cards, setCards] = useState<ProviderView[]>([]);
@@ -36,8 +34,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
   const [confirmUntrusted, setConfirmUntrusted] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [needsDefault, setNeedsDefault] = useState(false);
-  const [settingDefault, setSettingDefault] = useState(false);
   const [credits, setCredits] = useState<
     Record<
       string,
@@ -48,38 +44,13 @@ export function Providers({ highlight }: { highlight: string | null }) {
   >({});
 
   const refresh = () =>
-    Promise.all([ipc.listProviderAccounts(), ipc.listProviders(), ipc.getConfig()])
-      .then(([list, models, cfg]) => {
+    Promise.all([ipc.listProviderAccounts(), ipc.listProviders()])
+      .then(([list, setups]) => {
         setAccounts(list);
-        setCards(models);
-        setNeedsDefault(cfg.needs_default_provider);
+        setCards(setups);
       })
       .catch((e) => setError(String(e)));
   useEffect(() => void refresh(), []);
-  // A model's reasoning detection finished — after a save, a Re-detect, or in
-  // the background at startup — so the default's line is current.
-  useEffect(() => {
-    const unlisten = onEffortDetected(() => void refresh());
-    return () => void unlisten.then((u) => u());
-  }, []);
-  const [redetecting, setRedetecting] = useState<Set<string>>(new Set());
-  const redetect = async (id: string | null) => {
-    const key = id ?? '*';
-    setRedetecting((prev) => new Set(prev).add(key));
-    await refresh();
-    try {
-      await (id ? ipc.redetectEffort(id) : ipc.redetectEffortAll());
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRedetecting((prev) => {
-        const next = new Set(prev);
-        next.delete(key);
-        return next;
-      });
-      await refresh();
-    }
-  };
   const checkCredits = async (id: string) => {
     setCredits((prev) => ({ ...prev, [id]: { status: 'loading' } }));
     try {
@@ -107,7 +78,11 @@ export function Providers({ highlight }: { highlight: string | null }) {
       if (!hadDefault) {
         const now = await ipc.listProviders();
         const def = now.find((c) => c.active);
-        if (def) setNotice(`${cardLabel(def)} is now the default model for new chats.`);
+        if (def) {
+          setNotice(
+            `Kitty made a setup for ${def.info.name} and chose it for new chats. Add more under Setups.`
+          );
+        }
       }
     } catch (e) {
       setError(String(e));
@@ -122,27 +97,11 @@ export function Providers({ highlight }: { highlight: string | null }) {
     else void doSave();
   };
 
-  // The default for new chats only; open chats keep their own model
-  // (decision #50). The model must pass a connection check first.
-  const onDefault = async (cardId: string) => {
-    if (!cardId) return;
-    setSettingDefault(true);
-    setError('');
-    try {
-      await ipc.setDefaultProvider(cardId);
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSettingDefault(false);
-    }
-  };
-
   const onDelete = async (p: ProviderAccountView) => {
     const ok = await confirmDialog({
       title: `Delete "${p.name}"?`,
       message:
-        'Its saved API key is deleted too, and its models leave the model list. Chats that used them stay readable but cannot continue on them.',
+        'Its saved API key and every setup on its models are deleted too. Chats that used them stay readable, and continue once you choose another setup.',
       confirmLabel: 'Delete',
       danger: true,
     });
@@ -156,8 +115,8 @@ export function Providers({ highlight }: { highlight: string | null }) {
         const def = now.find((c) => c.id === next);
         setNotice(
           def
-            ? `${cardLabel(def, true)} is now the default model for new chats.`
-            : 'There is no default model now. Add a provider to start new chats.'
+            ? `${def.name} is now the default setup for new chats.`
+            : 'There is no default setup now. Add a provider to start new chats.'
         );
       }
     } catch (e) {
@@ -165,23 +124,16 @@ export function Providers({ highlight }: { highlight: string | null }) {
     }
   };
 
-  const active = cards.find((c) => c.active) ?? null;
-  const usable = cards.filter((c) => !c.disabled_reason);
+  // A deep link names a provider, or a setup (a chat's error card).
   const highlighted = (p: ProviderAccountView) =>
-    !!highlight && (p.id === highlight || Object.values(p.model_ids).includes(highlight));
+    !!highlight &&
+    (p.id === highlight || cards.some((c) => c.id === highlight && c.info.provider_id === p.id));
 
   return (
     <section className="settings-section">
       <div className="row" style={{ justifyContent: 'space-between' }}>
         <h1>Providers</h1>
         <div className="row">
-          <button
-            onClick={() => void redetect(null)}
-            disabled={redetecting.has('*') || cards.length === 0}
-            title="Check again which reasoning levels each model offers"
-          >
-            {redetecting.has('*') ? 'Re-detecting…' : 'Re-detect reasoning'}
-          </button>
           <button className="primary" onClick={startNew}>
             Add provider
           </button>
@@ -200,66 +152,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
           {notice}
         </Banner>
       )}
-      {needsDefault && (
-        <Banner tone="warn">
-          Your default model ran on this device, which Kitty no longer supports. Choose another
-          default model below.
-        </Banner>
-      )}
-
-      <label className="field default-model-field">
-        <span>Default model for new chats</span>
-        <select
-          value={active?.id ?? ''}
-          disabled={settingDefault || usable.length === 0}
-          onChange={(e) => void onDefault(e.target.value)}
-          title={active ? modelTitle(active.info) : undefined}
-        >
-          {!active && (
-            <option value="" disabled>
-              {usable.length === 0 ? 'Add a provider first' : 'Choose a model'}
-            </option>
-          )}
-          {groupByProvider(usable).map((g) => (
-            <optgroup key={g.providerId} label={g.provider}>
-              {g.cards.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {cardLabel(c)}
-                </option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-        <small className="muted">
-          {settingDefault
-            ? 'Checking the model…'
-            : 'Chats already open keep their own model. Models are ordered by intelligence and how recent each is; $ is up to $3 per million output tokens, $$ up to $8, $$$ more.'}
-        </small>
-        {active && (
-          <small className="muted provider-effort-line">
-            {(() => {
-              const busy =
-                active.effort.detecting || redetecting.has(active.id) || redetecting.has('*');
-              return (
-                <>
-                  {busy && active.effort.detected_at !== null
-                    ? 'Detecting reasoning levels…'
-                    : effortSummaryText(active.effort, Math.floor(Date.now() / 1000))}{' '}
-                  <button
-                    className="link"
-                    disabled={busy}
-                    onClick={() => void redetect(active.id)}
-                    title="Check again which reasoning levels this model offers. The current levels stay if the check fails."
-                  >
-                    Re-detect
-                  </button>
-                </>
-              );
-            })()}
-          </small>
-        )}
-      </label>
-
       <div className="provider-list">
         {accounts.length === 0 && (
           <p className="muted">No providers yet. Add one to start chatting.</p>
@@ -293,7 +185,11 @@ export function Providers({ highlight }: { highlight: string | null }) {
                   )}
                 </div>
                 <div className="muted provider-url-line">
-                  {checked} of {p.models.length} model{p.models.length === 1 ? '' : 's'} checked
+                  {checked} of {p.models.length} model{p.models.length === 1 ? '' : 's'} checked ·{' '}
+                  {(() => {
+                    const n = cards.filter((c) => c.info.provider_id === p.id).length;
+                    return `${n} setup${n === 1 ? '' : 's'}`;
+                  })()}
                   {['custom_openai', 'ollama', 'local'].includes(p.provider_type) &&
                     ` · ${p.base_url}`}
                 </div>
@@ -367,6 +263,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
         <ProviderForm
           profile={editing}
           secret={secret}
+          setups={cards.map((c) => c.setup)}
           onChange={setEditing}
           onSecret={setSecret}
           onCancel={() => setEditing(null)}

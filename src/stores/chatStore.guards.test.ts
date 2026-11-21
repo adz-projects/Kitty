@@ -294,6 +294,7 @@ describe('chatStore refreshProvider malformed base_url', () => {
     prompt_idle_timeout_secs: null,
     parallel_slots: null,
     created_at: '',
+    setup: { id: 'p1', name: 'Test', provider_id: 'p1', model: 'm', created_at: '' },
     network_tier: 'local',
     has_secret: false,
     active: true,

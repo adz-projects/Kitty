@@ -16,8 +16,11 @@
 //! Resolution order for a chat's level, each candidate checked against the
 //! levels its card actually offers:
 //!   1. the chat's own choice (`Config::session_efforts`);
-//!   2. the level last used on this card+model (`Config::model_efforts`);
+//!   2. the chat's setup's own default level (`Setup::effort`);
 //!   3. the ladder default (`medium` if offered, else the middle).
+//!
+//! A ladder describes a model, so it is stored per provider and model
+//! (`Config::effort_caps`), shared by every setup on that model.
 
 pub mod detect;
 pub mod ladder;
@@ -38,10 +41,19 @@ pub use ladder::{EffortCaps, EffortSource};
 /// the card is used. Model ladders change on the order of months.
 const STALE_AFTER_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// Key for the per-card+model maps (`effort_caps`, `model_efforts`) — the
-/// same `provider\0model` shape `context_window` and `vision` use.
-pub fn effort_key(card_id: &str, model: &str) -> String {
-    format!("{card_id}\u{0}{model}")
+/// Key for `effort_caps`: `provider id\0model`.
+pub fn effort_key(provider_id: &str, model: &str) -> String {
+    format!("{provider_id}\u{0}{model}")
+}
+
+/// The `effort_caps` key for a chat on `card_id` running `model`: its
+/// setup's provider and that model.
+fn caps_key(cfg: &Config, card_id: &str, model: &str) -> String {
+    let provider = cfg
+        .provider_of_card(card_id)
+        .map(|p| p.id.as_str())
+        .unwrap_or(card_id);
+    effort_key(provider, model)
 }
 
 fn now_unix() -> i64 {
@@ -140,8 +152,7 @@ pub fn effort_view(
     model: &str,
     session_id: Option<&str>,
 ) -> Option<ThinkingEffort> {
-    let key = effort_key(card_id, model);
-    let caps = cfg.effort_caps.get(&key)?;
+    let caps = cfg.effort_caps.get(&caps_key(cfg, card_id, model))?;
     if !caps.has_control() {
         return None;
     }
@@ -152,7 +163,11 @@ pub fn effort_view(
     let current_value = session_id
         .and_then(|sid| cfg.session_efforts.get(sid))
         .filter(|v| offered(v))
-        .or_else(|| cfg.model_efforts.get(&key).filter(|v| offered(v)))
+        .or_else(|| {
+            cfg.setup(card_id)
+                .and_then(|s| s.effort.as_ref())
+                .filter(|v| offered(v))
+        })
         .cloned()
         .unwrap_or(fallback);
     Some(ThinkingEffort {
@@ -195,8 +210,8 @@ pub async fn thinking_effort_for_session(
 
 /// The picker for a chat that doesn't exist yet — a new window before its
 /// first message, which will be created on `card_id` (or the default card).
-/// Same resolution as a chat's, minus the chat's own choice: the level last
-/// used on this card+model, else the default.
+/// Same resolution as a chat's, minus the chat's own choice: the setup's
+/// level, else the default.
 pub async fn card_effort(app: &AppHandle, card_id: Option<&str>) -> Option<ThinkingEffort> {
     let card = match card_id {
         Some(id) => id.to_string(),
@@ -222,7 +237,7 @@ pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
         let Some(model) = card_model(&cfg, card_id) else {
             return;
         };
-        match cfg.effort_caps.get(&effort_key(card_id, &model)) {
+        match cfg.effort_caps.get(&caps_key(&cfg, card_id, &model)) {
             None => (true, false),
             Some(c) => (
                 false,
@@ -237,6 +252,70 @@ pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
     } else if stale {
         spawn_detect(app, card_id);
     }
+}
+
+/// The levels `model` of `provider_id` offers, for the setup editor's
+/// thinking-level menu, detected now when they never were. `current_value`
+/// is the ladder's default. `None` when the model has no control or nothing
+/// could be detected.
+pub async fn model_effort(
+    app: &AppHandle,
+    provider_id: &str,
+    model: &str,
+) -> Option<ThinkingEffort> {
+    let key = effort_key(provider_id, model);
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        let p = cfg.providers.iter().find(|p| p.id == provider_id)?;
+        (!cfg.effort_caps.contains_key(&key)).then(|| CardSnapshot {
+            id: provider_id.to_string(),
+            provider_type: p.provider_type.clone(),
+            base_url: p.base_url.clone(),
+            model: model.to_string(),
+            secret_account: provider_id.to_string(),
+        })
+    };
+    if let Some(card) = snapshot {
+        let claimed = app
+            .state::<AppState>()
+            .effort_detecting
+            .lock()
+            .unwrap()
+            .insert(key.clone());
+        if claimed {
+            run_detection(app, &card).await;
+            app.state::<AppState>()
+                .effort_detecting
+                .lock()
+                .unwrap()
+                .remove(&key);
+        } else {
+            wait_for_detection(app, &key).await;
+        }
+    }
+    let state = app.state::<AppState>();
+    let cfg = state.config.lock().unwrap();
+    let caps = cfg.effort_caps.get(&key)?;
+    if !caps.has_control() {
+        return None;
+    }
+    let opts = ladder::options(caps);
+    let current_value =
+        ladder::default_level(&caps.levels).or_else(|| opts.first().map(|o| o.value.clone()))?;
+    Some(ThinkingEffort {
+        current_value,
+        max_stars: u8::try_from(caps.levels.len()).unwrap_or(u8::MAX),
+        can_disable: caps.can_disable,
+        options: opts
+            .into_iter()
+            .map(|o| EffortOption {
+                name: o.name,
+                value: o.value,
+                stars: o.stars,
+            })
+            .collect(),
+    })
 }
 
 // -------------------------------------------------------------- detection
@@ -303,7 +382,10 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
             let mut cfg = state.config.lock().unwrap();
             // Keep what we had, but stop treating a rejected ladder as stale
             // on every read — the next scheduled refresh tries again.
-            if let Some(c) = cfg.effort_caps.get_mut(&effort_key(&card.id, &card.model)) {
+            if let Some(c) = cfg
+                .effort_caps
+                .get_mut(&effort_key(&card.secret_account, &card.model))
+            {
                 if c.stale {
                     c.stale = false;
                     let _ = crate::config::save(&cfg);
@@ -323,7 +405,7 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
     let (changed, resync) = {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
-        let key = effort_key(&card.id, &card.model);
+        let key = effort_key(&card.secret_account, &card.model);
         let prev = cfg.effort_caps.get(&key).cloned();
         let changed = prev.as_ref().map_or(true, |p| {
             p.levels != found.levels || p.can_disable != found.can_disable
@@ -340,10 +422,11 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
         }
         (changed, resync)
     };
-    // The Anthropic wire mode and the delegate level ride the provider row, so
-    // the engine needs the card re-synced when either changes.
+    // The Anthropic wire mode and the delegate level ride the provider row
+    // of every setup on this model, so the engine needs them re-synced when
+    // either changes.
     if resync {
-        if let Err(e) = crate::bigtiny::providers::sync_one_provider(app, &card.id).await {
+        if let Err(e) = crate::bigtiny::providers::sync_all_providers(app).await {
             tracing::warn!("could not re-sync providers after effort detection: {e}");
         }
     }
@@ -386,11 +469,14 @@ pub async fn detect_all(app: &AppHandle, only_missing: bool) {
     let ids: Vec<String> = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
+        // One per model: setups on the same model share its ladder.
+        let mut seen = HashSet::new();
         cfg.cards()
             .into_iter()
             .filter(|p| p.is_usable())
             .filter(|p| {
-                !only_missing || !cfg.effort_caps.contains_key(&effort_key(&p.id, p.model()))
+                let key = effort_key(p.secret_account(), p.model());
+                seen.insert(key.clone()) && (!only_missing || !cfg.effort_caps.contains_key(&key))
             })
             .map(|p| p.id)
             .collect()
@@ -413,7 +499,8 @@ pub fn on_effort_rejected(app: &AppHandle, session_id: &str) {
         let name = {
             let state = app.state::<AppState>();
             let mut cfg = state.config.lock().unwrap();
-            if let Some(c) = cfg.effort_caps.get_mut(&effort_key(&card, &model)) {
+            let key = caps_key(&cfg, &card, &model);
+            if let Some(c) = cfg.effort_caps.get_mut(&key) {
                 c.stale = true;
             }
             let _ = crate::config::save(&cfg);
@@ -438,8 +525,8 @@ pub fn on_effort_rejected(app: &AppHandle, session_id: &str) {
 // ---------------------------------------------------- keeping the engine in step
 
 /// Materialize a chat's effective level on its **first turn**: persist it as
-/// the chat's own choice, remember it for this card+model, and push it to the
-/// engine so the wire matches the picker.
+/// the chat's own choice and push it to the engine so the wire matches the
+/// picker.
 ///
 /// Until this runs, a chat that never touched the picker shows a default it
 /// never sent. Doing it at first send (rather than at creation) lets the user
@@ -458,17 +545,10 @@ pub async fn confirm_model_effort(app: &AppHandle, session_id: &str) {
             return; // no control on this card — nothing to confirm
         };
         let value = effort.current_value;
-        let key = effort_key(&card, &model);
         let session_changed = cfg.session_efforts.get(session_id) != Some(&value);
-        let model_changed = cfg.model_efforts.get(&key) != Some(&value);
         if session_changed {
             cfg.session_efforts
                 .insert(session_id.to_string(), value.clone());
-        }
-        if model_changed {
-            cfg.model_efforts.insert(key, value.clone());
-        }
-        if session_changed || model_changed {
             if let Err(e) = crate::config::save(&cfg) {
                 tracing::warn!("failed to persist confirmed thinking effort: {e}");
             }
@@ -544,7 +624,9 @@ pub fn summary_for_profile(
     detecting: &HashSet<String>,
 ) -> EffortSummary {
     let model = profile.models.first().cloned().unwrap_or_default();
-    let caps = cfg.effort_caps.get(&effort_key(&profile.id, &model));
+    let caps = cfg
+        .effort_caps
+        .get(&effort_key(profile.secret_account(), &model));
     EffortSummary {
         levels: caps.map(|c| c.levels.clone()).unwrap_or_default(),
         can_disable: caps.is_some_and(|c| c.can_disable),
@@ -565,7 +647,7 @@ pub fn anthropic_thinking_for(
     }
     let model = profile.models.first()?;
     cfg.effort_caps
-        .get(&effort_key(&profile.id, model))
+        .get(&effort_key(profile.secret_account(), model))
         .and_then(|c| c.anthropic_thinking.clone())
 }
 
@@ -578,7 +660,7 @@ pub fn delegate_effort_for(
 ) -> Option<String> {
     let model = profile.models.first()?;
     cfg.effort_caps
-        .get(&effort_key(&profile.id, model))
+        .get(&effort_key(profile.secret_account(), model))
         .and_then(|c| ladder::delegate_level(&c.levels))
 }
 
@@ -655,9 +737,15 @@ mod tests {
     }
 
     #[test]
-    fn chosen_then_remembered_then_default() {
+    fn chosen_then_setup_then_default() {
         let mut cfg = Config::default();
         let key = effort_key("b", "m");
+        cfg.setups.push(crate::config::providers::Setup {
+            id: "b".into(),
+            provider_id: "b".into(),
+            model: "m".into(),
+            ..Default::default()
+        });
         cfg.effort_caps
             .insert(key.clone(), caps(&["low", "medium", "high"], false));
         assert_eq!(
@@ -666,7 +754,7 @@ mod tests {
                 .current_value,
             "medium"
         );
-        cfg.model_efforts.insert(key.clone(), "high".into());
+        cfg.setups[0].effort = Some("high".into());
         assert_eq!(
             effort_view(&cfg, "b", "m", Some("s"))
                 .unwrap()
@@ -683,7 +771,7 @@ mod tests {
         // A value this ladder doesn't offer (here Off on a mandatory model)
         // never sticks.
         cfg.session_efforts.insert("s".into(), "off".into());
-        cfg.model_efforts.insert(key, "xhigh".into());
+        cfg.setups[0].effort = Some("xhigh".into());
         assert_eq!(
             effort_view(&cfg, "b", "m", Some("s"))
                 .unwrap()

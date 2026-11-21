@@ -50,6 +50,7 @@ import type {
   StagedAttachment,
   ProviderProfile,
   ProviderView,
+  Setup,
   DownloadProgress,
   EngineRestartState,
   AllowRule,
@@ -433,6 +434,16 @@ export const ipc = {
   /** Returns the default model's card afterwards (another model takes over
       if the default was one of this provider's). */
   deleteProvider: (id: string) => invoke<string | null>('delete_provider', { id }),
+  /** Create or update a setup; returns it as saved. */
+  upsertSetup: (setup: Setup) => invoke<Setup>('upsert_setup', { setup }),
+  /** Delete a setup; returns the default setup's id afterwards. */
+  deleteSetup: (id: string) => invoke<string | null>('delete_setup', { id }),
+  /** Put the setups in this order (every model menu's order). */
+  reorderSetups: (ids: string[]) => invoke<void>('reorder_setups', { ids }),
+  /** The thinking levels a provider's model offers, for the setup editor;
+      detected now if they never were. `null`: no control, or unknown. */
+  getModelEffort: (providerId: string, model: string) =>
+    invoke<ThinkingEffort | null>('get_model_effort', { providerId, model }),
   activateProvider: (id: string | null, sessionId?: string | null) =>
     invoke<void>('activate_provider', { id, sessionId: sessionId ?? null }),
   setSessionProvider: (sessionId: string, providerId: string, model?: string | null) =>

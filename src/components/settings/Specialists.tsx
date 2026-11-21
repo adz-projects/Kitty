@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { ProviderView, Specialist, SpecialistRun } from '@/lib/types';
-import { cardLabel, groupByProvider } from '@/lib/models';
+import { setupTitle } from '@/components/settings/setups/setupUtils';
 import { DelegateRunRow } from './DelegateRunRow';
 import { Modal } from '@/components/shared/Modal';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
@@ -494,9 +494,10 @@ export function Specialists() {
             </small>
           </div>
           <div className="field">
-            <span>Model (optional)</span>
-            {/* Each entry is one checked model (its card: the engine row the
-                specialist is pinned to), so the model comes with it. */}
+            <span>Setup (optional)</span>
+            {/* Each entry is a setup (its card: the engine row the specialist
+                is pinned to), so the model comes with it. The specialist's own
+                prompt replaces the setup's. */}
             <select
               value={form.provider}
               onChange={(e) => {
@@ -505,18 +506,15 @@ export function Specialists() {
               }}
             >
               <option value="">Whatever this chat is using</option>
-              {groupByProvider(providers).map((g) => (
-                <optgroup key={g.providerId} label={g.provider}>
-                  {g.cards.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {cardLabel(p)}
-                    </option>
-                  ))}
-                </optgroup>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id} title={setupTitle(p)}>
+                  {p.name}
+                </option>
               ))}
             </select>
             <small className="muted">
-              Pin a cheaper or faster model for work that does not need your main one.
+              Pin a cheaper or faster setup for work that does not need your main one. The
+              specialist&apos;s own instructions replace the setup&apos;s system prompt.
             </small>
           </div>
           <div className="field">

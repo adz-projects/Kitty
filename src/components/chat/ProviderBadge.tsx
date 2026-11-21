@@ -1,20 +1,21 @@
 import { useEffect, useState } from 'react';
-import { ipc, onProviderActivated } from '@/lib/ipc';
+import { ipc, onConfigChanged, onProviderActivated } from '@/lib/ipc';
 import { TrustIcon } from '@/lib/provider_trust';
 import type { ProviderView } from '@/lib/types';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { useChatStore } from '@/stores/chatStore';
 import { useBranchToProvider } from './BranchToProvider';
-import { groupByProvider, modelLabel, modelTitle } from '@/lib/models';
+import { setupTitle } from '@/components/settings/setups/setupUtils';
 
-/** This chat's provider card, with a popover to change it (shown in both the
-    overlay and the full window). Only this chat changes — the default for new
-    chats is set in Settings (decision #50).
+/** This chat's setup, with a popover to change it (shown in both the
+    overlay and the full window). The badge and menu show setup names; a hover
+    says which provider and model each runs. Only this chat changes — the
+    default for new chats is set in Settings → Setups (decision #50).
 
-    An empty chat just switches (`set_chat_provider`, which checks the card
-    works first). A chat with history stays on its card (decision #24): the
-    popover offers to continue it on another card instead, as a branch, going
+    An empty chat just switches (`set_chat_provider`, which checks the setup
+    works first). A chat with history stays on its setup (decision #24): the
+    popover offers to continue it on another one instead, as a branch, going
     through the handoff gate when the target is less trusted. */
 export function ProviderBadge() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -36,9 +37,14 @@ export function ProviderBadge() {
       .catch(() => {});
   useEffect(() => {
     void load();
-    const un = onProviderActivated(() => void load());
-    return () => void un.then((fn) => fn());
+    // A setup added, renamed, reordered or deleted in Settings saves the
+    // config; every save is announced, so the menu follows it.
+    const un = [onProviderActivated(() => void load()), onConfigChanged(() => void load())];
+    return () => un.forEach((u) => void u.then((fn) => fn()));
   }, []);
+  useEffect(() => {
+    if (open) void load();
+  }, [open]);
 
   // Same resolution as chatStore.refreshProvider (release-fixes item 1): a
   // window with a live session shows *that session's* stamped provider, not
@@ -50,7 +56,7 @@ export function ProviderBadge() {
       ? (providers.find((p) => p.id === sessionProviderId) ?? providers.find((p) => p.active))
       : providers.find((p) => p.active);
   const activeId = active?.id;
-  const label = active ? active.info.name : 'No model';
+  const label = active ? active.name : 'No setup';
   const icon = active ? (
     <TrustIcon tier={active.network_tier} isTrusted={active.is_trusted} />
   ) : (
@@ -89,9 +95,10 @@ export function ProviderBadge() {
         className="status-badge provider-badge"
         onClick={() => setOpen((o) => !o)}
         title={
-          locked
-            ? 'This chat’s model — click to continue the conversation on another one'
-            : 'This chat’s model — click to switch'
+          (active ? `${setupTitle(active)}\n` : '') +
+          (locked
+            ? 'Click to continue this conversation on another setup'
+            : 'Click to switch this chat’s setup')
         }
         disabled={busy || branchFlow.busy}
       >
@@ -104,32 +111,27 @@ export function ProviderBadge() {
       {open && (
         <div ref={popoverRef} className="mode-popover provider-popover" role="menu" style={style}>
           {locked && <div className="muted popover-heading">Continue this chat on…</div>}
-          {/* The model list: every checked model, ranked, under its provider. */}
-          {groupByProvider(
-            providers.filter((p) => !p.disabled_reason && !(locked && p.id === activeId))
-          ).map((g) => (
-            <div key={g.providerId} role="group" aria-label={g.provider}>
-              <div className="muted popover-heading provider-group-heading">{g.provider}</div>
-              {g.cards.map((p) => (
-                <button
-                  key={p.id}
-                  role="menuitemradio"
-                  aria-checked={p.id === activeId}
-                  className={`provider-option${p.id === activeId ? ' active' : ''}`}
-                  title={modelTitle(p.info)}
-                  onClick={() => void switchTo(p.id)}
-                >
-                  {/* Icon and name are separate flex children rather than one
+          {/* The setups, in the user's order (Settings → Setups). */}
+          {providers
+            .filter((p) => !p.disabled_reason && !(locked && p.id === activeId))
+            .map((p) => (
+              <button
+                key={p.id}
+                role="menuitemradio"
+                aria-checked={p.id === activeId}
+                className={`provider-option${p.id === activeId ? ' active' : ''}`}
+                title={setupTitle(p)}
+                onClick={() => void switchTo(p.id)}
+              >
+                {/* Icon and name are separate flex children rather than one
                     run of inline content, so a name too long for the row
                     wraps to a hanging indent under the name instead of under
                     the icon (see `.provider-option` in base.css). */}
-                  <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
-                  <span className="provider-option-name">{modelLabel(p.info)}</span>
-                </button>
-              ))}
-            </div>
-          ))}
-          {providers.length === 0 && <span className="muted">No models set up</span>}
+                <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
+                <span className="provider-option-name">{p.name}</span>
+              </button>
+            ))}
+          {providers.length === 0 && <span className="muted">No setups yet</span>}
         </div>
       )}
       {branchFlow.gate}

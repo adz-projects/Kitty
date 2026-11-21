@@ -50,6 +50,7 @@ function profile(overrides: Partial<ProviderView>): ProviderView {
       intelligence: null,
       context_length: null,
     },
+    setup: { id: 'p1', name: 'Test', provider_id: 'p1', model: 'm', created_at: '' },
     network_tier: 'remote',
     has_secret: true,
     active: false,

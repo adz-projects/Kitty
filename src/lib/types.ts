@@ -255,7 +255,7 @@ export interface ProviderProfile {
   models: string[];
   /** The models the user checked: the ones in Kitty's model list. */
   enabled_models: string[];
-  /** Each model's card id (`model -> id`). Assigned by the backend. */
+  /** Card ids from before setups (`model -> id`); kept by the backend. */
   model_ids: Record<string, string>;
   /** Models marked as reading images (for models the catalog does not know). */
   vision_models: string[];
@@ -324,13 +324,41 @@ export interface ProviderAccountView extends ProviderProfile {
   model_infos: ModelInfo[];
 }
 
-/** One checked model as a card (mirrors Rust ProviderView): an entry of the
-    user's model list. `name` is the model id; `info.name` the readable
-    name; `info.provider_name` its provider's. */
+/** A setup: one of a provider's checked models with the user's own name,
+    default thinking level, context length, system prompt and specialist
+    role. What chats, scheduled tasks and specialists run on. Mirrors
+    `config::providers::Setup`. Sampling settings are carried but have no
+    controls. */
+export interface Setup {
+  id: string;
+  name: string;
+  provider_id: string;
+  model: string;
+  /** The level a chat starts at; `null`/absent = the model's own default. */
+  effort?: string | null;
+  /** `null`/absent = the window detected for the model. */
+  context_length?: number | null;
+  /** `null`/absent = Kitty's built-in prompt. Reaches new chats only. */
+  system_prompt?: string | null;
+  /** `"preferred"`, `"allowed"` (when absent) or `"never"`. */
+  subagent_role?: string | null;
+  temperature?: number | null;
+  top_p?: number | null;
+  top_k?: number | null;
+  min_p?: number | null;
+  presence_penalty?: number | null;
+  frequency_penalty?: number | null;
+  max_tokens?: number | null;
+  created_at: string;
+}
+
+/** A setup as its card: the provider's connection with the setup's model,
+    name and settings (`id` and `name` are the setup's). */
 export interface ProviderView extends ProviderProfile {
+  setup: Setup;
   network_tier: NetworkTier;
   has_secret: boolean;
-  /** The default model for new chats. */
+  /** The default setup for new chats. */
   active: boolean;
   info: ModelInfo;
   /** Resolved image support: the manual `supports_vision` override, else what

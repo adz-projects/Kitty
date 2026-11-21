@@ -58,17 +58,19 @@ lib.rs (app setup, window creation, generate_handler! list;
   │                     running elsewhere), notices, tool results
   │     turn_text.rs   how a user turn is laid out (documents, file list) and
   │                     parsed back for replay
-  │     providers.rs   sync every model card (checked model) into the engine
+  │     providers.rs   sync every setup's card into the engine (one row each)
   │     specialists.rs, mcp.rs (bundled servers self-heal), pathway.rs,
   │     memorabilia.rs, effort/ (ladder, detect), vision.rs, context_window.rs
   │
   ├─► config/                                app config (%APPDATA%/Kitty/config.json;
   │     mod.rs         Config, load/save,      app-private dir on Android);
   │                     patch (merge patch)     every save emits config://changed
-  │     providers/     providers and their model cards (one per checked
-  │                     model, `Config::cards`), the one-card-per-model →
-  │                     provider migration, network tier, secrets, endpoint
-  │                     scheme probing, connection test
+  │     providers/     providers (a service, its key, its checked models),
+  │                     setups.rs (a checked model with its own name,
+  │                     thinking level, context length and prompt; its card
+  │                     is `Config::card`), the card → provider → setup
+  │                     migrations, network tier, secrets, endpoint scheme
+  │                     probing, connection test
   │
   ├─► ai_models/                             a provider's models described from the
   │     mod.rs         OpenRouter catalog: ranked (intelligence less age),
@@ -230,9 +232,11 @@ Settings. Memorabilia and specialists are off on Android.
    registrations, approval rules** → the engine. The frontend's `messages[]`
    is a reconstruction from `chat://*` events, never persisted app-side.
    Providers are Kitty's (`config.json` + secret store). A provider holds the
-   models it offers and the ones the user checked; each checked model is a
-   *model card* with a stable id of its own, and every card is synced into the
-   engine as one provider row (chats, schedules and specialists pin a card).
+   models it offers and the ones the user checked; a *setup* is one checked
+   model with its own name, thinking level, context length and system prompt.
+   Each setup's card is synced into the engine as one provider row (chats,
+   schedules and specialists pin a setup). Reasoning ladders are stored per
+   provider and model (`effort_caps`), shared by the setups on that model.
 2. **Settings** → `config.json`, written through `patch_config` (only the
    fields that changed), with `config://changed` telling every window.
 3. **Secrets** → never `config.json`, never the webview. Desktop: Windows

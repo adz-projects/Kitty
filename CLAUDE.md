@@ -221,16 +221,23 @@ engine-managed) and why mixing them is a bug.
   while Kitty's process is alive, and one that fell due meanwhile runs when
   Kitty next opens (headless runs: `docs/BACKLOG.md`). Settings shows the last
   run with a link to its chat, and "Run now". Failures notify.
-- **Providers** (`config/providers/`, `ai_models/`, Settings → Providers) —
-  a provider is one service and key with the models it offers; the user
-  fetches them and checks the ones for Kitty's model list. Each checked model
-  is a *model card* with a stable id (`ProviderProfile::model_ids`), and every
-  card is synced into the engine as its own provider row. Model lists are
-  ranked by intelligence less age and marked `$`/`$$`/`$$$` by output price
-  (OpenRouter's catalog). The default model is chosen from a dropdown at the
-  top of the panel; the first provider fills it in. A chat stays on its card;
-  moving it is a branch onto another card, through the handoff gate when the
-  target is less trusted.
+- **Providers and setups** (`config/providers/`, `ai_models/`, Settings →
+  Providers and → Setups) — a provider is one service and key with the models
+  it offers; the user fetches them and checks the ones worth choosing from.
+  A *setup* (`config/providers/setups.rs`) is one checked model with the
+  user's name for it, a default thinking level, an optional context length,
+  an optional system prompt and whether specialists may run on it (sampling
+  settings live there too, with no controls). Chats, scheduled tasks and
+  specialists pick setups; the chat's menu shows setup names, a hover says
+  the provider and model, and the thinking level still changes turn by turn.
+  Each setup is its *card* (`Config::card`) and is synced into the engine as
+  its own provider row. Model lists are ranked by intelligence less age and
+  marked `$`/`$$`/`$$$` by output price (OpenRouter's catalog). The default
+  setup is chosen at the top of Settings → Setups; the first provider makes
+  one for its suggested model. A chat keeps the prompt and model it started
+  with when its setup is edited (both are pinned on the engine session, so
+  the prompt cache holds); moving it to another setup is a branch, through
+  the handoff gate when the target is less trusted.
 - **Right-click menus and Ctrl+F** (`context_menu.rs`, `lib/contextMenu.ts`,
   `FindBar.tsx`) — Kitty draws its own menus, keeping WebView2's spelling and
   editing items; browser keys are off and Ctrl+F finds in the chat. See

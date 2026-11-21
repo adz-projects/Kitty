@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cardLabel, groupByProvider, modelLabel, modelTitle, priceHint } from './models';
+import { modelLabel, modelTitle, priceHint } from './models';
 import type { ModelInfo } from './types';
 
 function info(over: Partial<ModelInfo>): ModelInfo {
@@ -42,22 +42,5 @@ describe('model labels', () => {
     expect(modelTitle(info({ price_out_per_m: 2, intelligence: 61.4 }))).toBe(
       'x/y — $2.00 per million output tokens — Intelligence index 61'
     );
-  });
-
-  it('names the provider when asked', () => {
-    expect(cardLabel({ info: info({ price_tier: '$' }) }, true)).toBe('X: Y · $ — OpenRouter');
-  });
-});
-
-describe('groupByProvider', () => {
-  it('keeps the ranked order within and across groups', () => {
-    const cards = [
-      { info: info({ provider_id: 'a', provider_name: 'A', name: '1' }) },
-      { info: info({ provider_id: 'b', provider_name: 'B', name: '2' }) },
-      { info: info({ provider_id: 'a', provider_name: 'A', name: '3' }) },
-    ];
-    const groups = groupByProvider(cards);
-    expect(groups.map((g) => g.provider)).toEqual(['A', 'B']);
-    expect(groups[0].cards.map((c) => c.info.name)).toEqual(['1', '3']);
   });
 });

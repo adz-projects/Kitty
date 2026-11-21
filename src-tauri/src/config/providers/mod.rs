@@ -1,11 +1,11 @@
 //! Providers and their models. A provider is one service (OpenRouter,
 //! Anthropic, a self-hosted server…) with one key and the models it offers;
-//! the user checks the models Kitty may use. Every checked model is a
-//! **model card**: a [`ProviderProfile`] with exactly one model and an id of
-//! its own (`model_ids`), built on demand by [`ProviderProfile::cards`]. The
-//! card is what a chat, a scheduled task, a specialist host and an engine
-//! provider row are pinned to, so everything below Settings → Providers still
-//! sees one model per card.
+//! the user checks the models worth choosing from. A **setup**
+//! ([`setups`]) is one checked model with the user's own name, thinking
+//! level, context length and system prompt; its **card** is the
+//! [`ProviderProfile`] a chat, a scheduled task, a specialist host and an
+//! engine provider row are pinned to ([`crate::config::Config::card`]), so
+//! everything below Settings still sees one model per card.
 //!
 //! Profile *metadata* lives in app config; secrets live only in the Windows
 //! Credential Manager via `keyring`, under the provider's id (a card reads its
@@ -16,6 +16,7 @@ mod connection;
 pub mod endpoint;
 mod keyring;
 mod network;
+pub mod setups;
 
 pub use connection::{test_connection, test_connection_with_key};
 pub use keyring::{
@@ -26,8 +27,9 @@ pub use keyring::{
 #[cfg(desktop)]
 pub use keyring::V1_ENCRYPTION_KEY_ACCOUNT;
 pub use network::{is_hosted_endpoint, network_tier_for, NetworkTier};
+pub use setups::{migrate_to_setups, repoint_setups, Setup};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -35,8 +37,8 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state::AppState;
 
-/// A provider (as stored), or one of its model cards (built on demand by
-/// [`ProviderProfile::cards`], with `provider_id` set and one model).
+/// A provider (as stored), or a setup's card (built on demand by
+/// [`setups::Setup::card`], with `provider_id` set and one model).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderProfile {
     pub id: String,
@@ -58,10 +60,9 @@ pub struct ProviderProfile {
     /// not in `models` any more is ignored.
     #[serde(default)]
     pub enabled_models: Vec<String>,
-    /// The id each model's card goes by (`model -> card id`): what chats,
-    /// scheduled tasks and the engine's provider rows are pinned to. Kept for
-    /// as long as the model is listed, so unchecking and re-checking a model
-    /// brings its chats back. Assigned by [`assign_model_ids`].
+    /// The id each model's card went by before setups (`model -> card id`).
+    /// Kept only so `setups::repoint_setups` can follow a setup into the
+    /// provider its model was merged into; new providers have none.
     #[serde(default)]
     pub model_ids: BTreeMap<String, String>,
     /// Models the user marked as reading images (for models OpenRouter's
@@ -350,87 +351,54 @@ impl ProviderProfile {
             .iter()
             .filter(|m| self.enabled_models.contains(m))
     }
-
-    /// One checked model as its card, or `None` when it is not checked or has
-    /// no id yet.
-    pub fn model_card(&self, model: &str) -> Option<ProviderProfile> {
-        if !self.is_enabled(model) {
-            return None;
-        }
-        let id = self.model_ids.get(model)?.clone();
-        let mut card = self.clone();
-        card.provider_id = Some(self.id.clone());
-        card.id = id;
-        card.name = model.to_string();
-        card.models = vec![model.to_string()];
-        card.enabled_models = vec![model.to_string()];
-        card.model_ids = BTreeMap::from([(model.to_string(), card.id.clone())]);
-        card.supports_vision = self.vision_models.iter().any(|m| m == model);
-        card.vision_models = Vec::new();
-        card.context_length = self
-            .context_length
-            .or_else(|| self.context_lengths.get(model).copied());
-        card.context_lengths = BTreeMap::new();
-        Some(card)
-    }
-
-    /// Every checked model's card, in listed order.
-    pub fn cards(&self) -> Vec<ProviderProfile> {
-        self.checked_models()
-            .filter_map(|m| self.model_card(m))
-            .collect()
-    }
 }
 
 impl crate::config::Config {
-    /// Every checked model of every provider, as cards (disabled providers'
-    /// too: `is_usable` tells them apart).
+    /// Every setup as its card, in the setups' order (unusable ones too:
+    /// `is_usable` tells them apart).
     pub fn cards(&self) -> Vec<ProviderProfile> {
-        self.providers.iter().flat_map(|p| p.cards()).collect()
-    }
-
-    /// The card with this id (a checked model).
-    pub fn card(&self, card_id: &str) -> Option<ProviderProfile> {
-        self.providers.iter().find_map(|p| {
-            let (model, _) = p.model_ids.iter().find(|(_, id)| id.as_str() == card_id)?;
-            p.model_card(model)
-        })
-    }
-
-    /// The provider a card belongs to.
-    pub fn provider_of_card(&self, card_id: &str) -> Option<&ProviderProfile> {
-        self.providers
+        self.setups
             .iter()
-            .find(|p| p.model_ids.values().any(|id| id == card_id))
+            .filter_map(|s| {
+                let p = self.providers.iter().find(|p| p.id == s.provider_id)?;
+                Some(s.card(p))
+            })
+            .collect()
     }
 
-    /// Remember a card's confirmed context window. Returns whether anything
-    /// changed. A provider-wide `context_length` is the user's and wins.
+    /// The setup with this id, as its card.
+    pub fn card(&self, card_id: &str) -> Option<ProviderProfile> {
+        let s = self.setup(card_id)?;
+        let p = self.providers.iter().find(|p| p.id == s.provider_id)?;
+        Some(s.card(p))
+    }
+
+    /// The provider a setup belongs to.
+    pub fn provider_of_card(&self, card_id: &str) -> Option<&ProviderProfile> {
+        let s = self.setup(card_id)?;
+        self.providers.iter().find(|p| p.id == s.provider_id)
+    }
+
+    /// Remember the context window confirmed for a setup's model. Returns
+    /// whether anything changed. A setup's own `context_length` is the
+    /// user's and wins.
     pub fn set_card_context_length(&mut self, card_id: &str, n: u32) -> bool {
-        let Some(p) = self
-            .providers
-            .iter_mut()
-            .find(|p| p.model_ids.values().any(|id| id == card_id))
-        else {
+        let Some(s) = self.setup(card_id) else {
             return false;
         };
-        if p.context_length.is_some() {
+        if s.context_length.is_some() {
             return false;
         }
-        let Some(model) = p
-            .model_ids
-            .iter()
-            .find(|(_, id)| id.as_str() == card_id)
-            .map(|(m, _)| m.clone())
-        else {
+        let (pid, model) = (s.provider_id.clone(), s.model.clone());
+        let Some(p) = self.providers.iter_mut().find(|p| p.id == pid) else {
             return false;
         };
         p.context_lengths.insert(model, n) != Some(n)
     }
 
-    /// Keep the default model on a usable card: when it was unchecked or its
-    /// provider deleted, `fallback` (else the first usable card) takes over.
-    /// Returns whether the default changed.
+    /// Keep the default on a usable setup: when its model was unchecked or
+    /// it or its provider deleted, `fallback` (else the first usable setup)
+    /// takes over. Returns whether the default changed.
     pub fn repair_default(&mut self, fallback: Option<String>) -> bool {
         let cards = self.cards();
         let ok = |id: &str| cards.iter().any(|c| c.id == id && c.is_usable());
@@ -443,63 +411,6 @@ impl crate::config::Config {
         let changed = next != self.active_provider_id;
         self.active_provider_id = next;
         changed
-    }
-}
-
-/// A card id for `model` that nothing else uses: `<provider id>-<model as a
-/// slug>`, numbered when that is taken.
-fn new_card_id(provider_id: &str, model: &str, taken: &HashSet<String>) -> String {
-    let slug: String = model
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    let slug: String = slug.chars().take(60).collect();
-    let base = format!("{provider_id}-{slug}");
-    if !taken.contains(&base) {
-        return base;
-    }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|id| !taken.contains(id))
-        .expect("an unused id")
-}
-
-/// Give every listed model of `providers[index]` a card id, and drop the
-/// checks, ids and marks of models no longer listed.
-pub fn assign_model_ids(providers: &mut [ProviderProfile], index: usize) {
-    let mut taken: HashSet<String> = HashSet::new();
-    for (i, p) in providers.iter().enumerate() {
-        taken.insert(p.id.clone());
-        if i != index {
-            taken.extend(p.model_ids.values().cloned());
-        }
-    }
-    let p = &mut providers[index];
-    let listed: HashSet<String> = p.models.iter().cloned().collect();
-    p.model_ids.retain(|m, _| listed.contains(m));
-    let mut seen = HashSet::new();
-    p.enabled_models
-        .retain(|m| listed.contains(m) && seen.insert(m.clone()));
-    p.vision_models.retain(|m| listed.contains(m));
-    p.context_lengths.retain(|m, _| listed.contains(m));
-    taken.extend(p.model_ids.values().cloned());
-    let pid = p.id.clone();
-    for model in p.models.clone() {
-        if let std::collections::btree_map::Entry::Vacant(slot) = p.model_ids.entry(model) {
-            let id = new_card_id(&pid, slot.key(), &taken);
-            taken.insert(id.clone());
-            slot.insert(id);
-        }
     }
 }
 
@@ -689,6 +600,7 @@ pub async fn migrate_merge_providers(app: &AppHandle) {
         let merged_away = merge_same_service(&mut providers, &secrets);
         cfg.providers = providers;
         cfg.providers_schema = SCHEMA_MERGED;
+        repoint_setups(&mut cfg);
         if let Err(e) = crate::config::save(&cfg) {
             tracing::warn!("could not save the merged providers: {e}");
             return;
@@ -718,6 +630,17 @@ mod tests {
         .unwrap()
     }
 
+    /// A config holding `providers`, each checked model a setup.
+    fn with_setups(providers: Vec<ProviderProfile>) -> crate::config::Config {
+        let mut cfg = crate::config::Config {
+            providers,
+            setups_migrated: false,
+            ..Default::default()
+        };
+        migrate_to_setups(&mut cfg);
+        cfg
+    }
+
     fn typed(id: &str, provider_type: &str) -> ProviderProfile {
         let mut p: ProviderProfile = serde_json::from_value(serde_json::json!({
             "id": id, "name": id, "provider_type": provider_type,
@@ -732,11 +655,8 @@ mod tests {
     /// default is cleared and flagged so the user is asked for another.
     #[test]
     fn local_profiles_are_disabled_and_a_local_default_is_cleared() {
-        let mut cfg = crate::config::Config {
-            providers: vec![typed("loc", "local"), typed("or", "openrouter")],
-            active_provider_id: Some("loc".into()),
-            ..Default::default()
-        };
+        let mut cfg = with_setups(vec![typed("loc", "local"), typed("or", "openrouter")]);
+        cfg.active_provider_id = Some("loc".into());
         assert!(migrate_local_profiles(&mut cfg));
         assert_eq!(
             cfg.providers[0].disabled_reason.as_deref(),
@@ -750,11 +670,8 @@ mod tests {
 
     #[test]
     fn a_remote_default_survives_the_local_migration() {
-        let mut cfg = crate::config::Config {
-            providers: vec![typed("loc", "local"), typed("or", "openrouter")],
-            active_provider_id: Some("or".into()),
-            ..Default::default()
-        };
+        let mut cfg = with_setups(vec![typed("loc", "local"), typed("or", "openrouter")]);
+        cfg.active_provider_id = Some("or".into());
         migrate_local_profiles(&mut cfg);
         assert_eq!(cfg.active_provider_id.as_deref(), Some("or"));
         assert!(!cfg.needs_default_provider);
@@ -806,10 +723,8 @@ mod tests {
         providers[0].supports_vision = true;
         providers[0].context_length = Some(32_768);
         upgrade_to_model_lists(&mut providers);
-        let cfg = crate::config::Config {
-            providers,
-            ..Default::default()
-        };
+        let mut again = providers.clone();
+        let cfg = with_setups(providers);
         let ids: Vec<String> = cfg.cards().iter().map(|c| c.id.clone()).collect();
         assert_eq!(ids, ["a", "b", "b-m1"]);
         let a = cfg.card("a").unwrap();
@@ -822,9 +737,9 @@ mod tests {
         assert_eq!(cfg.card("b-m1").unwrap().secret_account(), "b");
         assert_eq!(cfg.providers[0].context_length, None);
         // Idempotent.
-        let mut again = cfg.providers.clone();
+        let before = again[1].model_ids.clone();
         upgrade_to_model_lists(&mut again);
-        assert_eq!(again[1].model_ids, cfg.providers[1].model_ids);
+        assert_eq!(again[1].model_ids, before);
     }
 
     #[test]
@@ -841,6 +756,8 @@ mod tests {
         }
         providers[1].provider_type = "custom_openai".into();
         upgrade_to_model_lists(&mut providers);
+        let mut cfg = with_setups(providers);
+        let mut providers = cfg.providers.clone();
         let secrets = [
             Some("k1".to_string()),
             None,
@@ -858,10 +775,8 @@ mod tests {
         assert_eq!(providers[0].models, ["gpt-x", "claude-y"]);
         assert_eq!(providers[0].model_ids["claude-y"], "p3");
         assert_eq!(providers[2].name, "OpenRouter");
-        let cfg = crate::config::Config {
-            providers,
-            ..Default::default()
-        };
+        cfg.providers = providers;
+        repoint_setups(&mut cfg);
         let p3 = cfg.card("p3").unwrap();
         assert_eq!(p3.secret_account(), "p1");
         assert_eq!(p3.model(), "claude-y");
@@ -873,44 +788,20 @@ mod tests {
             profile_with("a", "A", &["m1"]),
             profile_with("b", "B", &["m2"]),
         ];
-        providers[1].system_prompt = Some("Be terse.".into());
+        providers[1].is_trusted = true;
         upgrade_to_model_lists(&mut providers);
         assert!(merge_same_service(&mut providers, &[None, None]).is_empty());
         assert_eq!(providers.len(), 2);
     }
 
     #[test]
-    fn new_models_get_ids_that_collide_with_nothing() {
-        let mut providers = vec![
-            profile_with("p", "P", &["a/b"]),
-            profile_with("q", "Q", &[]),
-        ];
-        upgrade_to_model_lists(&mut providers);
-        // Another provider already holds the id the slug would give.
-        providers[1].models = vec!["x".into()];
-        providers[1].model_ids = BTreeMap::from([("x".to_string(), "p-c-d".to_string())]);
-        providers[0].models = vec!["a/b".into(), "c.d".into(), "C:D".into()];
-        providers[0].enabled_models = vec!["c.d".into(), "gone".into()];
-        assign_model_ids(&mut providers, 0);
-        let ids = &providers[0].model_ids;
-        assert_eq!(ids["a/b"], "p", "an existing id stays");
-        assert_eq!(ids["c.d"], "p-c-d-2");
-        assert_eq!(ids["C:D"], "p-c-d-3");
-        assert_eq!(providers[0].enabled_models, ["c.d"], "unlisted checks drop");
-    }
-
-    #[test]
-    fn only_checked_models_are_cards_and_the_default_follows() {
+    fn a_setup_on_an_unchecked_model_hands_the_default_on() {
         let mut p = profile_with("p", "P", &["a", "b"]);
         upgrade_to_model_lists(std::slice::from_mut(&mut p));
-        p.enabled_models = vec!["b".into()];
-        let mut cfg = crate::config::Config {
-            providers: vec![p],
-            active_provider_id: Some("p".into()),
-            ..Default::default()
-        };
-        assert!(cfg.card("p").is_none(), "a is unchecked");
-        assert_eq!(cfg.cards().len(), 1);
+        let mut cfg = with_setups(vec![p]);
+        cfg.active_provider_id = Some("p".into());
+        cfg.providers[0].enabled_models = vec!["b".into()];
+        assert!(!cfg.card("p").unwrap().is_usable(), "a is unchecked");
         assert!(cfg.repair_default(None));
         assert_eq!(cfg.active_provider_id.as_deref(), Some("p-m1"));
         assert!(!cfg.repair_default(None));
@@ -920,17 +811,14 @@ mod tests {
     fn a_confirmed_window_is_remembered_per_model() {
         let mut p = profile_with("p", "P", &["a", "b"]);
         upgrade_to_model_lists(std::slice::from_mut(&mut p));
-        let mut cfg = crate::config::Config {
-            providers: vec![p],
-            ..Default::default()
-        };
+        let mut cfg = with_setups(vec![p]);
         assert!(cfg.set_card_context_length("p-m1", 200_000));
         assert!(!cfg.set_card_context_length("p-m1", 200_000));
         assert_eq!(cfg.card("p-m1").unwrap().context_length, Some(200_000));
         assert_eq!(cfg.card("p").unwrap().context_length, None);
-        cfg.providers[0].context_length = Some(8_192);
+        cfg.setups[1].context_length = Some(8_192);
         assert!(
-            !cfg.set_card_context_length("p", 1_000_000),
+            !cfg.set_card_context_length("p-m1", 1_000_000),
             "the user's wins"
         );
         assert_eq!(cfg.card("p-m1").unwrap().context_length, Some(8_192));

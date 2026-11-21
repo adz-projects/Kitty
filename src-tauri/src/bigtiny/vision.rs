@@ -197,11 +197,14 @@ mod tests {
     fn two_cards() -> Config {
         let mut providers = vec![profile("a", "small-model"), profile("b", "big-model")];
         crate::config::providers::upgrade_to_model_lists(&mut providers);
-        Config {
+        let mut cfg = Config {
             providers,
             active_provider_id: Some("a".into()),
+            setups_migrated: false,
             ..Config::default()
-        }
+        };
+        crate::config::providers::migrate_to_setups(&mut cfg);
+        cfg
     }
 
     /// Same NUL-separated shape as its two siblings, including the collision

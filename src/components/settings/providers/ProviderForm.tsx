@@ -1,22 +1,15 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Modal } from '@/components/shared/Modal';
-import type { ModelInfo, ProviderProfile, ProviderType } from '@/lib/types';
+import type { ModelInfo, ProviderProfile, ProviderType, Setup } from '@/lib/types';
 import { TrustBadge } from '@/lib/provider_trust';
 import { LockIcon } from '@/components/icons/LockIcon';
 import { GlobeIcon } from '@/components/icons/GlobeIcon';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
 import { ipc } from '@/lib/ipc';
 import { modelTitle, priceHint } from '@/lib/models';
-import {
-  CTX_DETENTS,
-  canSaveProvider,
-  ctxLabel,
-  hasFixedEndpoint,
-  initialChecks,
-  isLocal,
-  nearestCtxIndex,
-  tierOf,
-} from './providerUtils';
+import { canSaveProvider, hasFixedEndpoint, initialChecks, isLocal, tierOf } from './providerUtils';
+import { setupsUsing } from '../setups/setupUtils';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { isAndroid } from '@/lib/platform';
 
 /** The service's own name, offered as a new provider's name. */
@@ -62,6 +55,7 @@ const SECRET_STORE_NOTE = isAndroid()
 export function ProviderForm({
   profile,
   secret,
+  setups,
   onChange,
   onSecret,
   onCancel,
@@ -69,6 +63,8 @@ export function ProviderForm({
 }: {
   profile: ProviderProfile;
   secret: string;
+  /** Every setup, to mark (and guard) the models they run on. */
+  setups: Setup[];
   onChange: (p: ProviderProfile) => void;
   onSecret: (s: string) => void;
   onCancel: () => void;
@@ -99,7 +95,6 @@ export function ProviderForm({
     }
   };
 
-  const detents = CTX_DETENTS;
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // Hosted services sit at a fixed, well-known endpoint: no URL field.
@@ -214,15 +209,33 @@ export function ProviderForm({
   }, [ranked, filter]);
 
   const isOn = (model: string) => profile.enabled_models.includes(model);
-  const toggle = (model: string, on: boolean) =>
+  const usedBy = (model: string) => (profile.id ? setupsUsing(setups, profile.id, model) : []);
+  // Unchecking a model a setup runs on leaves that setup unusable: ask first.
+  const confirmUncheck = async (models: string[]) => {
+    const names = [...new Set(models.flatMap(usedBy))];
+    if (names.length === 0) return true;
+    return confirmDialog({
+      title: models.length === 1 ? `Uncheck ${models[0]}?` : 'Uncheck models in use?',
+      message: `${names.join(', ')} ${names.length === 1 ? 'runs' : 'run'} on ${
+        models.length === 1 ? 'it' : 'them'
+      }, and can't be used until you choose another model for ${
+        names.length === 1 ? 'it' : 'them'
+      } under Setups.`,
+      confirmLabel: 'Uncheck',
+    });
+  };
+  const toggle = async (model: string, on: boolean) => {
+    if (!on && !(await confirmUncheck([model]))) return;
     set({
       enabled_models: on
         ? [...profile.enabled_models, model]
         : profile.enabled_models.filter((m) => m !== model),
     });
+  };
   // Check / uncheck every model the filter shows (all of them when empty).
-  const setAll = (on: boolean) => {
+  const setAll = async (on: boolean) => {
     const ids = new Set(shown.map((m) => m.model));
+    if (!on && !(await confirmUncheck([...ids].filter(isOn)))) return;
     const rest = profile.enabled_models.filter((m) => !ids.has(m));
     set({ enabled_models: on ? [...rest, ...ids] : rest });
   };
@@ -353,8 +366,8 @@ export function ProviderForm({
         )}
         {profile.models.length === 0 ? (
           <small className="muted">
-            Fetch the provider&apos;s models, then check the ones you want in Kitty&apos;s model
-            list.
+            Fetch the provider&apos;s models, then check the ones you may want to use. Setups choose
+            from the checked models.
           </small>
         ) : (
           <>
@@ -369,7 +382,7 @@ export function ProviderForm({
               <button
                 type="button"
                 className="icon-button"
-                onClick={() => setAll(true)}
+                onClick={() => void setAll(true)}
                 aria-label={filter.trim() ? 'Check all shown models' : 'Check all models'}
                 title={filter.trim() ? 'Check all shown models' : 'Check all models'}
               >
@@ -378,14 +391,14 @@ export function ProviderForm({
               <button
                 type="button"
                 className="icon-button"
-                onClick={() => setAll(false)}
+                onClick={() => void setAll(false)}
                 aria-label={filter.trim() ? 'Uncheck all shown models' : 'Uncheck all models'}
                 title={filter.trim() ? 'Uncheck all shown models' : 'Uncheck all models'}
               >
                 <UncheckAllIcon />
               </button>
             </div>
-            <ul className="model-checklist" aria-label="Models in Kitty's model list">
+            <ul className="model-checklist" aria-label="Checked models, for setups">
               {shown.map((m) => {
                 const id = `prov-model-${m.model}`;
                 const marked = profile.vision_models.includes(m.model);
@@ -395,12 +408,20 @@ export function ProviderForm({
                       id={id}
                       type="checkbox"
                       checked={isOn(m.model)}
-                      onChange={(e) => toggle(m.model, e.target.checked)}
+                      onChange={(e) => void toggle(m.model, e.target.checked)}
                     />
                     <label htmlFor={id} className="model-name" title={modelTitle(m)}>
                       {m.name}
                       {m.name !== m.model && <span className="model-id">{m.model}</span>}
                     </label>
+                    {usedBy(m.model).length > 0 && (
+                      <span
+                        className="model-used-by"
+                        title={`Used by ${usedBy(m.model).join(', ')}`}
+                      >
+                        in use
+                      </span>
+                    )}
                     {m.price_tier && (
                       <span className="price-tier" title={priceHint(m) ?? undefined}>
                         {m.price_tier}
@@ -485,26 +506,6 @@ export function ProviderForm({
         </label>
       )}
 
-      {/* Specialists run on whichever provider the daemon judges best — this is
-          the one input to that decision that reflects what you want rather than
-          what it can measure, so it sits with trust rather than under Advanced.
-          A delegate is triage work: pointing it at a cheap, parallel endpoint is
-          usually the right answer, and "never" keeps it off an expensive one
-          entirely. */}
-      <div className="field">
-        <span>Use for specialists</span>
-        <select
-          value={profile.subagent_role ?? 'allowed'}
-          onChange={(e) =>
-            set({ subagent_role: e.target.value === 'allowed' ? null : e.target.value })
-          }
-        >
-          <option value="allowed">If it is the best available</option>
-          <option value="preferred">Prefer this one</option>
-          <option value="never">Never</option>
-        </select>
-      </div>
-
       <button
         type="button"
         className="disclosure-toggle"
@@ -540,20 +541,6 @@ export function ProviderForm({
               self-hosted or renamed one.
             </small>
           </label>
-          <label className="field">
-            <span>Custom system prompt (optional — overrides Kitty&apos;s built-in default)</span>
-            <textarea
-              rows={4}
-              value={profile.system_prompt ?? ''}
-              placeholder="Default: Kitty's built-in system prompt…"
-              onChange={(e) => set({ system_prompt: e.target.value || null })}
-            />
-            <small className="muted">
-              Sent as a hidden preamble on the first message of each new session — not visible in
-              the chat bubble.
-            </small>
-          </label>
-
           <label className="field">
             <span>Response timeout (seconds, optional — default 300)</span>
             <input
@@ -594,189 +581,6 @@ export function ProviderForm({
               actually hits. Leave unset for Ollama or anything else.
             </small>
           </label>
-
-          {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}
-          <div className="field param-slider">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={profile.temperature != null}
-                onChange={(e) => set({ temperature: e.target.checked ? 0.7 : null })}
-              />
-              <span>Override temperature</span>
-            </label>
-            {profile.temperature != null && (
-              <div className="row">
-                <input
-                  type="range"
-                  min={0}
-                  max={2}
-                  step={0.1}
-                  value={profile.temperature}
-                  onChange={(e) => set({ temperature: Number(e.target.value) })}
-                />
-                <span className="status-badge">{profile.temperature.toFixed(1)}</span>
-              </div>
-            )}
-          </div>
-
-          <div className="field param-slider">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={profile.top_p != null}
-                onChange={(e) => set({ top_p: e.target.checked ? 0.8 : null })}
-              />
-              <span>Override top_p</span>
-            </label>
-            {profile.top_p != null && (
-              <div className="row">
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={profile.top_p}
-                  onChange={(e) => set({ top_p: Number(e.target.value) })}
-                />
-                <span className="status-badge">{profile.top_p.toFixed(2)}</span>
-              </div>
-            )}
-          </div>
-
-          <div className="field param-slider">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={profile.presence_penalty != null}
-                onChange={(e) => set({ presence_penalty: e.target.checked ? 1.0 : null })}
-              />
-              <span>Override presence penalty</span>
-            </label>
-            {profile.presence_penalty != null && (
-              <div className="row">
-                <input
-                  type="range"
-                  min={0}
-                  max={2}
-                  step={0.1}
-                  value={profile.presence_penalty}
-                  onChange={(e) => set({ presence_penalty: Number(e.target.value) })}
-                />
-                <span className="status-badge">{profile.presence_penalty.toFixed(1)}</span>
-              </div>
-            )}
-            <small className="muted">
-              Repetition control, self-hosted providers only. Unset still applies a safe default —
-              llama-server&rsquo;s own default allows endless loops — set this only to override it.
-            </small>
-          </div>
-
-          {(profile.provider_type === 'ollama' || profile.provider_type === 'custom_openai') && (
-            <div className="field param-slider">
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={profile.top_k != null}
-                  onChange={(e) => set({ top_k: e.target.checked ? 20 : null })}
-                />
-                <span>Override top_k</span>
-              </label>
-              {profile.top_k != null && (
-                <div className="row">
-                  <input
-                    type="number"
-                    min={0}
-                    step={1}
-                    value={profile.top_k}
-                    onChange={(e) => set({ top_k: e.target.value ? Number(e.target.value) : null })}
-                  />
-                </div>
-              )}
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={profile.min_p != null}
-                  onChange={(e) => set({ min_p: e.target.checked ? 0.0 : null })}
-                />
-                <span>Override min_p</span>
-              </label>
-              {profile.min_p != null && (
-                <div className="row">
-                  <input
-                    type="number"
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={profile.min_p}
-                    onChange={(e) => set({ min_p: e.target.value ? Number(e.target.value) : null })}
-                  />
-                </div>
-              )}
-              <small className="muted">
-                llama.cpp/Ollama-only sampling knobs — not part of the OpenAI or Anthropic API, so
-                these are only ever sent to a self-hosted endpoint.
-              </small>
-            </div>
-          )}
-
-          <div className="field param-slider">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={profile.max_tokens != null}
-                onChange={(e) => set({ max_tokens: e.target.checked ? 8192 : null })}
-              />
-              <span>Override max reply length (tokens)</span>
-            </label>
-            {profile.max_tokens != null && (
-              <div className="row">
-                <input
-                  type="number"
-                  min={1}
-                  step={256}
-                  value={profile.max_tokens}
-                  onChange={(e) =>
-                    set({ max_tokens: e.target.value ? Number(e.target.value) : null })
-                  }
-                />
-              </div>
-            )}
-            <small className="muted">
-              Hard cap on one reply. Self-hosted providers get a finite default (8192) even when
-              this is unset, so no single reply can stream forever.
-            </small>
-          </div>
-
-          <div className="field param-slider">
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={profile.context_length != null}
-                onChange={(e) => set({ context_length: e.target.checked ? 8192 : null })}
-              />
-              <span>Override context length</span>
-            </label>
-            {profile.context_length != null && (
-              <div className="row">
-                <input
-                  type="range"
-                  min={0}
-                  max={detents.length - 1}
-                  step={1}
-                  value={nearestCtxIndex(detents, profile.context_length)}
-                  onChange={(e) => set({ context_length: detents[Number(e.target.value)] })}
-                />
-                <span className="status-badge">{ctxLabel(profile.context_length)}</span>
-              </div>
-            )}
-            {profile.context_length != null && (
-              <small className="muted">
-                Used as the context window of every model of this provider, overriding what Kitty
-                detects for each and the global token management value in Settings → Advanced.
-              </small>
-            )}
-          </div>
         </div>
       )}
 

@@ -26,6 +26,7 @@ const providers: ProviderView[] = [
     base_url: 'https://openrouter.ai/api/v1',
     models: ['big-model', 'small-model'],
     active: true,
+    setup: { id: 'p1', name: 'Test', provider_id: 'p1', model: 'm', created_at: '' },
     network_tier: 'remote',
     is_trusted: false,
     supports_vision: false,

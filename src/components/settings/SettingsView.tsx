@@ -5,6 +5,7 @@ import { isAndroid } from '@/lib/platform';
 import { KittyIcon } from '@/components/icons/KittyIcon';
 import { General } from '@/components/settings/General';
 import { Providers } from '@/components/settings/Providers';
+import { Setups } from '@/components/settings/Setups';
 import { HelperModels } from '@/components/settings/HelperModels';
 import { McpServers } from '@/components/settings/McpServers';
 import { NotificationsSection } from '@/components/settings/NotificationsSection';
@@ -20,6 +21,7 @@ function sectionLabels(): Record<string, string> {
   return {
     general: 'General',
     providers: 'Providers',
+    setups: 'Setups',
     local_models: 'Helper Models',
     mcp_servers: 'MCP Servers',
     tool_permissions: 'Tool permissions',
@@ -51,6 +53,7 @@ function buildGroups(): { label: string; sections: string[] }[] {
         // moves to Advanced. Rendering an almost-empty General is just clutter.
         ...(isAndroid() ? [] : ['general']),
         'providers',
+        'setups',
         'local_models',
         'appearance',
         ...(isAndroid() ? [] : ['notifications']),
@@ -171,6 +174,7 @@ export function SettingsView() {
       <main className="settings-main">
         {section === 'general' && <General />}
         {section === 'providers' && <Providers highlight={highlight} />}
+        {section === 'setups' && <Setups highlight={highlight} />}
         {section === 'local_models' && <HelperModels />}
         {section === 'mcp_servers' && <McpServers />}
         {section === 'tool_permissions' && <ToolPermissions />}

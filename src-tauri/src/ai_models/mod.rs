@@ -30,7 +30,7 @@ pub struct ModelInfo {
     pub provider_type: String,
     /// The id the provider uses (what is sent to it).
     pub model: String,
-    /// The model's card id, once it has one (`ProviderProfile::model_ids`).
+    /// The setup this describes, when it describes one (`list_providers`).
     pub card_id: Option<String>,
     /// A readable name: the catalog's (vendor prefix dropped for a
     /// single-company provider), else the id.
@@ -145,7 +145,7 @@ pub fn describe(
         provider_name: provider.name.clone(),
         provider_type: provider.provider_type.clone(),
         model: model.to_string(),
-        card_id: provider.model_ids.get(model).cloned(),
+        card_id: None,
         name: display_name(provider, model, entry),
         enabled: provider.is_enabled(model),
         vision,
@@ -354,7 +354,7 @@ pub(crate) mod tests {
         assert_eq!(m.price_tier, Some("$$$"));
         assert_eq!(m.price_in_per_m, Some(3.0));
         assert_eq!(m.intelligence, Some(65.0));
-        assert_eq!(m.card_id.as_deref(), Some("a"));
+        assert_eq!(m.card_id, None, "set only where it describes a setup");
         assert!(m.vision && m.in_catalog && m.enabled);
 
         let or = provider(

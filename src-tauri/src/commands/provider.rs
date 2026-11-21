@@ -1,30 +1,32 @@
 //! Provider commands. Settings → Providers lists, saves and deletes
 //! *providers* (a service, its key, and the models the user checked); the
-//! rest of Kitty works with *model cards*, one per checked model
-//! (`ProviderProfile::cards`): the model list a chat, a scheduled task or a
-//! specialist picks from, and the default model. Every change is mirrored to
-//! the engine by `bigtiny::providers::sync_all_providers`.
+//! rest of Kitty works with *setups* (`commands::setups`), each seen as its
+//! card: what a chat, a scheduled task or a specialist picks from, and the
+//! default. Every change is mirrored to the engine by
+//! `bigtiny::providers::sync_all_providers`.
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::ai_models::{self, ModelInfo};
 use crate::config;
-use crate::config::providers::{self, NetworkTier, ProviderProfile};
+use crate::config::providers::{self, NetworkTier, ProviderProfile, Setup};
 use crate::config::Config;
 use crate::openrouter;
 use crate::openrouter::catalog;
 use crate::state::AppState;
 
-/// One model card plus derived fields the UI needs: an entry of the user's
-/// model list.
+/// One setup, as its card, plus derived fields the UI needs: an entry of
+/// every model menu.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderView {
     #[serde(flatten)]
     pub profile: ProviderProfile,
+    /// The setup as stored, for its editor.
+    pub setup: Setup,
     pub network_tier: NetworkTier,
     pub has_secret: bool,
-    /// The default model (new chats start on it).
+    /// The default setup (new chats start on it).
     pub active: bool,
     /// Resolved image support for this card's model: the user's vision mark,
     /// else what `bigtiny::vision` discovered and remembered. `None` means no
@@ -62,39 +64,37 @@ async fn card_views(
     detecting: &std::collections::HashSet<String>,
 ) -> Vec<ProviderView> {
     let entries = catalog.map(|c| c.entries.as_slice()).unwrap_or(&[]);
-    let now = ai_models::now_unix();
-    let mut views = Vec::new();
-    for provider in &cfg.providers {
-        let has_secret = providers::get_secret_async(&provider.id).await.is_some();
-        for card in provider.cards() {
-            let mut info = ai_models::describe(provider, card.model(), entries);
-            info.card_id = Some(card.id.clone());
-            views.push(ProviderView {
-                network_tier: card.network_tier(),
-                has_secret,
-                active: cfg.active_provider_id.as_deref() == Some(&card.id),
-                accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, &card),
-                tools_supported: card.tools_supported(catalog),
-                effort: crate::bigtiny::effort::summary_for_profile(cfg, &card, detecting),
-                info,
-                profile: card,
-            });
-        }
+    let mut secrets = std::collections::HashMap::new();
+    for p in &cfg.providers {
+        secrets.insert(
+            p.id.clone(),
+            providers::get_secret_async(&p.id).await.is_some(),
+        );
     }
-    let mut infos: Vec<ModelInfo> = views.iter().map(|v| v.info.clone()).collect();
-    ai_models::rank(&mut infos, now);
-    let order = |v: &ProviderView| {
-        infos
-            .iter()
-            .position(|i| i.card_id == v.info.card_id)
-            .unwrap_or(usize::MAX)
-    };
-    views.sort_by_key(order);
+    let mut views = Vec::new();
+    for setup in &cfg.setups {
+        let Some(provider) = cfg.providers.iter().find(|p| p.id == setup.provider_id) else {
+            continue;
+        };
+        let card = setup.card(provider);
+        let mut info = ai_models::describe(provider, card.model(), entries);
+        info.card_id = Some(card.id.clone());
+        views.push(ProviderView {
+            network_tier: card.network_tier(),
+            has_secret: secrets.get(&provider.id).copied().unwrap_or(false),
+            active: cfg.active_provider_id.as_deref() == Some(&card.id),
+            accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, &card),
+            tools_supported: card.tools_supported(catalog),
+            effort: crate::bigtiny::effort::summary_for_profile(cfg, &card, detecting),
+            info,
+            setup: setup.clone(),
+            profile: card,
+        });
+    }
     views
 }
 
-/// The user's model list: every checked model of every provider, as cards,
-/// ranked by intelligence and age.
+/// The setups, as cards, in the user's order.
 #[tauri::command]
 pub async fn list_providers(
     state: tauri::State<'_, AppState>,
@@ -165,57 +165,62 @@ pub async fn upsert_provider(
     let (saved, detect) = {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
-        let old_cards = cfg
-            .providers
-            .iter()
-            .find(|p| p.id == profile.id)
-            .map(|p| p.cards())
-            .unwrap_or_default();
-        let index = match cfg.providers.iter().position(|p| p.id == profile.id) {
+        let old = cfg.providers.iter().find(|p| p.id == profile.id).cloned();
+        match cfg.providers.iter().position(|p| p.id == profile.id) {
             Some(i) => {
-                // Card ids are the config's, never the form's.
+                // Old card ids are the config's, never the form's.
                 profile.model_ids = cfg.providers[i].model_ids.clone();
                 cfg.providers[i] = profile.clone();
-                i
             }
             None => {
                 profile.model_ids.clear();
                 cfg.providers.push(profile.clone());
-                cfg.providers.len() - 1
             }
-        };
-        providers::assign_model_ids(&mut cfg.providers, index);
-        let saved = cfg.providers[index].clone();
-        // Re-detect the reasoning ladder of a card whose endpoint changed, or
-        // that has none yet.
-        let detect: Vec<String> = saved
+        }
+        let saved = profile.clone();
+        let moved = old.as_ref().map_or(true, |o| {
+            o.provider_type != saved.provider_type || o.base_url != saved.base_url
+        });
+        // The very first provider brings a first setup: its suggested model,
+        // which becomes the default.
+        if cfg.setups.is_empty() {
+            let suggested = ai_models::defaults::pick(
+                &saved.provider_type,
+                &saved.base_url,
+                &ai_models::provider_models(&saved, &catalog, now),
+                true,
+                now,
+            );
+            if let Some(model) = suggested {
+                let info = ai_models::describe(&saved, &model, &catalog);
+                let setup = Setup {
+                    id: providers::setups::new_setup_id(&cfg),
+                    name: info.name,
+                    provider_id: saved.id.clone(),
+                    model,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    ..Default::default()
+                };
+                cfg.active_provider_id = Some(setup.id.clone());
+                cfg.setups.push(setup);
+            }
+        }
+        // Re-detect the reasoning ladder of each of its setups' models whose
+        // endpoint changed, or that has none yet (once per model).
+        let mut seen = std::collections::HashSet::new();
+        let detect: Vec<String> = cfg
             .cards()
             .into_iter()
+            .filter(|card| card.secret_account() == saved.id && card.is_usable())
             .filter(|card| {
-                let has_caps = cfg
-                    .effort_caps
-                    .contains_key(&crate::bigtiny::effort::effort_key(&card.id, card.model()));
-                let moved = old_cards
-                    .iter()
-                    .find(|o| o.id == card.id)
-                    .map_or(true, |o| {
-                        o.provider_type != card.provider_type || o.base_url != card.base_url
-                    });
-                !has_caps || moved
+                let key = crate::bigtiny::effort::effort_key(&saved.id, card.model());
+                let has_caps = cfg.effort_caps.contains_key(&key);
+                seen.insert(key) && (!has_caps || moved)
             })
             .map(|card| card.id)
             .collect();
-        // No default yet (the first provider), or the default was unchecked:
-        // the provider's suggested model takes over.
-        let suggested = ai_models::defaults::pick(
-            &saved.provider_type,
-            &saved.base_url,
-            &ai_models::provider_models(&saved, &catalog, now),
-            true,
-            now,
-        )
-        .and_then(|m| saved.model_ids.get(&m).cloned());
-        cfg.repair_default(suggested);
+        // The default's model was unchecked: the first usable setup takes over.
+        cfg.repair_default(None);
         if cfg.active_provider_id.is_some() {
             cfg.needs_default_provider = false;
         }
@@ -236,9 +241,9 @@ pub async fn upsert_provider(
     }
     // Probe image support now rather than waiting for the first turn, so the
     // composer offers (or hides) the attach controls correctly from the
-    // moment the model is checked. Best-effort and cached after the first
-    // success.
-    for card in saved.cards() {
+    // start. Best-effort and cached after the first success.
+    let cards = app.state::<AppState>().config.lock().unwrap().cards();
+    for card in cards.iter().filter(|c| c.secret_account() == saved.id) {
         crate::bigtiny::vision::ensure_vision_cached(&app, &card.id).await;
     }
     Ok(saved)
@@ -260,10 +265,10 @@ pub async fn redetect_effort_all(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete a provider: its key, its config entry and its models' rows in the
-/// engine. When the default model was one of its models, the next usable
-/// model takes over; returns the default's card id, so the UI can say which
-/// one it is now.
+/// Delete a provider: its key, its config entry, its setups and their rows
+/// in the engine. When the default was one of its setups, the next usable
+/// setup takes over; returns the default's id, so the UI can say which one
+/// it is now.
 ///
 /// `async` for a platform reason, not a performance one: a *synchronous*
 /// `#[tauri::command]` runs on the main thread, and on Android the secret
@@ -280,6 +285,7 @@ pub async fn delete_provider(app: AppHandle, id: String) -> Result<Option<String
             return Ok(cfg.active_provider_id.clone());
         };
         cfg.providers.remove(index);
+        cfg.setups.retain(|s| s.provider_id != id);
         cfg.repair_default(None);
         cfg.needs_default_provider = false;
         config::save(&cfg).map_err(|e| e.to_string())?;

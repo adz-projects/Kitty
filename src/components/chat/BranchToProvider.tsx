@@ -6,7 +6,7 @@ import { Dialog } from '@/components/shared/Dialog';
 import { useChatStore } from '@/stores/chatStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import type { ProviderView } from '@/lib/types';
-import { groupByProvider, modelLabel, modelTitle } from '@/lib/models';
+import { setupTitle } from '@/components/settings/setups/setupUtils';
 
 function hostOf(url: string): string {
   try {
@@ -98,7 +98,7 @@ export function HandoffGateDialog({
   return (
     <Dialog title={`Send this conversation to ${host}?`} onClose={onCancel} alert>
       <p style={{ margin: 0 }}>
-        <strong>{target.info.name}</strong> ({target.info.provider_name}) is less trusted than the
+        <strong>{target.name}</strong> ({target.info.provider_name}) is less trusted than the
         provider this chat is on. Keeping the context sends the whole conversation so far —
         messages, pasted documents and tool results — to <strong>{host}</strong>. Starting clean
         opens an empty chat there instead. Either way this chat stays as it is.
@@ -137,29 +137,24 @@ export function BranchProviderDialog({ onClose }: { onClose: () => void }) {
 
   if (flow.gate) return flow.gate;
   return (
-    <Dialog title="Continue on another model" onClose={onClose}>
+    <Dialog title="Continue on another setup" onClose={onClose}>
       <p className="muted" style={{ margin: 0 }}>
-        The conversation continues in a new chat on the model you pick. This chat stays as it is.
+        The conversation continues in a new chat on the setup you pick. This chat stays as it is.
       </p>
       <div className="provider-choice-list">
-        {groupByProvider(others).map((g) => (
-          <div key={g.providerId} role="group" aria-label={g.provider}>
-            <div className="muted popover-heading provider-group-heading">{g.provider}</div>
-            {g.cards.map((p) => (
-              <button
-                key={p.id}
-                className="provider-option"
-                disabled={flow.busy}
-                title={modelTitle(p.info)}
-                onClick={() => void flow.start(p, current)}
-              >
-                <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
-                <span className="provider-option-name">{modelLabel(p.info)}</span>
-              </button>
-            ))}
-          </div>
+        {others.map((p) => (
+          <button
+            key={p.id}
+            className="provider-option"
+            disabled={flow.busy}
+            title={setupTitle(p)}
+            onClick={() => void flow.start(p, current)}
+          >
+            <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
+            <span className="provider-option-name">{p.name}</span>
+          </button>
         ))}
-        {others.length === 0 && <p className="muted">No other models are set up.</p>}
+        {others.length === 0 && <p className="muted">There is no other setup.</p>}
       </div>
       {flow.error && <p className="error">{flow.error}</p>}
       <div className="modal-actions">

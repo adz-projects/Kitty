@@ -239,11 +239,14 @@ mod tests {
     fn two_cards() -> Config {
         let mut providers = vec![profile("a", "small-model"), profile("b", "big-model")];
         crate::config::providers::upgrade_to_model_lists(&mut providers);
-        Config {
+        let mut cfg = Config {
             providers,
             active_provider_id: Some("a".into()),
+            setups_migrated: false,
             ..Config::default()
-        }
+        };
+        crate::config::providers::migrate_to_setups(&mut cfg);
+        cfg
     }
 
     #[test]
@@ -301,7 +304,7 @@ mod tests {
     #[test]
     fn an_explicit_window_on_the_chats_card_wins_over_discovery() {
         let mut cfg = two_cards();
-        cfg.providers[1].context_length = Some(65_536);
+        cfg.setups[1].context_length = Some(65_536);
         cfg.model_context_lengths
             .insert(model_key("b", "big-model"), 200_000);
         assert_eq!(resolved_context_length(&cfg, "b"), Some(65_536));
