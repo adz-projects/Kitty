@@ -236,8 +236,12 @@ impl ProviderRouter {
             // provider-config default — there's nothing to resolve here.
             effort: None,
         };
-        let resolved_sampling =
-            sampling::resolve(&config.provider_type, &config.model, &configured);
+        let resolved_sampling = sampling::resolve(
+            &config.provider_type,
+            &config.model,
+            &configured,
+            config.context_length,
+        );
         let concurrency = config
             .parallel_slots
             .filter(|&n| n > 0)

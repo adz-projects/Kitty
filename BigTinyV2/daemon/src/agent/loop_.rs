@@ -493,6 +493,56 @@ fn annotate_assistant(mut msg: Value, timing: &TimingResult) -> Value {
     msg
 }
 
+/// Whether `m` is this turn's own reply that stopped short: an assistant
+/// message not yet persisted (no DB `id`), with no tool calls. The loop
+/// leaves one at the end of `messages` when a step ends without `stop` /
+/// `end_turn` (typically `length`, at the reply cap), and the next request
+/// sends it as the trailing message for the provider to continue from.
+fn is_open_reply(m: &Value) -> bool {
+    m.get("role").and_then(Value::as_str) == Some("assistant")
+        && m.get("id").is_none()
+        && m.get("tool_calls")
+            .and_then(Value::as_array)
+            .is_none_or(|calls| calls.is_empty())
+        && m.get("content").is_some_and(Value::is_string)
+}
+
+/// Add a step's assistant message to the turn — or, when the last message is
+/// the turn's own reply that stopped short ([`is_open_reply`]), continue that
+/// one instead: the new text is its continuation (the provider was handed
+/// the cut-off reply as the trailing message), and its tool calls, reasoning
+/// and provenance replace the old. Pushing a second message instead left the
+/// next request ending in two assistant messages, which llama-server refuses
+/// outright ("Cannot have 2 or more assistant messages at the end of the
+/// list") — so a reply cut off twice failed the whole turn.
+fn push_assistant(messages: &mut Vec<Value>, msg: Value) {
+    let Some(prev) = messages.last_mut().filter(|m| is_open_reply(m)) else {
+        messages.push(msg);
+        return;
+    };
+    let (Some(prev_obj), Value::Object(next)) = (prev.as_object_mut(), msg) else {
+        return;
+    };
+    for (key, value) in next {
+        if key == "content" {
+            let tail = value.as_str().unwrap_or_default();
+            if let Some(Value::String(text)) = prev_obj.get_mut("content") {
+                text.push_str(tail);
+            }
+        } else if key == "_reasoning" {
+            let tail = value.as_str().unwrap_or_default().to_string();
+            match prev_obj.get_mut("_reasoning") {
+                Some(Value::String(text)) => text.push_str(&tail),
+                _ => {
+                    prev_obj.insert(key, Value::String(tail));
+                }
+            }
+        } else {
+            prev_obj.insert(key, value);
+        }
+    }
+}
+
 fn build_assistant_message(content: &str, turn_tool_calls: &[ToolCall]) -> Value {
     let mut assistant_msg = json!({
         "role": "assistant",
@@ -1303,6 +1353,67 @@ mod control_message_tests {
         let owned = control_message(String::from("budget exhausted"));
         assert_eq!(owned["role"], "user");
         assert_eq!(owned["content"], "budget exhausted");
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::push_assistant;
+    use serde_json::json;
+
+    /// A reply cut off at the cap is continued in the same message, however
+    /// many times: the request never ends in two assistant messages, which
+    /// llama-server refuses with a 400.
+    #[test]
+    fn a_reply_cut_off_twice_stays_one_message() {
+        let mut messages = vec![json!({"role": "user", "content": "critique this", "id": 7})];
+        push_assistant(&mut messages, json!({"role": "assistant", "content": "Part one, "}));
+        push_assistant(
+            &mut messages,
+            json!({"role": "assistant", "content": "part two, ", "_reasoning": "a"}),
+        );
+        push_assistant(
+            &mut messages,
+            json!({"role": "assistant", "content": "done.", "_reasoning": "b", "_model": "q"}),
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["content"], "Part one, part two, done.");
+        assert_eq!(messages[1]["_reasoning"], "ab");
+        assert_eq!(messages[1]["_model"], "q");
+    }
+
+    /// A continuation that ends in tool calls carries them on the one message.
+    #[test]
+    fn a_continuation_may_end_in_tool_calls() {
+        let mut messages = vec![json!({"role": "user", "content": "go", "id": 1})];
+        push_assistant(&mut messages, json!({"role": "assistant", "content": "Let me "}));
+        let calls = json!([{"id": "c1", "type": "function", "function": {"name": "f"}}]);
+        push_assistant(
+            &mut messages,
+            json!({"role": "assistant", "content": "check.", "tool_calls": calls}),
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["content"], "Let me check.");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "c1");
+    }
+
+    /// Anything else is a new message: after a tool call, after tool results,
+    /// and after an assistant message already saved (a previous turn's).
+    #[test]
+    fn only_the_turns_own_open_reply_is_continued() {
+        let calls = json!([{"id": "c1", "type": "function", "function": {"name": "f"}}]);
+        let mut after_call = vec![json!({"role": "assistant", "content": "", "tool_calls": calls})];
+        push_assistant(&mut after_call, json!({"role": "assistant", "content": "x"}));
+        assert_eq!(after_call.len(), 2);
+
+        let mut after_result = vec![json!({"role": "tool", "content": "r", "tool_call_id": "c1"})];
+        push_assistant(&mut after_result, json!({"role": "assistant", "content": "x"}));
+        assert_eq!(after_result.len(), 2);
+
+        let mut saved = vec![json!({"role": "assistant", "content": "old", "id": 3})];
+        push_assistant(&mut saved, json!({"role": "assistant", "content": "x"}));
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0]["content"], "old");
     }
 }
 
@@ -3983,10 +4094,13 @@ impl AgentLoop {
                     // the assistant message, silently discarding it: the
                     // model would have no memory of having tried, and its
                     // output was gone from history for good.
-                    messages.push(annotate_assistant(
-                        build_assistant_message(&content_buf, &turn_tool_calls),
-                        &timing,
-                    ));
+                    push_assistant(
+                        &mut messages,
+                        annotate_assistant(
+                            build_assistant_message(&content_buf, &turn_tool_calls),
+                            &timing,
+                        ),
+                    );
                     // Those persisted `tool_calls` are never executed here, so
                     // without results the next provider request carried
                     // dangling tool_calls (HTTP 400 on OpenAI-compatible
@@ -4038,10 +4152,13 @@ impl AgentLoop {
                     }
                     // Same fix as above: this path used to `break`/`continue`
                     // without ever appending the assistant message.
-                    messages.push(annotate_assistant(
-                        build_assistant_message(&content_buf, &turn_tool_calls),
-                        &timing,
-                    ));
+                    push_assistant(
+                        &mut messages,
+                        annotate_assistant(
+                            build_assistant_message(&content_buf, &turn_tool_calls),
+                            &timing,
+                        ),
+                    );
                     if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                         tracing::warn!("failed to save messages for session {session_id}: {e}");
                     }
@@ -4122,10 +4239,13 @@ impl AgentLoop {
             // Add assistant message (reached for a non-budget-check turn, or
             // a budget-check turn that approved more steps and still has
             // real tool calls left to execute this same turn).
-            messages.push(annotate_assistant(
-                build_assistant_message(&content_buf, &turn_tool_calls),
-                &timing,
-            ));
+            push_assistant(
+                &mut messages,
+                annotate_assistant(
+                    build_assistant_message(&content_buf, &turn_tool_calls),
+                    &timing,
+                ),
+            );
 
             if turn_tool_calls.is_empty() {
                 if finish_reason.as_deref() == Some("stop")
