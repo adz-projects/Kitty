@@ -45,6 +45,7 @@ import type {
   LocalModel,
   ModelInfo,
   ProviderAccountView,
+  DebateSeat,
   OpenRouterCredits,
   PathInfo,
   StagedAttachment,
@@ -185,7 +186,9 @@ export const ipc = {
     text: string,
     images?: { mime: string; data_url: string }[],
     attachedPaths?: string[],
-    documents?: { label: string; content: string; pinned?: boolean }[]
+    documents?: { label: string; content: string; pinned?: boolean }[],
+    /** `/debate`: the backend adds the moderator brief and arms the panel. */
+    debate?: boolean
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
@@ -193,6 +196,7 @@ export const ipc = {
       images: images ?? null,
       attachedPaths: attachedPaths ?? null,
       documents: documents ?? null,
+      debate: debate ?? null,
     }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   /** Fresh (not client-cached) check of whether `session/prompt` is currently
@@ -423,6 +427,9 @@ export const ipc = {
     invoke<void>('context_menu_choose', { commandId }),
   /** The providers themselves, each with its ranked model list. */
   listProviderAccounts: () => invoke<ProviderAccountView[]>('list_provider_accounts'),
+  getDebatePanel: () => invoke<DebateSeat[]>('get_debate_panel'),
+  /** Saves the panel and syncs its seats to the engine; returns it as saved. */
+  setDebatePanel: (seats: DebateSeat[]) => invoke<DebateSeat[]>('set_debate_panel', { seats }),
   /** Describe and rank a provider form's model list against the catalog. */
   describeProviderModels: (profile: ProviderProfile) =>
     invoke<ModelInfo[]>('describe_provider_models', { profile }),

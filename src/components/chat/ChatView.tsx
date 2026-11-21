@@ -356,7 +356,7 @@ export function ChatView({ headerSlot }: { headerSlot?: HTMLElement | null } = {
         </p>
       )}
       <Composer
-        onSend={(t) => void send(t)}
+        onSend={(t, opts) => void send(t, opts)}
         onStop={() => void cancel()}
         disabled={busy}
         concluded={sessionConcluded}

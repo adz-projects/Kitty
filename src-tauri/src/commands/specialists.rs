@@ -128,3 +128,40 @@ pub async fn seed_subagent_denylist(app: &tauri::AppHandle) {
         crate::lifecycle::engine_restart::schedule(app);
     }
 }
+
+/// The Debate panel: the models a `/debate` may seat personas on
+/// (`config::providers::debate`).
+#[tauri::command]
+pub fn get_debate_panel(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<Vec<crate::config::providers::DebateSeat>, String> {
+    Ok(state
+        .config
+        .lock()
+        .unwrap()
+        .specialists
+        .debate_panel
+        .clone())
+}
+
+/// Replace the Debate panel, then bring the engine's rows in line: each seat
+/// is a provider row of its own, and a removed seat's row goes with it.
+#[tauri::command]
+pub async fn set_debate_panel(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::state::AppState>,
+    seats: Vec<crate::config::providers::DebateSeat>,
+) -> Result<Vec<crate::config::providers::DebateSeat>, String> {
+    let saved = {
+        let mut cfg = state.config.lock().unwrap();
+        let seats = crate::config::providers::debate::normalize_panel(&cfg, seats)?;
+        cfg.specialists.debate_panel = seats.clone();
+        crate::config::save(&cfg).map_err(|e| e.to_string())?;
+        seats
+    };
+    if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
+        tracing::warn!("debate panel saved, but the engine did not take it yet: {e}");
+        return Err("Saved. The engine will pick the panel up once it is running again.".into());
+    }
+    Ok(saved)
+}

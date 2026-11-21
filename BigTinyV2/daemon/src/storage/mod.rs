@@ -1313,6 +1313,7 @@ mod tests {
                 reasoning_cap: None,
                 fan_out: None,
                 max_concurrent: None,
+                host_policy: None,
                 enabled: true,
                 builtin: false,
             },

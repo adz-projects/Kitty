@@ -84,9 +84,16 @@ describe('chatStore send in-flight guard', () => {
     await Promise.all([p1, p2]);
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
-    // ipc.sendPrompt(sessionId, text, images?, attachedPaths?, documents?) —
-    // all undefined here since this test attaches nothing.
-    expect(ipc.sendPrompt).toHaveBeenCalledWith('s1', 'hello', undefined, undefined, undefined);
+    // ipc.sendPrompt(sessionId, text, images?, attachedPaths?, documents?, debate) —
+    // all undefined here since this test attaches nothing, and not a debate.
+    expect(ipc.sendPrompt).toHaveBeenCalledWith(
+      's1',
+      'hello',
+      undefined,
+      undefined,
+      undefined,
+      false
+    );
   });
 
   it('releases the guard so a subsequent turn can send after the first settles', async () => {
@@ -365,5 +372,29 @@ describe('chatStore first-send attachments survive session creation', () => {
 
     const documents = vi.mocked(ipc.sendPrompt).mock.calls[0][4];
     expect(documents).toEqual([{ label: 'doc.txt', content: 'keep me', pinned: true }]);
+  });
+});
+
+describe('chatStore /debate', () => {
+  it('sends a debate turn with the flag and a debate chip on the bubble', async () => {
+    await useChatStore.getState().send('three faculty, three rounds', { debate: true });
+    expect(ipc.sendPrompt).toHaveBeenCalledWith(
+      's1',
+      'three faculty, three rounds',
+      undefined,
+      undefined,
+      undefined,
+      true
+    );
+    const bubble = useChatStore.getState().messages.find((m) => m.role === 'user');
+    expect(bubble?.attachedFiles).toEqual([{ name: 'Debate brief', kind: 'debate' }]);
+  });
+
+  it('sends a bare /debate, which an ordinary empty message would not', async () => {
+    await useChatStore.getState().send('', { debate: true });
+    expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().messages[0].text).toBe('/debate');
+    await useChatStore.getState().send('');
+    expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
   });
 });

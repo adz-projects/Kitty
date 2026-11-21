@@ -263,8 +263,27 @@ fn specialists_disabled(metadata: &Value) -> bool {
 
 /// The tools that start, collect or list delegates.
 fn is_specialist_tool(name: &str) -> bool {
-    use crate::specialists::server::{AWAIT_TOOL, CALL_TOOL, LIST_TOOL};
-    name == CALL_TOOL || name == AWAIT_TOOL || name == LIST_TOOL
+    use crate::specialists::server::{AWAIT_TOOL, CALL_TOOL, DEBATE_ORDER_TOOL, LIST_TOOL};
+    name == CALL_TOOL || name == AWAIT_TOOL || name == LIST_TOOL || name == DEBATE_ORDER_TOOL
+}
+
+/// Withhold `debate_order` from a chat that has never armed a debate.
+///
+/// Keyed on the sticky `debate_used` flag rather than on whether *this* turn
+/// is armed: the tool list may only grow within a chat, so once a chat has
+/// been offered the tool it keeps it, and a later ordinary turn is refused by
+/// the tool itself instead (`prompt_determinism.md`).
+fn withhold_debate_tool(tools: &mut Vec<ToolDefinition>, metadata: &Value) -> usize {
+    let used = metadata
+        .get(crate::routes::chat::DEBATE_USED_KEY)
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    if used {
+        return 0;
+    }
+    let before = tools.len();
+    tools.retain(|t| t.name != crate::specialists::server::DEBATE_ORDER_TOOL);
+    before - tools.len()
 }
 
 /// Withhold the delegate tools from a chat whose user switched specialists
@@ -1866,6 +1885,7 @@ impl AgentLoop {
             );
         }
         self.specialists_off = specialists_disabled(&metadata);
+        withhold_debate_tool(&mut active_tools, &metadata);
         let withheld = withhold_specialist_tools(&mut active_tools, &metadata);
         if withheld > 0 {
             tracing::debug!(session_id, withheld, "specialists are off for this chat");
@@ -2827,6 +2847,17 @@ impl AgentLoop {
             .get("subagent_model_deny")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // A delegate whose host the *caller* chose (a debate seat). It runs
+        // there or not at all: the caller picked that model on purpose, so a
+        // re-resolution or failover onto some other provider would silently
+        // put a different model behind the persona it was given.
+        let host_pinned: Option<String> = metadata
+            .get("host_pinned")
+            .and_then(|v| v.as_bool())
+            .filter(|b| *b)
+            .and_then(|_| metadata.get("provider"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         // When this run will be killed, and the slice of its budget held back
         // so it can stop and write a report first.
@@ -2941,6 +2972,20 @@ impl AgentLoop {
                 return;
             }
         };
+        if let Some(pinned) = host_pinned.as_deref().filter(|p| *p != turn_provider_id) {
+            let msg = format!(
+                "the chosen host '{pinned}' is unavailable right now, so this run did not start;                  choose another"
+            );
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::Error,
+                content: Some(msg.clone()),
+                error_message: Some(msg),
+                session_id: Some(session_id.to_string()),
+                is_last: true,
+                ..Default::default()
+            });
+            return;
+        }
         let mut turn_provider_model = self.model_for(
             &turn_provider_id,
             effective_provider.as_deref(),
@@ -3680,7 +3725,7 @@ impl AgentLoop {
                         // reintroduce the cross-provider switch through the
                         // back door, since the router is free to return a
                         // different id.
-                        if !self.fallback_cfg.enabled {
+                        if !self.fallback_cfg.enabled || host_pinned.is_some() {
                             continue;
                         }
                         if let Ok(next_id) = self.resolve_provider(session_id, None).await {
@@ -6714,6 +6759,30 @@ mod specialists_toggle_tests {
         assert_eq!(withhold_specialist_tools(&mut tools, &off), 3);
         assert_eq!(names(&tools), ["lean_file_read", "lean_web_search"]);
         assert!(specialists_disabled(&off));
+    }
+
+    /// `debate_order` appears only once the chat has armed a debate, and then
+    /// stays (the tool list only grows).
+    #[test]
+    fn the_debate_tool_waits_for_a_chats_first_debate() {
+        let fresh = || vec![tool("call_specialist"), tool("debate_order")];
+        let mut tools = fresh();
+        assert_eq!(withhold_debate_tool(&mut tools, &json!({})), 1);
+        assert_eq!(names(&tools), ["call_specialist"]);
+
+        let mut tools = fresh();
+        assert_eq!(
+            withhold_debate_tool(&mut tools, &json!({"debate_used": true})),
+            0
+        );
+        assert_eq!(tools.len(), 2);
+
+        // Specialists off for the chat outranks it: the debate tool is one of
+        // the specialist tools.
+        let mut tools = fresh();
+        let off = json!({"debate_used": true, "specialists_disabled": true});
+        withhold_debate_tool(&mut tools, &off);
+        assert_eq!(withhold_specialist_tools(&mut tools, &off), 2);
     }
 
     /// Default on: absent, `false`, or anything that is not literally `true`

@@ -36,6 +36,7 @@ pub struct SpecialistRow {
     pub reasoning_cap_fraction: Option<f64>,
     pub enabled: i64,
     pub builtin: i64,
+    pub host_policy: Option<String>,
 }
 
 impl SpecialistRow {
@@ -78,6 +79,7 @@ impl SpecialistRow {
                 (None, None) => None,
             },
             enabled: self.enabled != 0,
+            host_policy: self.host_policy,
             builtin: self.builtin != 0,
         }
     }
@@ -103,7 +105,7 @@ fn cap_fraction(spec: &Specialist) -> Option<f64> {
 
 const COLUMNS: &str = "id, app_id, name, description, system_prompt, provider, model, \
                        tool_allow, response_schema, max_steps, max_concurrent, enabled, builtin, \
-                       reasoning_cap_tokens, reasoning_cap_fraction, fan_out";
+                       reasoning_cap_tokens, reasoning_cap_fraction, fan_out, host_policy";
 
 /// Every specialist visible to `app_id`: its own, plus the built-ins it has not
 /// shadowed.
@@ -173,8 +175,8 @@ pub async fn upsert(pool: &SqlitePool, spec: &Specialist) -> Result<(), StorageE
         "INSERT INTO specialists \
            (id, app_id, name, description, system_prompt, provider, model, tool_allow, \
             response_schema, max_steps, max_concurrent, enabled, builtin, \
-            reasoning_cap_tokens, reasoning_cap_fraction, fan_out, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) \
+            reasoning_cap_tokens, reasoning_cap_fraction, fan_out, host_policy, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) \
          ON CONFLICT(COALESCE(app_id, ''), name) DO UPDATE SET \
            description = excluded.description, \
            system_prompt = excluded.system_prompt, \
@@ -187,6 +189,7 @@ pub async fn upsert(pool: &SqlitePool, spec: &Specialist) -> Result<(), StorageE
            reasoning_cap_tokens = excluded.reasoning_cap_tokens, \
            reasoning_cap_fraction = excluded.reasoning_cap_fraction, \
            fan_out = excluded.fan_out, \
+           host_policy = excluded.host_policy, \
            enabled = excluded.enabled, \
            updated_at = datetime('now')",
     )
@@ -206,6 +209,7 @@ pub async fn upsert(pool: &SqlitePool, spec: &Specialist) -> Result<(), StorageE
     .bind(cap_tokens(spec))
     .bind(cap_fraction(spec))
     .bind(&spec.fan_out)
+    .bind(&spec.host_policy)
     .execute(pool)
     .await?;
     Ok(())

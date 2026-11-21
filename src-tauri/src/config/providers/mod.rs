@@ -13,6 +13,7 @@
 //! plaintext (CLAUDE.md rule 4).
 
 mod connection;
+pub mod debate;
 pub mod endpoint;
 mod keyring;
 mod network;
@@ -27,6 +28,7 @@ pub use keyring::{
 #[cfg(desktop)]
 pub use keyring::V1_ENCRYPTION_KEY_ACCOUNT;
 pub use network::{is_hosted_endpoint, network_tier_for, NetworkTier};
+pub use debate::DebateSeat;
 pub use setups::{migrate_to_setups, repoint_setups, Setup};
 
 use std::collections::BTreeMap;

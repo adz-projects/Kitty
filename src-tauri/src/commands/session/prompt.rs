@@ -35,10 +35,27 @@ pub async fn send_prompt(
     images: Option<Vec<ImageAttachment>>,
     attached_paths: Option<Vec<String>>,
     documents: Option<Vec<crate::bigtiny::turn_text::InlineDocument>>,
+    debate: Option<bool>,
 ) -> Result<(), String> {
+    // `/debate`: a moderator brief rides as the turn's last document, and the
+    // panel it names is armed in the engine for this turn only.
+    let mut documents = documents.unwrap_or_default();
+    let debate_panel = if debate.unwrap_or(false) {
+        let turn = crate::bigtiny::debate::prepare(
+            &app,
+            &session_id,
+            &documents,
+            attached_paths.as_deref().unwrap_or_default(),
+        )
+        .await;
+        documents.push(turn.brief);
+        turn.panel
+    } else {
+        None
+    };
     let text = crate::bigtiny::turn_text::compose(
         &text,
-        documents.as_deref().unwrap_or_default(),
+        &documents,
         attached_paths.as_deref().unwrap_or_default(),
     );
     // First turn of this chat: confirm its reasoning effort against the
@@ -65,7 +82,8 @@ pub async fn send_prompt(
             crate::bigtiny::vision::confirm_model_vision(&app, &session_id),
         );
     }
-    crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths).await
+    crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths, debate_panel)
+        .await
 }
 
 /// "Regenerate" on the chat's latest answer: ask its last question again, in

@@ -539,6 +539,19 @@ export interface SpecialistSettings {
   seeded: boolean;
   timeout_secs: number;
   max_concurrent: number;
+  /** The models a `/debate` may seat personas on; empty uses the setups. */
+  debate_panel: DebateSeat[];
+  /** Kitty switched off its copies of `extractor` and `analyst` once. */
+  builtins_retired: boolean;
+}
+
+/** One Debate panel seat. Mirrors `config::providers::DebateSeat`; a new seat
+    is sent with an empty `id` and comes back with one. */
+export interface DebateSeat {
+  id: string;
+  name: string;
+  provider_id: string;
+  model: string;
 }
 
 /** One recorded delegate run. Routing depends entirely on each specialist's
@@ -962,7 +975,7 @@ export interface TextDeltaEvent {
 /** `chat://user-message`: a (replayed) user turn, as typed, with the chips of
     what it carried. */
 export interface UserMessageEvent extends TextDeltaEvent {
-  attachments?: { name: string; kind: 'file' | 'document' | 'image' }[];
+  attachments?: { name: string; kind: 'file' | 'document' | 'image' | 'debate' }[];
 }
 
 export interface ToolCallEvent {

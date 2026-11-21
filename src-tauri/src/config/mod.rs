@@ -895,6 +895,15 @@ pub struct SpecialistSettings {
     /// How many delegates may run at once.
     #[serde(default = "default_max_concurrent_specialists")]
     pub max_concurrent: u32,
+    /// The models a `/debate` may seat its personas on
+    /// (`config::providers::debate`). Empty: the setups are used instead.
+    #[serde(default)]
+    pub debate_panel: Vec<crate::config::providers::DebateSeat>,
+    /// Kitty switched off its own copies of the `extractor` and `analyst`
+    /// built-ins once. Kept so a user who switches one back on in Settings is
+    /// not overruled at the next start.
+    #[serde(default)]
+    pub builtins_retired: bool,
 }
 
 impl Default for SpecialistSettings {
@@ -905,6 +914,8 @@ impl Default for SpecialistSettings {
             seeded: false,
             timeout_secs: default_specialist_timeout_secs(),
             max_concurrent: default_max_concurrent_specialists(),
+            debate_panel: Vec::new(),
+            builtins_retired: false,
         }
     }
 }

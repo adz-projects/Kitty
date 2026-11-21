@@ -55,11 +55,34 @@ pub const LIST_TOOL: &str = "list_specialists";
 /// agent loop uses for the collection it performs itself when a model tries to
 /// answer with tickets outstanding, so both read the same in a transcript.
 pub const AWAIT_TOOL: &str = "await_specialists";
+/// Random speaking orders for a debate. Offered only to a chat that has armed
+/// a debate at least once (`debate_used`), and refused outside an armed turn.
+pub const DEBATE_ORDER_TOOL: &str = "debate_order";
+
+/// Most rounds `debate_order` will deal, as a guard against a model passing an
+/// absurd count; a real debate is a handful.
+const MAX_DEBATE_ROUNDS: usize = 20;
+/// Most debaters it will order.
+const MAX_DEBATERS: usize = 12;
+
+/// A fresh, independent random order of `personas` for each of rounds
+/// `2..=rounds`. Round 1 has no order: everyone speaks at once.
+pub fn debate_orders(personas: &[String], rounds: usize) -> Vec<Vec<String>> {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+    (2..=rounds)
+        .map(|_| {
+            let mut order = personas.to_vec();
+            order.shuffle(&mut rng);
+            order
+        })
+        .collect()
+}
 
 /// Tool names owned by this server that need the calling session injected.
 /// All of them do: none can be answered without knowing which session (and so
 /// which app, and which turn's tickets) is asking.
-pub const SESSION_SCOPED_TOOLS: [&str; 3] = [CALL_TOOL, LIST_TOOL, AWAIT_TOOL];
+pub const SESSION_SCOPED_TOOLS: [&str; 4] = [CALL_TOOL, LIST_TOOL, AWAIT_TOOL, DEBATE_ORDER_TOOL];
 
 /// Absolute ceiling on refs one call may fan out over.
 ///
@@ -88,6 +111,22 @@ pub struct CallRequest {
     /// Document ids, file paths, or URLs the specialist should work from.
     #[serde(default)]
     pub refs: Option<Vec<String>>,
+    /// Only for a specialist you were told to give a host (a debate): the
+    /// host id to run it on, from the panel you were given. Omit otherwise.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Host-injected, never model-supplied.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebateOrderRequest {
+    /// Every debater's persona name.
+    pub personas: Vec<String>,
+    /// How many rounds the debate has in total, round 1 included.
+    pub rounds: usize,
     /// Host-injected, never model-supplied.
     #[serde(default)]
     #[schemars(skip)]
@@ -195,9 +234,8 @@ before your answer counts.
 
 Specialists: `researcher` (a question needing web sources; findings with citations), \
 `summarizer` (long documents; notes and anchors; one run per ref), `locator` (where something \
-is across files; paths only), `extractor` (named fields from many documents; one run per ref), \
-`analyst` (figures from spreadsheets, with the method). `list_specialists` shows any others. \
-More refs than the limit is refused outright."
+is across files; paths only). `list_specialists` shows the others. More refs than the limit is \
+refused outright. Pass `host` only when you were told to choose one."
     )]
     pub async fn call_specialist(&self, Parameters(req): Parameters<CallRequest>) -> String {
         let Some(app_id) = self.app_for(req.session_id.as_deref()).await else {
@@ -229,6 +267,42 @@ More refs than the limit is refused outright."
                 .to_string();
             }
             Err(e) => return Self::refuse(format!("could not look up '{name}': {e}")),
+        };
+
+        // A specialist whose host the caller names runs only inside a turn the
+        // app armed with a panel, and only on a host from that panel. Outside
+        // one it is refused outright: the panel is what opted those hosts in,
+        // and without it there is nothing to choose from.
+        let host = req.host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+        let forced_host: Option<String> = if spec.caller_hosted() {
+            let Some(panel) = self.orchestrator.debate_panel(&parent_session_id) else {
+                return Self::refuse(format!(
+                    "'{name}' runs only in a debate the user started with /debate; \
+                     write the debate yourself instead, voicing every persona"
+                ));
+            };
+            let Some(host) = host else {
+                return json!({
+                    "ok": false,
+                    "error": format!("'{name}' needs a `host` from the debate panel"),
+                    "panel": panel,
+                })
+                .to_string();
+            };
+            if !panel.iter().any(|p| p == host) {
+                return json!({
+                    "ok": false,
+                    "error": format!("'{host}' is not on this debate's panel"),
+                    "panel": panel,
+                })
+                .to_string();
+            }
+            Some(host.to_string())
+        } else {
+            // Ignored rather than refused: a host only means something to a
+            // caller-hosted specialist, and failing an otherwise good call
+            // over a stray argument would cost a step for nothing.
+            None
         };
 
         // Refs are appended to the request rather than templated into it: the
@@ -276,8 +350,15 @@ More refs than the limit is refused outright."
             parent_session_id,
             prompt,
             system_prompt: Some(spec.system_prompt.clone()),
-            provider: spec.provider.clone(),
-            model: spec.model.clone(),
+            provider: forced_host.clone().or_else(|| spec.provider.clone()),
+            // A chosen host serves its own configured model: a model pinned
+            // in the definition was chosen for some other provider.
+            model: if forced_host.is_some() {
+                None
+            } else {
+                spec.model.clone()
+            },
+            force_host: forced_host.is_some(),
             // The spawn tools are stripped rather than trusted to be absent: a
             // user-defined specialist could list them, and `Orchestrator`'s
             // depth check would then refuse mid-run instead of the definition
@@ -358,17 +439,68 @@ names fits."
         let Some(app_id) = self.app_for(req.session_id.as_deref()).await else {
             return Self::refuse("this session cannot call specialists");
         };
+        // A caller-hosted specialist is listed only while a debate is armed:
+        // anywhere else it would be refused, so listing it only invites a
+        // wasted call.
+        let armed = req
+            .session_id
+            .as_deref()
+            .is_some_and(|s| self.orchestrator.debate_panel(s).is_some());
         match store::list_visible(&self.pool, &app_id).await {
             Ok(list) => {
                 let entries: Vec<_> = list
                     .into_iter()
-                    .filter(|s| s.enabled)
+                    .filter(|s| s.enabled && (armed || !s.caller_hosted()))
                     .map(|s| json!({"name": s.name, "description": s.description}))
                     .collect();
                 json!({"ok": true, "specialists": entries}).to_string()
             }
             Err(e) => Self::refuse(format!("could not list specialists: {e}")),
         }
+    }
+
+    #[tool(
+        name = "debate_order",
+        description = "Only in a debate the user started with /debate. Call once, after round 1, \
+with every persona's name and the total number of rounds. Returns the speaking order for each \
+round from round 2 on; follow it exactly, one speaker at a time."
+    )]
+    pub async fn debate_order(&self, Parameters(req): Parameters<DebateOrderRequest>) -> String {
+        let Some(session_id) = req.session_id.as_deref().filter(|s| !s.is_empty()) else {
+            return Self::refuse("this session cannot run a debate");
+        };
+        if self.orchestrator.debate_panel(session_id).is_none() {
+            return Self::refuse(
+                "there is no debate running; only a turn started with /debate has one",
+            );
+        }
+        let mut personas: Vec<String> = Vec::new();
+        for p in req
+            .personas
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+        {
+            if !personas.iter().any(|q| q == p) {
+                personas.push(p.to_string());
+            }
+        }
+        if personas.len() < 2 || personas.len() > MAX_DEBATERS {
+            return Self::refuse(format!(
+                "a debate needs between 2 and {MAX_DEBATERS} distinct personas"
+            ));
+        }
+        if req.rounds < 2 || req.rounds > MAX_DEBATE_ROUNDS {
+            return Self::refuse(format!(
+                "`rounds` must be between 2 and {MAX_DEBATE_ROUNDS} (round 1 included)"
+            ));
+        }
+        let orders: Vec<_> = debate_orders(&personas, req.rounds)
+            .into_iter()
+            .enumerate()
+            .map(|(i, order)| json!({"round": i + 2, "order": order}))
+            .collect();
+        json!({"ok": true, "orders": orders}).to_string()
     }
 }
 

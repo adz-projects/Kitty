@@ -62,7 +62,7 @@ Never a silently wrong-shaped call.
 | `DELETE /api/chat/{id}` | 404 if it matched nothing; also forgets what the memory engines kept for that chat alone (2.5.0) |
 | `PATCH /api/chat/{id}/config` | shallow-merges metadata; see "Reasoning effort" below |
 | `GET /api/chat/{id}/history` | bare array; `?tool_call_id=` returns only that call's result row (2.5.0) |
-| `POST /api/chat/{id}/send` | SSE stream, below |
+| `POST /api/chat/{id}/send` | `{message, images?, debate?}`; SSE stream, below. `debate: {panel: [provider ids]}` arms a debate for this turn (2.7.0, see "Debates") |
 | `GET /api/chat/{id}/stream` | rejoin a turn in progress |
 | `POST /api/chat/{id}/fork` | the fork belongs to the forking app |
 | `POST /api/chat/{id}/cancel`, `/compact`, `/approve` | `/compact` with nothing folded answers `{compacted: false, reason, skip}`; `skip` is `disabled`, `lock_held`, `nothing_to_fold`, `below_threshold`, `summarizer_failed` or `storage_failed` (2.5.0) |
@@ -219,7 +219,7 @@ the result.
 | Route | Notes |
 |---|---|
 | `GET /api/specialists` | your own, plus the built-ins you have not shadowed |
-| `POST /api/specialists` | `{name, description, system_prompt, provider?, model?, tool_allow?, response_schema?, max_steps?, enabled?}` to `{id}`; also the edit path |
+| `POST /api/specialists` | `{name, description, system_prompt, provider?, model?, tool_allow?, response_schema?, max_steps?, host_policy?, enabled?}` to `{id}`; also the edit path |
 | `DELETE /api/specialists/{id}` | your own only; **403** on a built-in |
 | `POST /api/specialists/{name}/run` | `{request, refs?, session_id}` to `{ok, ran_on, notes, result}` — runs to completion |
 | `GET /api/specialists/runs` | the last 100 delegate runs, for diagnosing what routed where |
@@ -319,6 +319,28 @@ Refs are capped at 32, and the whole batch shares one deadline of three times
 children against three permits is eleven waves of it with the parent's tool call
 blocked throughout. A source the batch did not reach is reported as such, so a
 caller can re-run just the ones that are missing.
+
+**Debates** (2.7.0). A specialist with `host_policy: "caller"` has its host
+named by the calling model, per call, in `call_specialist`'s `host` argument,
+and runs only in a turn the app armed by sending `debate: {panel: [...]}` with
+`POST /send`. The panel is the app's opt-in for that turn alone:
+
+- A call outside an armed turn is refused, telling the model to voice the
+  debate itself. A missing `host` is answered with the panel; a host not on it
+  is refused.
+- A chosen host skips the subagent role (`never` included) and
+  `agent.subagent_model_deny`, but not health, tool support or the minimum
+  context. It serves its own configured model, thinks at its own default rather
+  than `delegate_effort`, and never fails over: the delegate's metadata carries
+  `host_pinned: true`, and a pinned host that is unavailable at step 0 ends the
+  run with an error rather than moving it.
+- The panel is dropped when the turn ends, however it ends.
+- `debate_order({personas, rounds})` returns a fresh random speaking order for
+  each round from round 2 on; it is refused outside an armed turn.
+- The first armed turn sets the session's `debate_used: true`. Until then the
+  session is not offered `debate_order`; from then on it always is, because the
+  tool list only grows. `list_specialists` shows a caller-hosted specialist only
+  while a debate is armed.
 
 Progress reaches a watching client as `subagent_status` frames carrying the
 *child's* session id, so its full transcript stays readable through

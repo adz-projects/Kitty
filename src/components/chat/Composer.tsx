@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { hasSomethingToSend, useChatStore } from '@/stores/chatStore';
+import { parseDebateCommand } from '@/stores/chat/messageUtils';
 import { pastedFileKind, readAsDataUrl } from '@/lib/pasteFiles';
 import { ipc, pickFiles } from '@/lib/ipc';
 import { UploadIcon } from '@/components/icons/UploadIcon';
@@ -17,7 +18,9 @@ const DEFAULT_PLACEHOLDER = 'Ask Kitty…';
 /** Message composer: Enter sends, Shift+Enter inserts a newline. While a reply
     streams, sending is blocked and a Stop button cancels the turn. In chat-only
     mode, large pastes collapse into an inlined document attachment. Typing
-    `/compact` is the one slash command left — a local action, not a message.
+    `/compact` compacts the chat (a local action, not a message); a message
+    starting `/debate` is sent as a debate between personas on several models
+    (`bigtiny::debate`).
     The recipe dropdown that used to live here went with the recipes feature:
     delegation is chosen by the model from an ordinary request now (see
     `bigtiny::specialists`), so there is no invocation syntax for the user to
@@ -36,7 +39,7 @@ export function Composer({
   sendBlocked,
   spectating,
 }: {
-  onSend: (text: string) => void;
+  onSend: (text: string, opts?: { debate?: boolean }) => void;
   onStop: () => void;
   disabled: boolean;
   concluded?: boolean;
@@ -109,7 +112,6 @@ ${prefill}`
     );
     useChatStore.getState().setComposerPrefill(null);
     scheduleResize();
-     
   }, [prefill]);
 
   // Cancel any pending resize frame on unmount.
@@ -122,8 +124,15 @@ ${prefill}`
 
   const submit = () => {
     const value = text.trim();
-    if (!hasSomethingToSend(value, useChatStore.getState())) return;
+    const debate = parseDebateCommand(value);
+    if (debate === null && !hasSomethingToSend(value, useChatStore.getState())) return;
     if (disabled || readOnly || sendBlocked) return;
+    if (debate !== null) {
+      onSend(debate, { debate: true });
+      setText('');
+      resetTextareaHeight();
+      return;
+    }
     // Manual context compaction — a local command, not a message to the
     // model. Exact-slug match only: a word-boundary check would still let a
     // user message like "/compactify the plan" trigger compaction and be
@@ -188,8 +197,16 @@ ${prefill}`
     }
   };
 
+  const debating = parseDebateCommand(text) !== null;
+
   return (
     <div className="composer">
+      {debating && (
+        <div className="composer-hint" role="status">
+          Debate: say who the personas are, how many rounds, and what the debate should examine.
+          Attach or link the item under debate. The panel is set in Settings → Specialists.
+        </div>
+      )}
       <button
         className="composer-attach"
         onClick={() => void attachFiles()}

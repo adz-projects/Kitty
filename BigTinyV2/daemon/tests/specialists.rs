@@ -390,6 +390,7 @@ async fn a_delegate_cannot_start_another_delegate() {
         max_steps: 5,
         reasoning_cap: None,
         max_concurrent: None,
+        force_host: false,
     };
     match orchestrator.run(run).await {
         Err(SpawnRefusal::TooDeep) => {}
@@ -444,6 +445,7 @@ async fn a_delegate_inherits_the_parents_filesystem_grants() {
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: None,
+            force_host: false,
         })
         .await;
 
@@ -494,6 +496,7 @@ async fn a_delegate_of_an_unowned_session_is_refused() {
         max_steps: 5,
         reasoning_cap: None,
         max_concurrent: None,
+        force_host: false,
     };
     assert!(matches!(
         orchestrator.run(run).await,
@@ -547,6 +550,7 @@ async fn a_denylisted_model_is_refused_rather_than_run_as_the_fallback() {
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: None,
+            force_host: false,
         })
         .await
     {
@@ -616,6 +620,7 @@ async fn a_delegate_that_runs_too_long_is_stopped() {
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: None,
+            force_host: false,
         }),
     )
     .await
@@ -674,6 +679,7 @@ async fn concurrent_delegates_are_capped() {
                     max_steps: 5,
                     reasoning_cap: None,
                     max_concurrent: None,
+                    force_host: false,
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -729,6 +735,7 @@ async fn a_fan_out_runs_one_delegate_per_ref_and_survives_partial_failure() {
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: None,
+            force_host: false,
         })
         .collect();
 
@@ -1241,6 +1248,7 @@ async fn run_until_timeout(
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: None,
+            force_host: false,
         }),
     )
     .await
@@ -1372,6 +1380,7 @@ async fn a_runs_history_records_its_host() {
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: Some(1),
+            force_host: false,
         })
         .await;
 

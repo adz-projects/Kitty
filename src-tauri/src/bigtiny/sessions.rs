@@ -722,12 +722,16 @@ pub async fn regenerate_last(app: &AppHandle, session_id: &str) -> Result<(), St
         .strip_suffix(crate::bigtiny::turn_text::REGENERATE_NOTE)
         .unwrap_or(&text);
     let images = stored_images(question);
+    // A `/debate` turn asked again is a debate again, on today's panel.
+    let debate_panel =
+        crate::bigtiny::debate::panel_for_regenerate(app, session_id, original).await;
     crate::bigtiny::stream::send_prompt(
         app.clone(),
         session_id.to_string(),
         format!("{original}{}", crate::bigtiny::turn_text::REGENERATE_NOTE),
         (!images.is_empty()).then_some(images),
         None,
+        debate_panel,
     )
     .await
 }

@@ -941,7 +941,23 @@ pub struct SendMessageRequest {
     pub message: String,
     #[serde(default)]
     pub images: Option<Vec<Value>>,
+    /// Arms a debate for this turn only: the provider ids the model may name
+    /// as the host of a specialist whose `host_policy` is `"caller"`.
+    #[serde(default)]
+    pub debate: Option<DebateArm>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct DebateArm {
+    #[serde(default)]
+    pub panel: Vec<String>,
+}
+
+/// Session metadata key set the first time a chat arms a debate. From then on
+/// the chat is offered `debate_order` and sees caller-hosted specialists in
+/// `list_specialists`. Never cleared: the tool list may only grow, or the
+/// prompt cache is lost (`prompt_determinism.md`).
+pub const DEBATE_USED_KEY: &str = "debate_used";
 
 /// Move a turn's events from its (unbounded) channel to the client's
 /// (bounded) queue, recording each for replay.
@@ -1055,6 +1071,25 @@ pub async fn send_message(
         return resp;
     };
 
+    // Armed before the turn starts, so the turn's first read of its metadata
+    // already sees `debate_used` and offers the debate tool on step 0.
+    let debate_guard = match body.debate.map(|d| d.panel).filter(|p| !p.is_empty()) {
+        Some(panel) => {
+            if let Err(e) = sessions::update_metadata_with(&state.db, &id, |mut m| {
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert(DEBATE_USED_KEY.into(), Value::Bool(true));
+                }
+                m
+            })
+            .await
+            {
+                return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+            Some(state.orchestrator.arm_debate(&id, panel))
+        }
+        None => None,
+    };
+
     let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();
     let replay = state.replay.clone();
     let replay_session = id.clone();
@@ -1086,7 +1121,13 @@ pub async fn send_message(
     // correctness — and a client that has stopped reading entirely closes
     // the channel, which the turn already treats as a cancel.
     let (client_tx, client_rx) = mpsc::channel::<(Option<u64>, SSEEvent)>(SSE_CLIENT_QUEUE);
-    tokio::spawn(forward_to_client(rx, client_tx, replay, replay_session));
+    // The forwarder runs until the turn drops its sender, which is when the
+    // turn has ended (including collecting every specialist report), so it is
+    // what holds the debate panel.
+    tokio::spawn(async move {
+        forward_to_client(rx, client_tx, replay, replay_session).await;
+        drop(debate_guard);
+    });
 
     // A keepalive comment every `KEEPALIVE_INTERVAL` while the turn is quiet
     // -- most importantly while it waits on an approval, which can take far

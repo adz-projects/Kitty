@@ -1,11 +1,17 @@
 import type { Message } from '@/stores/chatStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 import { ImageIcon } from '@/components/icons/ImageIcon';
+import { SparkIcon } from '@/components/icons/SparkIcon';
 
-const ICON: Record<'file' | 'document' | 'image', typeof DocumentIcon> = {
+const ICON: Record<
+  'file' | 'document' | 'image' | 'debate',
+  (props: { size?: number }) => JSX.Element
+> = {
   file: DocumentIcon,
   document: DocumentIcon,
   image: ImageIcon,
+  // The moderator brief a `/debate` turn carries (`bigtiny::debate`).
+  debate: SparkIcon,
 };
 
 /** Read-only chips showing what was attached to a sent user turn (Round-7 fix)

@@ -712,6 +712,11 @@ pub async fn self_heal_builtin_servers(app: &AppHandle) {
             for (server, e) in report.failed {
                 tracing::warn!("bundled MCP server {server} did not sync: {e}");
             }
+            // After the servers, because the engine checks a specialist's
+            // tools against the connected ones.
+            if let Ok(client) = ensure_client(app) {
+                crate::bigtiny::kitty_specialists::ensure(app, &client).await;
+            }
         }
         Err(e) => tracing::debug!("builtin MCP sync skipped: {e}"),
     }

@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "bigtiny2_daemon"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "adaptive-pathway",
  "aes-gcm",

@@ -300,6 +300,7 @@ pub async fn send_prompt(
     text: String,
     images: Option<Vec<ImageAttachment>>,
     attached_paths: Option<Vec<String>>,
+    debate_panel: Option<Vec<String>>,
 ) -> Result<(), String> {
     let client = ensure_client(&app)?;
     // Claimed before anything else, and answered to the calling window only:
@@ -362,11 +363,15 @@ pub async fn send_prompt(
             json!({ "data": data, "mime_type": img.mime })
         })
         .collect();
-    let body = if image_blocks.is_empty() {
+    let mut body = if image_blocks.is_empty() {
         json!({ "message": text })
     } else {
         json!({ "message": text, "images": image_blocks })
     };
+    // Arms a debate for this turn only (`/debate`, engine 2.7.0).
+    if let Some(panel) = debate_panel.filter(|p| !p.is_empty()) {
+        body["debate"] = json!({ "panel": panel });
+    }
 
     // Keep the process foreground for the whole turn on Android; moved into
     // the task below and dropped at its end. No-op on desktop.

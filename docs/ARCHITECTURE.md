@@ -58,6 +58,10 @@ lib.rs (app setup, window creation, generate_handler! list;
   │                     running elsewhere), notices, tool results
   │     turn_text.rs   how a user turn is laid out (documents, file list) and
   │                     parsed back for replay
+  │     debate.rs      `/debate`: the moderator brief and the panel armed for
+  │                     the turn (pasted items saved to <chat>/debate/)
+  │     kitty_specialists.rs  the `debater` specialist, and extractor/analyst
+  │                     switched off for Kitty (once, after each MCP self-heal)
   │     providers.rs   sync every setup's card into the engine (one row each)
   │     specialists.rs, mcp.rs (bundled servers self-heal), pathway.rs,
   │     memorabilia.rs, effort/ (ladder, detect), vision.rs, context_window.rs
@@ -68,7 +72,9 @@ lib.rs (app setup, window creation, generate_handler! list;
   │     providers/     providers (a service, its key, its checked models),
   │                     setups.rs (a checked model with its own name,
   │                     thinking level, context length and prompt; its card
-  │                     is `Config::card`), the card → provider → setup
+  │                     is `Config::card`), debate.rs (the Debate panel's
+  │                     seats, each synced as a provider row of its own),
+  │                     the card → provider → setup
   │                     migrations, network tier, secrets, endpoint scheme
   │                     probing, connection test
   │

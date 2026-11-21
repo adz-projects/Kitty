@@ -95,6 +95,7 @@ async fn run_delegate(orchestrator: &Orchestrator) -> Result<DelegateOutcome, St
             max_steps: 5,
             reasoning_cap: None,
             max_concurrent: None,
+            force_host: false,
         })
         .await
     {

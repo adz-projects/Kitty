@@ -214,6 +214,15 @@ engine-managed) and why mixing them is a bug.
   OpenRouter provider is synced). Delegates run in the background: the model
   collects reports with `await_specialists`, and a turn cannot end until every
   ticket is collected (`docs/VERSIONS.md`, 0.10.7). Desktop only.
+  Kitty switches off the `extractor` and `analyst` built-ins for itself and
+  defines a `debater` (`bigtiny/kitty_specialists.rs`). A message starting
+  `/debate` (`bigtiny/debate.rs`) makes the chat's model a moderator: Kitty
+  adds a brief to the turn and arms a panel of hosts for that turn alone —
+  Settings → Specialists → Debate panel, any model a provider lists, else the
+  setups — and the moderator seats each persona on one, skipping the
+  specialist tag and the denylist. Round 1 runs in parallel, later rounds one
+  speaker at a time in a random order (`debate_order`). With one model, or
+  without `/debate`, the chat's model voices every persona itself.
 - **Scheduled tasks** (`commands/scheduled_tasks.rs` over `/api/schedules`,
   `components/settings/ScheduledTasks.tsx`) — instructions the engine runs
   later, once or on an interval, on a chosen provider card with its system

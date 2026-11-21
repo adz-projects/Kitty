@@ -71,9 +71,11 @@ async fn sync_providers(app: &AppHandle, only: Option<&str>) -> Result<(), Strin
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         // One engine row per checked model (its card).
+        // Plus a row per Debate panel seat, so a debater can be pinned to it.
         let profiles = cfg
             .cards()
             .into_iter()
+            .chain(cfg.seat_cards())
             .filter(|p| p.is_usable())
             .filter(|p| only.map_or(true, |id| p.id == id))
             .collect::<Vec<_>>();
@@ -141,6 +143,10 @@ pub(crate) struct ProviderCard {
     pub base_url: String,
     pub config: Value,
     pub api_key: Option<String>,
+    /// Lower is tried first when the engine fails a chat over. A debate seat
+    /// sorts last, so ordinary routing reaches one only when nothing else is
+    /// left.
+    pub fallback_priority: i32,
 }
 
 /// Map a profile onto the daemon's provider row. Every optional setting is
@@ -212,6 +218,11 @@ pub(crate) fn provider_body(
         base_url,
         config,
         api_key,
+        fallback_priority: if crate::config::providers::debate::is_seat_id(&profile.id) {
+            crate::config::providers::debate::SEAT_FALLBACK_PRIORITY
+        } else {
+            1
+        },
     }
 }
 
@@ -273,7 +284,7 @@ async fn upsert_rows(
                     "name": card.name,
                     "base_url": card.base_url,
                     "config": card.config,
-                    "fallback_priority": 1,
+                    "fallback_priority": card.fallback_priority,
                     // Explicit `null`, not an omitted field, when there's no
                     // key: the daemon reads an omitted `api_key` as "leave the
                     // stored one alone", so a key removed here would otherwise
@@ -306,7 +317,7 @@ async fn create_row(
         "name": card.name,
         "provider_type": card.provider_type,
         "base_url": card.base_url,
-        "fallback_priority": 1,
+        "fallback_priority": card.fallback_priority,
         "config": card.config,
     });
     if let Some(key) = &card.api_key {

@@ -3,6 +3,7 @@ import { ipc } from '@/lib/ipc';
 import type { ProviderView, Specialist, SpecialistRun } from '@/lib/types';
 import { setupTitle } from '@/components/settings/setups/setupUtils';
 import { DelegateRunRow } from './DelegateRunRow';
+import { DebatePanel } from './DebatePanel';
 import { Modal } from '@/components/shared/Modal';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
@@ -328,6 +329,8 @@ export function Specialists() {
       <button className="primary" onClick={openNew}>
         + New specialist
       </button>
+
+      <DebatePanel />
 
       <h2>Never use as a subagent</h2>
       <p className="muted">

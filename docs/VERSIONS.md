@@ -106,6 +106,16 @@ Daemon **2.6.1** (Kitty 1.0.12): the builtin `researcher` specialist's
 `tool_allow` gains `lean_web_find_document`. No route changed; API version
 stays 2.
 
+Added in daemon **2.7.0** (`/debate`). All additive; API version stays 2:
+
+| Surface | Used for |
+|---|---|
+| `POST /api/chat/{id}/send` `debate: {panel: [provider ids]}` arms a panel for that turn only | A `/debate` turn (`bigtiny/debate.rs`); the panel is the Debate panel's seats, else the setups |
+| specialist `host_policy: "caller"` + `call_specialist`'s `host` argument | The `debater`, seated by the moderator on a panel host; refused outside an armed turn or off the panel |
+| a chosen host skips the subagent role and `subagent_model_deny`, keeps the health, tool and context gates, runs at its own default effort, never fails over (`host_pinned`) | Debate seats are picked for capability, which the denylist exists to steer delegates away from |
+| `debate_order({personas, rounds})`; session metadata `debate_used` (sticky) offers it | A random speaking order per round from round 2; the tool list only grows (`prompt_determinism.md`) |
+| `call_specialist`'s description no longer names `extractor` / `analyst` | Kitty retires both with disabled app copies (`bigtiny/kitty_specialists.rs`); other apps still have them |
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it

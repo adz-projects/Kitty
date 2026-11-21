@@ -7,6 +7,16 @@ import type { Artifact, Message, ToolCall } from './types';
 
 /** Whether the composer has anything to send: typed text or any attachment
     (#26 — a screenshot or file on its own is a complete message). Pure. */
+/** The instructions after a leading `/debate` command, or `null` when the
+    text is not one. `/debate` alone yields `''` (the item and instructions
+    may come entirely from attachments). Matched as a whole word, so
+    "/debates" or "/debate-club" stay ordinary messages. */
+export function parseDebateCommand(text: string): string | null {
+  const m = /^\/debate(?:\s+([\s\S]*))?$/.exec(text.trim());
+  if (!m) return null;
+  return (m[1] ?? '').trim();
+}
+
 export function hasSomethingToSend(
   text: string,
   s: { droppedFiles: unknown[]; attachments: unknown[]; pendingImages: unknown[] }

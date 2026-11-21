@@ -52,6 +52,10 @@ pub struct Specialist {
     /// daemon's global limit only.
     #[serde(default)]
     pub max_concurrent: Option<i64>,
+    /// `"caller"`: the calling model names the host per call, from a debate's
+    /// panel (the `debater`). Absent: the engine chooses.
+    #[serde(default)]
+    pub host_policy: Option<String>,
     #[serde(default)]
     pub enabled: bool,
     /// Seeded by the daemon and shared by every app. Editable only by defining
@@ -108,8 +112,33 @@ pub struct SpecialistSpec {
     pub fan_out: Option<String>,
     #[serde(default)]
     pub max_concurrent: Option<i64>,
+    #[serde(default)]
+    pub host_policy: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+impl From<&Specialist> for SpecialistSpec {
+    /// The definition as it stands, ready to write back — how Kitty saves its
+    /// own copy of a built-in.
+    fn from(s: &Specialist) -> Self {
+        Self {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            system_prompt: s.system_prompt.clone(),
+            provider: s.provider.clone(),
+            model: s.model.clone(),
+            tool_allow: s.tool_allow.clone(),
+            response_schema: s.response_schema.clone(),
+            max_steps: Some(s.max_steps).filter(|n| *n > 0),
+            reasoning_cap_tokens: s.reasoning_cap_tokens,
+            reasoning_cap_fraction: s.reasoning_cap_fraction,
+            fan_out: s.fan_out.clone(),
+            max_concurrent: s.max_concurrent,
+            host_policy: s.host_policy.clone(),
+            enabled: s.enabled,
+        }
+    }
 }
 
 fn default_true() -> bool {

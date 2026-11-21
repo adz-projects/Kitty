@@ -21,6 +21,19 @@ const FILES_HEADER: &str = "Files provided by the user:";
 pub const REGENERATE_NOTE: &str =
     "\n\n(Please reconsider your previous answer above and provide an improved response.)";
 
+/// Label of the moderator brief a `/debate` turn carries as an inline
+/// document (`commands::session::debate`). Shown as a "debate" chip on replay.
+pub const DEBATE_LABEL: &str = "Debate brief";
+
+/// Whether a stored user turn was sent with `/debate`.
+pub fn is_debate_turn(stored: &str) -> bool {
+    stored.contains(&format!(
+        "{}
+",
+        doc_open(DEBATE_LABEL, false)
+    ))
+}
+
 /// A document pasted or dropped into a turn and sent inline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineDocument {
@@ -44,7 +57,7 @@ pub const PINNED_TOKEN: &str = "[remember]";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachmentChip {
     pub name: String,
-    /// `file`, `document` or `image`.
+    /// `file`, `document`, `image` or `debate`.
     pub kind: &'static str,
     /// Marked "Remember this" by the user (shown pinned on replay).
     #[serde(default)]
@@ -113,9 +126,14 @@ pub fn parse(stored: &str) -> ParsedTurn {
         let close = format!("\n{}", doc_close(label));
         match after_open.find(&close) {
             Some(end) => {
+                let kind = if label == DEBATE_LABEL {
+                    "debate"
+                } else {
+                    "document"
+                };
                 attachments.push(AttachmentChip {
                     name: label.to_string(),
-                    kind: "document",
+                    kind,
                     pinned,
                 });
                 rest = after_open[end + close.len()..].trim_start_matches('\n');
@@ -262,6 +280,26 @@ mod tests {
         let parsed = parse(&sent);
         assert_eq!(parsed.text, "Summarize");
         assert_eq!(parsed.attachments.len(), 1);
+    }
+
+    #[test]
+    fn a_debate_brief_round_trips_as_a_debate_chip() {
+        let docs = [
+            doc("draft.md", "the draft"),
+            doc(
+                DEBATE_LABEL,
+                "rules
+
+panel",
+            ),
+        ];
+        let sent = compose("Three faculty, three rounds", &docs, &[]);
+        assert!(is_debate_turn(&sent));
+        let parsed = parse(&sent);
+        assert_eq!(parsed.text, "Three faculty, three rounds");
+        let kinds: Vec<&str> = parsed.attachments.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, ["document", "debate"]);
+        assert!(!is_debate_turn(&compose("q", &[doc("a", "b")], &[])));
     }
 
     #[test]

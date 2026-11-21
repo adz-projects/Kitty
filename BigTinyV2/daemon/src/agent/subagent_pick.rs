@@ -234,6 +234,44 @@ fn pin_status(candidates: &[Candidate], pin: Pin<'_>, deny: &[String]) -> PinSta
     }
 }
 
+/// Place a delegate on the one host its caller chose, or refuse.
+///
+/// For a specialist whose host the calling model names per call, from a panel
+/// the app armed for that turn. The app's arming *is* the opt-in, so the two
+/// preference-shaped gates — the subagent role and the model denylist — do not
+/// apply: a debate seat is chosen for capability, which is exactly what those
+/// two exist to steer delegates away from. The two gates that are about the
+/// run working at all still do: a host that cannot call tools fabricates its
+/// report, and an unhealthy one fails. There is no fallback: a different model
+/// behind the same persona is not what the caller asked for.
+pub fn choose_forced(candidates: &[Candidate], provider: &str, model: Option<&str>) -> Decision {
+    let Some(c) = candidates.iter().find(|c| c.provider_id == provider) else {
+        return Decision::Refused {
+            reason: format!("'{provider}' is not a provider this app can use"),
+        };
+    };
+    if !c.supports_tools {
+        return Decision::Refused {
+            reason: format!("'{provider}' cannot call tools, so it cannot take part"),
+        };
+    }
+    if !c.healthy {
+        return Decision::Refused {
+            reason: format!("'{provider}' is unavailable right now; choose another"),
+        };
+    }
+    if c.context_length.is_some_and(|n| n < MIN_CONTEXT) {
+        return Decision::Refused {
+            reason: format!("'{provider}' has too small a context window to take part"),
+        };
+    }
+    Decision::Chosen {
+        provider_id: provider.to_string(),
+        model: model.filter(|m| !m.is_empty()).map(str::to_string),
+        note: None,
+    }
+}
+
 /// Pick a host for a delegate.
 ///
 /// `deny` is applied to every candidate *and* to the pin, so no path through
@@ -410,6 +448,46 @@ mod tests {
             !note.contains("unavailable"),
             "the host was available; only the model was denied: {note}"
         );
+    }
+
+    /// A caller-chosen host skips the two preference gates (role "never", the
+    /// denylist — nothing here even consults it) but keeps the two that decide
+    /// whether a run can work, and never substitutes another provider.
+    #[test]
+    fn a_forced_host_ignores_role_and_price_but_not_health() {
+        let mut seat = candidate("seat");
+        seat.subagent_role = Some("never".into());
+        seat.cost_tier = Some("premium".into());
+        let cheap = candidate("cheap");
+        let c = vec![seat.clone(), cheap.clone()];
+
+        let d = choose_forced(&c, "seat", Some("big-model"));
+        assert_eq!(chosen(&d), "seat");
+        let Decision::Chosen { model, note, .. } = d else {
+            unreachable!()
+        };
+        assert_eq!(model.as_deref(), Some("big-model"));
+        assert!(note.is_none());
+
+        let mut sick = seat.clone();
+        sick.healthy = false;
+        assert!(
+            matches!(
+                choose_forced(&[sick, cheap.clone()], "seat", None),
+                Decision::Refused { .. }
+            ),
+            "an unhealthy seat is refused, not swapped for a healthy one"
+        );
+        let mut toolless = seat;
+        toolless.supports_tools = false;
+        assert!(matches!(
+            choose_forced(&[toolless, cheap.clone()], "seat", None),
+            Decision::Refused { .. }
+        ));
+        assert!(matches!(
+            choose_forced(&[cheap], "missing", None),
+            Decision::Refused { .. }
+        ));
     }
 
     /// A slot count nobody measured is not evidence of spare capacity. Ollama

@@ -285,7 +285,8 @@ interface ChatState {
     modelId?: string
   ) => Promise<void>;
   reloadCurrent: () => Promise<void>;
-  send: (text: string) => Promise<void>;
+  /** `debate`: the turn was sent with `/debate` (`bigtiny::debate`). */
+  send: (text: string, opts?: { debate?: boolean }) => Promise<void>;
   cancel: () => Promise<void>;
   /** Hard-reset a stuck turn the user chose to force-stop (Round-5): clears
       `busy`, ends the in-flight message, and abandons the turn so late events
@@ -846,7 +847,8 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       droppedFiles: PathInfo[];
       attachments: Attachment[];
       pendingImages: PendingImage[];
-    }
+    },
+    debate = false
   ): Promise<boolean> => {
     const trimmed = text;
     // Captured before ANY await — see the note above. This is also what makes
@@ -934,7 +936,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // Snapshot what's attached to this turn before the set() below clears
       // droppedFiles/attachments/pendingImages from composer state — otherwise
       // there'd be no record of it on the sent message at all (Round-7 fix).
-      const attachedFiles: { name: string; kind: 'file' | 'document' | 'image' }[] = [
+      const attachedFiles: { name: string; kind: 'file' | 'document' | 'image' | 'debate' }[] = [
         ...otherFiles.map((f) => ({ name: f.name, kind: 'file' as const })),
         ...imageFiles.map((f) => ({ name: f.name, kind: 'image' as const })),
         ...attachments.map((a) => ({ name: a.label, kind: 'document' as const })),
@@ -942,6 +944,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           name: pendingImages.length > 1 ? `Clipboard image ${i + 1}` : 'Clipboard image',
           kind: 'image' as const,
         })),
+        ...(debate ? [{ name: 'Debate brief', kind: 'debate' as const }] : []),
       ];
 
       const userMsg: Message = {
@@ -949,6 +952,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         role: 'user',
         text:
           trimmed ||
+          (debate ? '/debate' : '') ||
           (attachments.length
             ? `(${attachments.length} document(s))`
             : pendingImages.length
@@ -996,7 +1000,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       lastSentProvider = get().providerName;
       lastSentModel = get().model;
       submitted = true;
-      await ipc.sendPrompt(sessionId, trimmed, images, attachedPaths, documents);
+      await ipc.sendPrompt(sessionId, trimmed, images, attachedPaths, documents, debate);
       // A turn that carried attachments just widened the session's grant set
       // daemon-side. Re-read it now, before the model's first tool call, or
       // the approval check still judges those files against chat_dir/cwd
@@ -2032,9 +2036,11 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       }
     },
 
-    send: async (text: string) => {
+    send: async (text: string, opts?: { debate?: boolean }) => {
       const trimmed = text.trim();
-      if (sendInFlight || get().busy || !hasSomethingToSend(trimmed, get())) {
+      const debate = opts?.debate ?? false;
+      // `/debate` alone is a request too: the brief says what to do.
+      if (sendInFlight || get().busy || !(debate || hasSomethingToSend(trimmed, get()))) {
         return;
       }
       // Acquire the synchronous in-flight guard BEFORE any await — `busy` is
@@ -2043,7 +2049,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // and enqueue two prompts.
       sendInFlight = true;
       try {
-        await doSend(trimmed);
+        await doSend(trimmed, undefined, debate);
       } finally {
         sendInFlight = false;
       }

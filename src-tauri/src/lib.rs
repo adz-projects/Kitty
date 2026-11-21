@@ -249,6 +249,8 @@ pub fn run() {
             commands::delete_specialist,
             commands::list_available_tools,
             commands::list_specialist_runs,
+            commands::get_debate_panel,
+            commands::set_debate_panel,
             commands::list_scheduled_tasks,
             commands::create_scheduled_task,
             commands::update_scheduled_task,

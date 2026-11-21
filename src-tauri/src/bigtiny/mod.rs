@@ -11,7 +11,9 @@
 
 pub mod client;
 pub mod context_window;
+pub mod debate;
 pub mod effort;
+pub mod kitty_specialists;
 pub mod mcp;
 pub mod memorabilia;
 pub mod pathway;

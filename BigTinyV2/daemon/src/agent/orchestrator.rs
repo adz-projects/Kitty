@@ -76,6 +76,14 @@ pub struct DelegateRun {
     /// rate-limited tool, where the daemon-wide cap alone would let a
     /// fan-out spend every slot on it.
     pub max_concurrent: Option<i64>,
+    /// Run on exactly `provider` (and `model`, when given), or not at all.
+    ///
+    /// Set only for a specialist whose host the *caller* chose from a panel the
+    /// app armed for the turn (`Orchestrator::arm_debate`). Such a run skips the
+    /// subagent role and the model denylist — the app opted that host in for
+    /// this turn — but never health or tool support, and it does not fail over:
+    /// the caller picked that model on purpose.
+    pub force_host: bool,
 }
 
 /// Where a delegate actually ran, and how many of it there were.
@@ -178,6 +186,25 @@ pub struct Orchestrator {
     /// Per-specialist caps (`DelegateRun::max_concurrent`), keyed by app and
     /// specialist name, with the limit each semaphore was built for.
     per_specialist: DashMap<(String, String), (usize, Arc<Semaphore>)>,
+    /// The hosts a turn's caller may choose from, by session, for exactly as
+    /// long as that turn runs. See `arm_debate`.
+    debates: DashMap<String, Vec<String>>,
+}
+
+/// Disarms a turn's debate panel when dropped.
+///
+/// Held by the task that forwards the turn's events, which ends when the turn
+/// does — however it ends — so a panel can never outlive its turn and leave a
+/// later, ordinary turn able to pick premium hosts.
+pub struct DebateGuard {
+    orchestrator: Arc<Orchestrator>,
+    session_id: String,
+}
+
+impl Drop for DebateGuard {
+    fn drop(&mut self) {
+        self.orchestrator.debates.remove(&self.session_id);
+    }
 }
 
 type Report = Shared<BoxFuture<'static, String>>;
@@ -284,6 +311,7 @@ impl Orchestrator {
             tickets: DashMap::new(),
             ticket_seq: AtomicU64::new(0),
             per_specialist: DashMap::new(),
+            debates: DashMap::new(),
         }
     }
 
@@ -418,7 +446,16 @@ impl Orchestrator {
                     .as_deref()
                     .filter(|p| !p.is_empty())
                     .map(|p| (p, spec.model.as_deref().filter(|m| !m.is_empty())));
-                match subagent_pick::choose_host(&candidates, pin, &self.model_deny) {
+                let decision = match (spec.force_host, pin) {
+                    (true, Some((provider, model))) => {
+                        subagent_pick::choose_forced(&candidates, provider, model)
+                    }
+                    (true, None) => Decision::Refused {
+                        reason: "this specialist runs only on a host its caller names".into(),
+                    },
+                    (false, _) => subagent_pick::choose_host(&candidates, pin, &self.model_deny),
+                };
+                match decision {
                     Decision::Chosen {
                         provider_id,
                         model,
@@ -569,7 +606,12 @@ impl Orchestrator {
         // which on a self-hosted Qwen3.8 template is xhigh. `delegate` marks
         // the session for the loop's delegate-only paths.
         meta["delegate"] = json!(true);
-        if let Some(level) = host_provider
+        // A caller-chosen host was picked for what it can do, so it thinks at
+        // its own default rather than the delegate level, and it is pinned:
+        // the turn loop refuses to move it (see `host_pinned` there).
+        if spec.force_host {
+            meta["host_pinned"] = json!(true);
+        } else if let Some(level) = host_provider
             .as_deref()
             .and_then(|p| self.router.get().and_then(|r| r.delegate_effort(p)))
         {
@@ -598,7 +640,7 @@ impl Orchestrator {
         // picked onto a permitted host could fail over onto a denied one and
         // spend exactly what the denylist exists to prevent. The loop consults
         // this at both resolution sites.
-        if !self.model_deny.is_empty() {
+        if !self.model_deny.is_empty() && !spec.force_host {
             meta["subagent_model_deny"] = json!(self.model_deny);
         }
         // Delegates read and write the response cache; interactive chat does
@@ -840,6 +882,32 @@ impl Orchestrator {
     /// arrive. Spawned rather than stored as a lazy future: the delegate must
     /// make progress while the parent model is busy elsewhere, whether or not
     /// anyone is awaiting it yet, which is the entire point of a ticket.
+    /// Let this session's current turn choose hosts from `panel` (provider
+    /// ids) for specialists whose host the caller names.
+    ///
+    /// The panel is the app's opt-in: a host in it may run such a specialist
+    /// whatever its subagent role or the model denylist say. Empty ids are
+    /// dropped; an empty panel arms nothing.
+    pub fn arm_debate(self: &Arc<Self>, session_id: &str, panel: Vec<String>) -> DebateGuard {
+        let panel: Vec<String> = panel
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !panel.is_empty() {
+            self.debates.insert(session_id.to_string(), panel);
+        }
+        DebateGuard {
+            orchestrator: self.clone(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// The armed panel for this session's current turn, if any.
+    pub fn debate_panel(&self, session_id: &str) -> Option<Vec<String>> {
+        self.debates.get(session_id).map(|p| p.clone())
+    }
+
     pub fn start_ticket<F>(&self, parent_session_id: &str, specialist: &str, work: F) -> String
     where
         F: std::future::Future<Output = String> + Send + 'static,

@@ -3,6 +3,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// `host_policy` value for a specialist whose host the caller chooses.
+pub const HOST_POLICY_CALLER: &str = "caller";
+
+impl Specialist {
+    /// Whether the calling model chooses this specialist's host per call.
+    pub fn caller_hosted(&self) -> bool {
+        self.host_policy.as_deref() == Some(HOST_POLICY_CALLER)
+    }
+}
+
 /// A named delegate agent.
 ///
 /// Deliberately not a prompt template. The caller supplies the request in its
@@ -44,6 +54,12 @@ pub struct Specialist {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<i64>,
     pub enabled: bool,
+    /// Who picks the host. `None` = the daemon (`choose_host`). `"caller"` =
+    /// the calling model names one per call from the turn's armed panel, and
+    /// the specialist refuses to run in a turn that armed none — see
+    /// [`HOST_POLICY_CALLER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_policy: Option<String>,
     /// Seeded by the daemon. Editable by an app only in the sense that the app
     /// may define its own specialist of the same name, which shadows this one.
     pub builtin: bool,

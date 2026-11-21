@@ -72,6 +72,10 @@ pub struct WriteRequest {
     pub fan_out: Option<String>,
     #[serde(default)]
     pub max_concurrent: Option<i64>,
+    /// `"caller"` to let the calling model choose the host per call from the
+    /// turn's armed panel; omit for the daemon's own choice.
+    #[serde(default)]
+    pub host_policy: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -145,6 +149,11 @@ pub async fn create(
             .fan_out
             .filter(|f| f == "per_ref"),
         max_concurrent: body.max_concurrent,
+        // Same rule as `fan_out`: an unknown policy is the default, never a
+        // guess at what was meant.
+        host_policy: body
+            .host_policy
+            .filter(|h| h == crate::models::specialist::HOST_POLICY_CALLER),
         enabled: body.enabled,
         // Never settable over the wire: `builtin` is what makes a row
         // undeletable and shared, and an app declaring itself one would be
@@ -261,6 +270,7 @@ pub async fn run(
         max_steps: spec.max_steps,
         reasoning_cap: spec.reasoning_cap,
         max_concurrent: spec.max_concurrent,
+        force_host: false,
     };
 
     match state.orchestrator.run(run).await {

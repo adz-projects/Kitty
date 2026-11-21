@@ -103,6 +103,7 @@ fn builtin_with_fan_out(
         max_steps: 20,
         fan_out: fan_out.map(str::to_string),
         max_concurrent: None,
+        host_policy: None,
         // Left to the daemon default rather than pinned per specialist: the
         // right budget depends on the model a delegate lands on, which a
         // definition cannot know.
