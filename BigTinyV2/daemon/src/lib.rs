@@ -21,6 +21,7 @@ pub mod plugins;
 pub mod private_fs;
 pub mod provider;
 pub mod routes;
+pub mod research;
 pub mod scheduler;
 pub mod server;
 pub mod specialists;
@@ -382,6 +383,14 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     });
 
     routes::jobs::resume_pending(&state).await;
+
+    // Deep research runs: resumes any a previous process left mid-run, and
+    // picks up each newly approved plan.
+    research::driver::spawn_supervisor(Arc::new(research::driver::Driver {
+        pool: state.db.clone(),
+        agent: state.agent.clone(),
+        orchestrator: state.orchestrator.clone(),
+    }));
 
     // The memory watchdog logs these counters when it fires. Weak, so the
     // registration never keeps a stopped engine's state alive.

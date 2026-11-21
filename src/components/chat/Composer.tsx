@@ -1,3 +1,4 @@
+import { DEFAULT_RESEARCH_TURNS, parseResearchCommand } from '@/lib/research';
 import { useEffect, useRef, useState } from 'react';
 import { hasSomethingToSend, useChatStore } from '@/stores/chatStore';
 import { parseDebateCommand } from '@/stores/chat/messageUtils';
@@ -39,7 +40,10 @@ export function Composer({
   sendBlocked,
   spectating,
 }: {
-  onSend: (text: string, opts?: { debate?: boolean }) => void;
+  onSend: (
+    text: string,
+    opts?: { debate?: boolean; research?: { maxTurns: number | null } }
+  ) => void;
   onStop: () => void;
   disabled: boolean;
   concluded?: boolean;
@@ -125,6 +129,15 @@ ${prefill}`
   const submit = () => {
     const value = text.trim();
     const debate = parseDebateCommand(value);
+    const research = parseResearchCommand(value);
+    if (research !== null) {
+      // `/deepresearch` alone has nothing to plan from: the hint says what to add.
+      if (!research.brief || disabled || readOnly || sendBlocked) return;
+      onSend(research.brief, { research: { maxTurns: research.maxTurns } });
+      setText('');
+      resetTextareaHeight();
+      return;
+    }
     if (debate === null && !hasSomethingToSend(value, useChatStore.getState())) return;
     if (disabled || readOnly || sendBlocked) return;
     if (debate !== null) {
@@ -198,6 +211,7 @@ ${prefill}`
   };
 
   const debating = parseDebateCommand(text) !== null;
+  const researching = parseResearchCommand(text) !== null;
 
   return (
     <div className="composer">
@@ -205,6 +219,13 @@ ${prefill}`
         <div className="composer-hint" role="status">
           Debate: say who the personas are, how many rounds, and what the debate should examine.
           Attach or link the item under debate. The panel is set in Settings → Specialists.
+        </div>
+      )}
+      {researching && (
+        <div className="composer-hint" role="status">
+          Deep research: say what to research and what to produce. Add turns=N to set the budget
+          (default {DEFAULT_RESEARCH_TURNS}: two research waves, a critique, the write-up). You
+          approve the plan before it starts.
         </div>
       )}
       <button

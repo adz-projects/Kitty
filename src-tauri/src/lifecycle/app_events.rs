@@ -119,6 +119,18 @@ fn handle(app: &AppHandle, event: SSEEvent) {
             });
         }
         SSEEventType::ScheduleRun => schedule_run(app, &event),
+        // A deep research run moved on: phase, wave, counts, coverage.
+        SSEEventType::ResearchProgress => {
+            let _ = app.emit(
+                "research://progress",
+                json!({
+                    "research_id": event.research_id,
+                    "session_id": event.session_id,
+                    "status": event.content,
+                    "detail": event.tool_args,
+                }),
+            );
+        }
         // A chat's derived title, which lands after its turn stream closed.
         SSEEventType::SessionTitle => {
             let (Some(session_id), Some(title)) = (event.session_id, event.content) else {
@@ -248,7 +260,15 @@ async fn on_pause(
         return;
     };
     let session = session_view(app, &session_id).await;
-    let mut decision = approvals::decide(&tool_args, session.dirs.as_deref());
+    // A call that is itself a question for the user (a research plan) is
+    // never answered by Kitty, however safe its arguments look.
+    let mut decision = if approvals::is_always_ask(&tool_name) {
+        Decision::Prompt {
+            warning: String::new(),
+        }
+    } else {
+        approvals::decide(&tool_args, session.dirs.as_deref())
+    };
     // A shell command Kitty would allow on its own gets a second opinion from
     // the decision model, when there is one. Escalation only: a flagged
     // command goes to a person; anything else is decided as before.
@@ -261,13 +281,13 @@ async fn on_pause(
     }
     let warning = match decision {
         Decision::Allow => {
-            match approve(app, &session_id, &action_id, "allow", None).await {
+            match approve(app, &session_id, &action_id, "allow", None, None).await {
                 Ok(()) => return,
                 // Could not answer it: a person will have to.
                 Err(e) => Some(format!("Kitty could not approve this automatically: {e}")),
             }
         }
-        Decision::Prompt { warning } => Some(warning),
+        Decision::Prompt { warning } => (!warning.is_empty()).then_some(warning),
     };
 
     let pending = PendingApproval {
@@ -449,11 +469,15 @@ pub(crate) async fn approve(
     action_id: &str,
     decision: &str,
     args_pattern: Option<&str>,
+    message: Option<&str>,
 ) -> Result<(), String> {
     let client = crate::bigtiny::client::ensure_client(app)?;
     let mut body = json!({ "action_id": action_id, "decision": decision });
     if let Some(pattern) = args_pattern {
         body["args_pattern"] = Value::String(pattern.to_string());
+    }
+    if let Some(message) = message.map(str::trim).filter(|m| !m.is_empty()) {
+        body["message"] = Value::String(message.to_string());
     }
     client
         .post_json(&format!("/api/chat/{session_id}/approve"), &body)

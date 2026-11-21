@@ -28,6 +28,8 @@ pub struct ImageAttachment {
 /// drops) and `attached_paths` are laid out around it here
 /// (`bigtiny::turn_text::compose`), the same code that takes them apart
 /// again when the chat is resumed.
+// Each parameter is a field of the webview's `send_prompt` call.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_prompt(
     app: AppHandle,
     session_id: String,
@@ -36,6 +38,7 @@ pub async fn send_prompt(
     attached_paths: Option<Vec<String>>,
     documents: Option<Vec<crate::bigtiny::turn_text::InlineDocument>>,
     debate: Option<bool>,
+    research: Option<crate::bigtiny::research::ResearchArgs>,
 ) -> Result<(), String> {
     // `/debate`: a moderator brief rides as the turn's last document, and the
     // panel it names is armed in the engine for this turn only.
@@ -53,6 +56,23 @@ pub async fn send_prompt(
     } else {
         None
     };
+    // `/deepresearch`: the engine ties this chat to a new run and returns turn
+    // 0's instructions, which ride with the brief so this turn drafts the
+    // plan the user then approves.
+    if let Some(args) = research {
+        let client = crate::bigtiny::client::ensure_client(&app)?;
+        let started = crate::bigtiny::research::start(&client, &session_id, &text, &args)
+            .await
+            .map_err(|e| {
+                tracing::warn!("deep research start for {session_id}: {e}");
+                if e.contains("already has a research run") {
+                    "This chat already has a deep research run in progress.".to_string()
+                } else {
+                    "Could not start deep research.".to_string()
+                }
+            })?;
+        documents.push(crate::bigtiny::research::instructions_document(&started));
+    }
     let text = crate::bigtiny::turn_text::compose(
         &text,
         &documents,
@@ -142,17 +162,27 @@ pub async fn list_pending_approvals(
 }
 
 /// Answer an approval: `allow`, `always_allow` (scoped, see
-/// `approvals::always_scope`) or `reject`.
+/// `approvals::always_scope`), `reject`, or `revise`. `message` is the
+/// person's own words for the model: what to change (required for `revise`),
+/// or why it was rejected.
 #[tauri::command]
 pub async fn answer_approval(
     app: AppHandle,
     action_id: String,
     decision: String,
+    message: Option<String>,
 ) -> Result<(), String> {
-    if !matches!(decision.as_str(), "allow" | "always_allow" | "reject") {
+    if !matches!(
+        decision.as_str(),
+        "allow" | "always_allow" | "reject" | "revise"
+    ) {
         return Err(format!("unknown decision: {decision}"));
     }
-    crate::bigtiny::stream::answer_approval(&app, &action_id, &decision).await
+    if decision == "revise" && message.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err("Say what should change.".into());
+    }
+    crate::bigtiny::stream::answer_approval(&app, &action_id, &decision, message.as_deref())
+        .await
 }
 
 /// The whole output of a tool call whose card showed a truncated result.

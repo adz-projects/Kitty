@@ -16,6 +16,7 @@ pub mod overnight;
 pub mod pathway;
 pub mod plugins;
 pub mod providers;
+pub mod research;
 pub mod schedules;
 pub mod search;
 pub mod specialists;
@@ -151,6 +152,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // stream taken away, so it survives its submitter going away.
         .route("/api/jobs", get(jobs::list).post(jobs::create))
         .route("/api/jobs/{id}", get(jobs::get).delete(jobs::cancel))
+        // Deep research: a brief turned into a sourced deliverable over a
+        // budget of turns (`crate::research`).
+        .route("/api/research", post(research::start))
+        .route("/api/research/{id}", get(research::get))
+        .route("/api/research/{id}/entries", get(research::entries))
+        .route("/api/research/{id}/cancel", post(research::cancel))
+        .route("/api/apps/me/research", get(research::list))
         // Ollama-compatible on purpose — see routes/embeddings.rs.
         .route("/api/embeddings", post(embeddings::embed))
         .route(

@@ -92,7 +92,8 @@ describe('chatStore send in-flight guard', () => {
       undefined,
       undefined,
       undefined,
-      false
+      false,
+      undefined
     );
   });
 
@@ -384,7 +385,8 @@ describe('chatStore /debate', () => {
       undefined,
       undefined,
       undefined,
-      true
+      true,
+      undefined
     );
     const bubble = useChatStore.getState().messages.find((m) => m.role === 'user');
     expect(bubble?.attachedFiles).toEqual([{ name: 'Debate brief', kind: 'debate' }]);
@@ -396,5 +398,28 @@ describe('chatStore /debate', () => {
     expect(useChatStore.getState().messages[0].text).toBe('/debate');
     await useChatStore.getState().send('');
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('chatStore /deepresearch', () => {
+  it('sends the brief with the research flag and its budget', async () => {
+    useChatStore.setState({ sessionId: 's1', cwd: 'C:/c', busy: false });
+    await useChatStore.getState().send('AI in SF', { research: { maxTurns: 6 } });
+    expect(ipc.sendPrompt).toHaveBeenLastCalledWith(
+      's1',
+      'AI in SF',
+      undefined,
+      undefined,
+      undefined,
+      false,
+      { max_turns: 6 }
+    );
+  });
+
+  it('sends nothing without a brief', async () => {
+    useChatStore.setState({ sessionId: 's1', cwd: 'C:/c', busy: false });
+    vi.mocked(ipc.sendPrompt).mockClear();
+    await useChatStore.getState().send('  ', { research: { maxTurns: null } });
+    expect(ipc.sendPrompt).not.toHaveBeenCalled();
   });
 });

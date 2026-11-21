@@ -1,3 +1,4 @@
+import { ResearchProgressCard } from './ResearchProgressCard';
 import { useEffect, useState, type ReactElement } from 'react';
 import { createPortal } from 'react-dom';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
@@ -295,6 +296,7 @@ export function ChatView({ headerSlot }: { headerSlot?: HTMLElement | null } = {
       <ChatTranscript />
       <FindBar />
 
+      <ResearchProgressCard sessionId={sessionId} />
       {pendingApprovals
         .filter((a) => a.session_id === sessionId)
         .map((a) => (

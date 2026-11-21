@@ -1326,6 +1326,7 @@ pub async fn answer_approval(
     app: &AppHandle,
     action_id: &str,
     decision: &str,
+    message: Option<&str>,
 ) -> Result<(), String> {
     // Read, not removed: if the POST fails the approval is still pending and
     // can be answered again. The daemon's `hitl_resolved` removes it.
@@ -1340,8 +1341,15 @@ pub async fn answer_approval(
     let pattern = (decision == "always_allow")
         .then_some(pending.always_scope.args_pattern.as_deref())
         .flatten();
-    crate::lifecycle::app_events::approve(app, &pending.session_id, action_id, decision, pattern)
-        .await
+    crate::lifecycle::app_events::approve(
+        app,
+        &pending.session_id,
+        action_id,
+        decision,
+        pattern,
+        message,
+    )
+    .await
 }
 
 #[cfg(test)]

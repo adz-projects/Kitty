@@ -68,6 +68,21 @@ Never a silently wrong-shaped call.
 | `POST /api/chat/{id}/cancel`, `/compact`, `/approve` | `/compact` with nothing folded answers `{compacted: false, reason, skip}`; `skip` is `disabled`, `lock_held`, `nothing_to_fold`, `below_threshold`, `summarizer_failed` or `storage_failed` (2.5.0) |
 | `GET /api/chat/{id}/stats`, `/timings`, `/pending` | |
 
+**Approving a paused call.** `POST /api/chat/{id}/approve` takes
+`{action_id, decision, args_pattern?, message?}`. `decision` is `allow`,
+`always_allow`, `reject` or `revise` (2.8.0). `revise` does not run the call:
+the user's `message` (required, 400 without one) goes back to the model as
+the call's result, so it changes what it proposed and calls again. `message`
+may also explain a `reject`, which the model then sees instead of a bare
+denial. The resulting `hitl_resolved` event carries the decision in `content`
+and the message in `reason`.
+
+**Always-ask tools** (2.8.0). Some calls are themselves questions for the user:
+`submit_research_plan`, plus any name in `hitl.always_ask_tools`. Every call
+pauses, whatever stored rules, allow patterns, the app's automatic approval or
+a delegate's `tool_allow` say, and waits up to 24 hours instead of the usual
+hour. A delegate cannot answer one: it refuses as for any approval.
+
 **Reasoning effort.** A session's `thinking_effort` metadata key (a string,
 set through `PATCH /api/chat/{id}/config`) is translated per provider dialect
 on every turn. `""` or absent: no effort sent, the model's own default.
@@ -161,6 +176,77 @@ it next starts, and one cancelled while waiting never starts.
 
 Jobs queue at background priority, so a batch never delays another app's
 interactive chat.
+
+## Deep research (2.8.0)
+
+A brief turned into a sourced deliverable over a budget of **turns**, default
+4: research waves, then a critique and a write-up, which are always kept
+back. So 4 turns are 2 waves, and the range is 3–20.
+
+| Route | Notes |
+|---|---|
+| `POST /api/research` | `{session_id, brief, max_turns?}` to `{research_id, status, max_turns, instructions}`; **409** while the chat has a run in progress |
+| `GET /api/research/{id}` | the run (below) plus `contract` and `plan_markdown` |
+| `GET /api/research/{id}/entries` | `?kind`; the ledger: `{seq, wave, kind, status, cells, sections, entry}` |
+| `POST /api/research/{id}/cancel` | stops the step and delegates in flight; the ledger stays |
+| `GET /api/apps/me/research` | `?session_id&limit`; `{runs}`, newest first |
+
+**How a run goes.** Starting one runs nothing. Send the `instructions` with
+the brief as an ordinary turn on that chat (turn 0). That turn calls
+`submit_research_plan`, an always-ask tool, so it pauses for the user:
+
+- `allow` starts the run.
+- `revise` with a `message` sends the user's words back, and the model submits
+  a revised plan.
+- `reject` ends turn 0. A run whose turn 0 ends with no approved plan is
+  cancelled.
+
+After approval the daemon drives the run in the background, surviving the
+client:
+
+- **Each wave:** a planner on a fresh child session reads a bounded projection
+  of the ledger, not a transcript. It records leads, sets a frontier, and the
+  frontier's tasks run as parallel delegates. These are the `researcher`,
+  `summarizer` and `analyst` definitions, answering in one report shape.
+- **The critique:** one or two critics. The second runs on a different model
+  when one is eligible. Gaps they name get one targeted search.
+- **The write-up:** written section by section from each section's slice of
+  the ledger, checked mechanically (every `[L#]` must be a usable finding),
+  checked against the cited evidence, rewritten once, then numbered against a
+  source list.
+
+The report is appended to the chat as an assistant message and saved as
+`<chat_dir>/outputs/<slug>.md`. A `.docx` is saved too when the plan asks for
+Word.
+
+**The ledger is append-only.** It holds entries of these kinds: `finding`,
+`source`, `question`, `lead`, `dead_end`, `entity`, `defect` and `task`. What
+became of an entry (`answered`, `pursued`, `duplicate`, `disputed`,
+`superseded`, `resolved`) is derived from links.
+
+**Every frontier is held to a rule.** Once there are findings, the wave must
+record leads drawn from them (`derived_from`), at least one of them a
+productive tangent. The frontier must carry a tangent task, and once leads
+exist, at least half its tasks must pursue one. `research_set_frontier`
+refuses a frontier that breaks this, saying why.
+
+**Progress.** `research_progress` events go on the app stream and the chat's
+stream:
+
+- `research_id` names the run.
+- `content` is its status: `planning`, `researching`, `critiquing`, `writing`,
+  `done`, `failed` or `cancelled`.
+- `tool_args` carries the detail: `turns_used`, `max_turns`, `waves`,
+  `findings`, `sources`, `open_questions`, `open_leads`, `tangents_paid_off`,
+  `coverage` per cell, `steps` with their sessions, the current `step`, and
+  `tokens_used`.
+
+A run interrupted by a restart resumes at its next step. One still waiting for
+plan approval is cancelled.
+
+The ledger tools reach the model through the in-process `research` MCP server,
+which an app registers like `specialists`. The daemon withholds them from every
+session without a research role.
 
 ## Admin
 

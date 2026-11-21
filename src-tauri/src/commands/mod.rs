@@ -20,6 +20,7 @@ mod memory;
 mod models;
 mod overnight;
 mod provider;
+mod research;
 mod scheduled_tasks;
 // Win32 GDI desktop capture — see `crate::screenshot` (docs/ANDROID.md §2.5).
 mod export;
@@ -33,6 +34,7 @@ mod v1_import;
 mod window;
 
 pub use adaptive_pathway::*;
+pub use research::*;
 pub use config::*;
 pub use decider::*;
 pub use export::*;

@@ -8,6 +8,7 @@ pub mod jobs;
 pub mod mcp_servers;
 pub mod messages;
 pub mod providers;
+pub mod research;
 pub mod schedules;
 pub mod sessions;
 pub mod specialists;

@@ -148,6 +148,15 @@ fn lexical_normalize(path: &Path) -> String {
 /// security-sensitive shell command always needs a person; everything else
 /// is allowed. When the folders are unknown, a call that names a path asks:
 /// failing to read the grants must not approve everything.
+/// Tools whose call is itself a question for the person, so Kitty never
+/// answers it: the engine's `hitl::manager::ALWAYS_ASK_TOOLS`. A deep research
+/// run's plan is approved, revised or rejected by the user and nobody else.
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["submit_research_plan"];
+
+pub fn is_always_ask(tool_name: &str) -> bool {
+    ALWAYS_ASK_TOOLS.contains(&tool_name)
+}
+
 pub fn decide(args: &Value, dirs: Option<&[String]>) -> Decision {
     for path in target_paths(args) {
         if is_internal_tool_cache_path(path) {
@@ -441,5 +450,11 @@ mod tests {
             "{} vs {args}",
             scope.args_pattern.unwrap()
         );
+    }
+
+    #[test]
+    fn a_research_plan_is_always_put_to_the_person() {
+        assert!(is_always_ask("submit_research_plan"));
+        assert!(!is_always_ask("lean_file_read"));
     }
 }

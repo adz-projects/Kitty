@@ -60,6 +60,8 @@ lib.rs (app setup, window creation, generate_handler! list;
   │                     parsed back for replay
   │     debate.rs      `/debate`: the moderator brief and the panel armed for
   │                     the turn (pasted items saved to <chat>/debate/)
+  │     research.rs    `/deepresearch`: starts an engine research run, whose
+  │                     turn-0 instructions ride with the brief; reads/stops runs
   │     kitty_specialists.rs  the `debater` specialist, and extractor/analyst
   │                     switched off for Kitty (once, after each MCP self-heal)
   │     providers.rs   sync every setup's card into the engine (one row each)

@@ -1,6 +1,7 @@
 // The ONLY file that calls Tauri `invoke()` / `listen()`. Everything else in the
 // frontend goes through these typed wrappers (CLAUDE.md rule 2).
 
+import type { ResearchDetail } from './research';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -188,7 +189,10 @@ export const ipc = {
     attachedPaths?: string[],
     documents?: { label: string; content: string; pinned?: boolean }[],
     /** `/debate`: the backend adds the moderator brief and arms the panel. */
-    debate?: boolean
+    debate?: boolean,
+    /** `/deepresearch`: the engine ties the chat to a new research run and
+        this turn drafts its plan (`bigtiny::research`). */
+    research?: { max_turns: number | null }
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
@@ -197,6 +201,7 @@ export const ipc = {
       attachedPaths: attachedPaths ?? null,
       documents: documents ?? null,
       debate: debate ?? null,
+      research: research ?? null,
     }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   /** Fresh (not client-cached) check of whether `session/prompt` is currently
@@ -463,8 +468,18 @@ export const ipc = {
     invoke<void>('test_provider_draft', { profile, secret }),
   // Approvals (every chat, on screen or not)
   listPendingApprovals: () => invoke<PendingApproval[]>('list_pending_approvals'),
-  answerApproval: (actionId: string, decision: 'allow' | 'always_allow' | 'reject') =>
-    invoke<void>('answer_approval', { actionId, decision }),
+  /** `message`: the user's own words for the model, required with
+      `revise` (what to change), optional with `reject` (why). */
+  answerApproval: (
+    actionId: string,
+    decision: 'allow' | 'always_allow' | 'reject' | 'revise',
+    message?: string
+  ) => invoke<void>('answer_approval', { actionId, decision, message: message ?? null }),
+  getResearch: (researchId: string) => invoke<ResearchDetail>('get_research', { researchId }),
+  /** This chat's research runs, newest first. */
+  listResearch: (sessionId?: string) =>
+    invoke<ResearchDetail[]>('list_research', { sessionId: sessionId ?? null }),
+  cancelResearch: (researchId: string) => invoke<void>('cancel_research', { researchId }),
   listAllowRules: () => invoke<AllowRule[]>('list_allow_rules'),
   /** The whole output of a tool call whose card was truncated. */
   fetchFullToolResult: (sessionId: string, toolCallId: string) =>
@@ -812,6 +827,22 @@ export const onHotkeyFailed = (cb: (e: { errors: string[] }) => void) =>
 
 export const onChatNotice = (cb: (e: ChatNoticeEvent) => void) =>
   listen<ChatNoticeEvent>('chat://notice', (e) => cb(e.payload));
+
+/** A deep research run moved on (`research_progress` from the engine). */
+export const onResearchProgress = (
+  cb: (e: {
+    research_id: string;
+    session_id: string | null;
+    status: string;
+    detail: ResearchDetail | null;
+  }) => void
+) =>
+  listen<{
+    research_id: string;
+    session_id: string | null;
+    status: string;
+    detail: ResearchDetail | null;
+  }>('research://progress', (e) => cb(e.payload));
 
 export const onApprovalResolved = (
   cb: (e: { action_id: string; session_id: string | null; timed_out: boolean }) => void

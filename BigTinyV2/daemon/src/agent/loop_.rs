@@ -286,6 +286,19 @@ fn withhold_debate_tool(tools: &mut Vec<ToolDefinition>, metadata: &Value) -> us
     before - tools.len()
 }
 
+/// Withhold deep research's ledger tools from every session except one with a
+/// research role, and give that session only its role's tools: turn 0 may
+/// submit a plan, a wave's planner may read and write the ledger, nothing
+/// else may touch it. Returns how many were withheld.
+fn withhold_research_tools(tools: &mut Vec<ToolDefinition>, metadata: &Value) -> usize {
+    use crate::research::server::{tools_for_role, RESEARCH_TOOLS};
+    let role = crate::research::ops::role_from_metadata(metadata);
+    let allowed = tools_for_role(role.as_ref().map(|r| r.role.as_str()));
+    let before = tools.len();
+    tools.retain(|t| !RESEARCH_TOOLS.contains(&t.name.as_str()) || allowed.contains(&t.name.as_str()));
+    before - tools.len()
+}
+
 /// Withhold the delegate tools from a chat whose user switched specialists
 /// off. Withheld rather than offered and refused: a small model that sees
 /// `call_specialist` will reach for it whatever the result says, and a refusal
@@ -1886,6 +1899,7 @@ impl AgentLoop {
         }
         self.specialists_off = specialists_disabled(&metadata);
         withhold_debate_tool(&mut active_tools, &metadata);
+        withhold_research_tools(&mut active_tools, &metadata);
         let withheld = withhold_specialist_tools(&mut active_tools, &metadata);
         if withheld > 0 {
             tracing::debug!(session_id, withheld, "specialists are off for this chat");
@@ -5583,12 +5597,22 @@ impl AgentLoop {
             // call even from `shutdown()`. Timing out and falling through to
             // the "denied" branch below fails safe rather than silently
             // auto-executing an unattended tool call.
-            let timed_out = tokio::time::timeout(self.hitl_timeout, notify.notified())
+            // A call that is itself a question for the user (a research plan)
+            // waits as long as a checkpoint should, not an interruption.
+            let wait = {
+                let hitl = self.hitl.lock().await;
+                if crate::hitl::manager::is_always_ask(&tool_name, &hitl.config) {
+                    crate::hitl::manager::ALWAYS_ASK_TIMEOUT.max(self.hitl_timeout)
+                } else {
+                    self.hitl_timeout
+                }
+            };
+            let timed_out = tokio::time::timeout(wait, notify.notified())
                 .await
                 .is_err();
             self.hitl_notifies.remove(&action_id);
 
-            let resolved = if timed_out {
+            let resolved: Option<(String, Option<String>)> = if timed_out {
                 // Remove the pending record AND any decision that raced in
                 // after the timeout: the pending-approvals API would
                 // otherwise show an approval no waiter will ever honor for
@@ -5607,7 +5631,9 @@ impl AgentLoop {
                 tool_name: Some(tool_name.clone()),
                 session_id: Some(session_id.to_string()),
                 action_id: Some(action_id.clone()),
-                content: resolved.clone(),
+                content: resolved.as_ref().map(|(d, _)| d.clone()),
+                // The user's message with a `revise` or `reject`.
+                reason: resolved.as_ref().and_then(|(_, m)| m.clone()),
                 // Lets a client that is showing this approval tell "answered
                 // elsewhere" from "nobody answered in time".
                 error_type: timed_out.then(|| "approval_timeout".to_string()),
@@ -5618,8 +5644,33 @@ impl AgentLoop {
             }
             let _ = event_tx.send(resolved_event);
 
+            let (resolved, message) = match resolved {
+                Some((d, m)) => (Some(d), m),
+                None => (None, None),
+            };
             match resolved.as_deref() {
                 Some("allow") | Some("always_allow") => {}
+                // Not run. The user's message is the result, so the model
+                // changes what it proposed and calls again. Not an error: the
+                // call did what it was for, which was to ask.
+                Some("revise") => {
+                    let text = format!(
+                        "Not accepted yet. The user asked for revisions: {}
+
+Revise what you                          proposed accordingly and call {tool_name} again.",
+                        message.as_deref().unwrap_or("(no details given)")
+                    );
+                    let _ = event_tx.send(SSEEvent {
+                        event_type: SSEEventType::ToolFinish,
+                        tool_name: Some(tool_name.clone()),
+                        tool_result: Some(text.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        session_id: Some(session_id.to_string()),
+                        is_error: Some(false),
+                        ..Default::default()
+                    });
+                    return text;
+                }
                 _ if timed_out => {
                     // Said plainly, so the model can finish the task without
                     // the tool (or report what it couldn't do) rather than
@@ -5628,7 +5679,7 @@ impl AgentLoop {
                         "Tool {tool_name} was not run: nobody approved it within {} minute(s) \
                          (the user was not available). Continue without it, and say what \
                          was skipped.",
-                        self.hitl_timeout.as_secs().div_ceil(60)
+                        wait.as_secs().div_ceil(60)
                     );
                     let _ = event_tx.send(SSEEvent {
                         event_type: SSEEventType::ToolFinish,
@@ -5643,7 +5694,10 @@ impl AgentLoop {
                     return err;
                 }
                 _ => {
-                    let err = format!("Tool {} denied by HITL policy", tool_name);
+                    let err = match message.as_deref() {
+                        Some(why) => format!("Tool {tool_name} was denied by the user: {why}"),
+                        None => format!("Tool {} denied by HITL policy", tool_name),
+                    };
                     let _ = event_tx.send(SSEEvent {
                         event_type: SSEEventType::ToolFinish,
                         tool_name: Some(tool_name.clone()),
@@ -5675,7 +5729,8 @@ impl AgentLoop {
         // would let a turn graft its subagents onto another session's tree, so
         // this is the only writer for those as well.
         let needs_session = crate::mcp::builtin::PATHWAY_TOOLS.contains(&tool_name.as_str())
-            || crate::specialists::server::SESSION_SCOPED_TOOLS.contains(&tool_name.as_str());
+            || crate::specialists::server::SESSION_SCOPED_TOOLS.contains(&tool_name.as_str())
+            || crate::research::server::RESEARCH_TOOLS.contains(&tool_name.as_str());
         let tool_args = if needs_session {
             let mut args = tool_args.clone();
             if let Some(obj) = args.as_object_mut() {
@@ -6627,7 +6682,7 @@ mod containment_order_tests {
         let action_id = action_id.expect("a HitlPause with an action_id must arrive");
         {
             let mut hitl = hitl.lock().await;
-            hitl.record_decision(&action_id, "allow");
+            hitl.record_decision(&action_id, "allow", None);
         }
         // Wake the paused call the way `Agent::resolve_approval` would.
         if let Some((_, notify)) = agent_loop.hitl_notifies.remove(&action_id) {
@@ -6641,6 +6696,94 @@ mod containment_order_tests {
             !result.contains("denied"),
             "an approved in-dir write must not be denied: {result}"
         );
+    }
+
+    /// Run one call to `tool`, answer its HitlPause with `decision` and
+    /// `message`, and return the call's result.
+    async fn answer_pause(tool: &str, decision: &str, message: Option<&str>) -> String {
+        let (agent_loop, hitl) = test_loop().await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let agent_loop = Arc::new(agent_loop);
+        let al = agent_loop.clone();
+        let tool = tool.to_string();
+        let handle = tokio::spawn(async move {
+            let sink = dashmap::DashMap::new();
+            al.execute_one_tool_call(
+                "sess-1",
+                "tc-1".to_string(),
+                tool,
+                json!({"title": "plan"}),
+                &[],
+                Arc::new(Semaphore::new(1)),
+                &tx,
+                &sink,
+            )
+            .await
+        });
+        let mut action_id = None;
+        while let Some(ev) = rx.recv().await {
+            if ev.event_type == SSEEventType::HitlPause {
+                action_id = ev.action_id;
+                break;
+            }
+        }
+        let action_id = action_id.expect("a HitlPause must arrive");
+        hitl.lock().await.record_decision(&action_id, decision, message);
+        if let Some((_, notify)) = agent_loop.hitl_notifies.remove(&action_id) {
+            notify.notify_one();
+        }
+        let result = handle.await.unwrap();
+        // The resolution carries the message for clients.
+        let mut resolved_reason = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.event_type == SSEEventType::HitlResolved {
+                resolved_reason = ev.reason;
+            }
+        }
+        assert_eq!(resolved_reason.as_deref(), message.map(str::trim));
+        result
+    }
+
+    /// `revise` does not run the tool: the user's words come back as the
+    /// result, not as an error, so the model revises and calls again.
+    #[tokio::test]
+    async fn a_revise_answer_returns_the_users_words_without_running_the_tool() {
+        let result =
+            answer_pause("submit_research_plan", "revise", Some(" include radio drama ")).await;
+        assert!(result.contains("include radio drama"), "{result}");
+        assert!(result.contains("call submit_research_plan again"), "{result}");
+        assert!(!result.contains("error"), "the tool must not have run: {result}");
+    }
+
+    #[tokio::test]
+    async fn a_reject_with_a_reason_passes_the_reason_on() {
+        let result = answer_pause("submit_research_plan", "reject", Some("not now")).await;
+        assert!(result.contains("denied by the user: not now"), "{result}");
+    }
+
+    /// An always-ask tool is a question for the user, so an unattended run
+    /// whose `tool_allow` names it still cannot answer it for them.
+    #[tokio::test]
+    async fn an_unattended_run_cannot_answer_an_always_ask_tool() {
+        let (mut agent_loop, hitl) = test_loop().await;
+        agent_loop.hitl_auto_reject = true;
+        agent_loop.tool_allow = Some(["submit_research_plan".to_string()].into_iter().collect());
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let sink = dashmap::DashMap::new();
+        let result = agent_loop
+            .execute_one_tool_call(
+                "sess-1",
+                "tc-1".to_string(),
+                "submit_research_plan".to_string(),
+                json!({}),
+                &[],
+                Arc::new(Semaphore::new(1)),
+                &tx,
+                &sink,
+            )
+            .await;
+        assert!(result.contains("requires human approval"), "{result}");
+        assert!(hitl.lock().await.get_pending_approvals("sess-1").is_empty());
     }
 
     /// #1 regression: a mid-stream transient-error delta (`error_type ==

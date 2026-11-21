@@ -1,5 +1,7 @@
 import type { PendingApproval } from '@/lib/types';
 import { useApprovalStore } from '@/stores/approvalStore';
+import { RESEARCH_PLAN_TOOL } from '@/lib/research';
+import { ResearchPlanPrompt } from './ResearchPlanPrompt';
 
 /** A human-readable preview of the tool call's arguments: the command for a
     shell call, otherwise the arguments as JSON. */
@@ -30,6 +32,13 @@ export function ApprovalPrompt({
   /** Inline in its chat (card chrome) rather than inside a dialog. */
   inline?: boolean;
 }) {
+  if (approval.tool_name === RESEARCH_PLAN_TOOL) {
+    return <ResearchPlanPrompt approval={approval} inline={inline} />;
+  }
+  return <ToolApprovalPrompt approval={approval} inline={inline} />;
+}
+
+function ToolApprovalPrompt({ approval, inline }: { approval: PendingApproval; inline: boolean }) {
   const answer = useApprovalStore((s) => s.answer);
   const busy = useApprovalStore((s) => s.answering.includes(approval.action_id));
   const preview = previewArgs(approval.tool_args);

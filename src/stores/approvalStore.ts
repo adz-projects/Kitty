@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { ipc, onApprovalResolved, onPendingApproval } from '@/lib/ipc';
 import type { PendingApproval } from '@/lib/types';
 
-export type ApprovalDecision = 'allow' | 'always_allow' | 'reject';
+export type ApprovalDecision = 'allow' | 'always_allow' | 'reject' | 'revise';
 
 /** Add `a`, or replace the entry with its action id. Pure. */
 export function upsertApproval(list: PendingApproval[], a: PendingApproval): PendingApproval[] {
@@ -35,7 +35,7 @@ interface ApprovalState {
   refresh: () => Promise<void>;
   /** Resolves whether the answer reached the engine; on failure the
       approval stays so it can be answered again. */
-  answer: (actionId: string, decision: ApprovalDecision) => Promise<boolean>;
+  answer: (actionId: string, decision: ApprovalDecision, message?: string) => Promise<boolean>;
 }
 
 let subscribed = false;
@@ -68,11 +68,11 @@ export const useApprovalStore = create<ApprovalState>((set, get) => ({
     }
   },
 
-  answer: async (actionId, decision) => {
+  answer: async (actionId, decision, message) => {
     if (get().answering.includes(actionId)) return false;
     set((s) => ({ answering: [...s.answering, actionId], error: null }));
     try {
-      await ipc.answerApproval(actionId, decision);
+      await ipc.answerApproval(actionId, decision, message);
       set((s) => ({
         pending: s.pending.filter((a) => a.action_id !== actionId),
         answering: s.answering.filter((id) => id !== actionId),

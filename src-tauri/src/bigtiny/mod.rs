@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod memorabilia;
 pub mod pathway;
 pub mod providers;
+pub mod research;
 pub mod sessions;
 pub mod specialists;
 pub mod stream;

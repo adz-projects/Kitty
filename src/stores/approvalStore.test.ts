@@ -45,7 +45,7 @@ describe('approvalStore.answer', () => {
     vi.mocked(ipc.answerApproval).mockResolvedValue(undefined);
 
     expect(await useApprovalStore.getState().answer('a', 'allow')).toBe(true);
-    expect(ipc.answerApproval).toHaveBeenCalledWith('a', 'allow');
+    expect(ipc.answerApproval).toHaveBeenCalledWith('a', 'allow', undefined);
     expect(useApprovalStore.getState().pending).toEqual([]);
   });
 

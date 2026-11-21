@@ -1564,6 +1564,65 @@ button:disabled {
   gap: 8px;
   flex-wrap: wrap;
 }
+/* A deep research plan awaiting approval (ResearchPlanPrompt). */
+.research-plan-body {
+  max-height: 22rem;
+  overflow: auto;
+  padding: 4px 8px;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+}
+.research-plan-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.research-plan-notes textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+}
+/* A deep research run's progress, above the composer (ResearchProgressCard). */
+.research-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px auto;
+  width: 100%;
+  max-width: var(--reading-max-width, 44rem);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.research-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.research-card-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 0.9em;
+}
+.research-meter {
+  height: 6px;
+  border-radius: var(--radius-sm);
+  background: var(--border);
+  overflow: hidden;
+}
+.research-meter > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.research-steps {
+  margin: 0;
+  padding-left: 1.2em;
+  font-size: 0.9em;
+}
 /* A line under a reply about how it was produced (failover, step limit). */
 /* A label above a popover's items. */
 .popover-heading {

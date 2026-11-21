@@ -767,6 +767,10 @@ pub struct ApproveRequest {
     /// call to the tool, as before.
     #[serde(default)]
     pub args_pattern: Option<String>,
+    /// The user's own words, passed to the model as the call's result: what
+    /// to change with `revise` (required), why with `reject` (optional).
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 pub async fn approve_action(
@@ -797,6 +801,15 @@ pub async fn approve_action(
         }
     }
 
+    if body.decision == "revise"
+        && body.message.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "revise needs a message saying what to change",
+        );
+    }
+
     // A pattern that doesn't compile would silently fall back to substring
     // matching (`HITLManager::match_rule`), which is not what the caller
     // asked for. Refuse it before recording anything.
@@ -820,7 +833,7 @@ pub async fn approve_action(
     // every concurrent tool call's HITL check behind a DB write.
     let (decision, rule_to_persist) = {
         let mut hitl = state.agent.hitl().lock().await;
-        hitl.record_decision(&body.action_id, &body.decision)
+        hitl.record_decision(&body.action_id, &body.decision, body.message.as_deref())
     };
     state.agent.resolve_approval(&body.action_id);
     if let Some(tool_name) = rule_to_persist {

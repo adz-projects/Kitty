@@ -13,6 +13,25 @@ use crate::storage::hitl_rules;
 /// Maximum age of a pending approval before it's swept stale.
 const MAX_PENDING_AGE: Duration = Duration::from_secs(3600);
 
+/// Tools whose every call goes to a person, whatever the rules, patterns, app
+/// policy or a delegate's `tool_allow` say: the call *is* a question for the
+/// user. `submit_research_plan` asks them to approve, revise or reject a
+/// research plan (`crate::research`).
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["submit_research_plan"];
+
+/// How long an always-ask call waits for its answer. Longer than an ordinary
+/// approval: it is a deliberate checkpoint, not an interruption, and a plan
+/// left for the evening should still be there in the morning.
+pub const ALWAYS_ASK_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
+/// Longest user message passed on with a decision.
+const MAX_MESSAGE_CHARS: usize = 4000;
+
+/// Whether every call to `tool_name` must be put to the user.
+pub fn is_always_ask(tool_name: &str, config: &HITLConfig) -> bool {
+    ALWAYS_ASK_TOOLS.contains(&tool_name) || config.always_ask_tools.iter().any(|t| t == tool_name)
+}
+
 /// Compiled-regex cache for HITL rule `args_pattern`s. `match_rule` runs once
 /// per tool call, so compiling a pattern from scratch on every invocation (the
 /// old code) turned a tiny string compare into a full regex parse each time.
@@ -39,6 +58,9 @@ pub struct PendingAction {
     /// was "seconds since this action was created", not a real date. The
     /// UI (`GET /api/chat/{id}/pending`) renders that as a garbage date.
     pub created_at_utc: chrono::DateTime<Utc>,
+    /// How long this action may wait before the sweep drops it: the waiter's
+    /// own timeout, so a long checkpoint is not swept out from under it.
+    pub max_age: Duration,
 }
 
 impl PendingAction {
@@ -88,7 +110,8 @@ pub struct HITLManager {
     pub config: HITLConfig,
     pending: HashMap<String, PendingAction>,
     session_pending: HashMap<String, Vec<String>>,
-    decisions: HashMap<String, (String, Instant)>,
+    /// A recorded answer: the decision, the user's message, when.
+    decisions: HashMap<String, (String, Option<String>, Instant)>,
 }
 
 impl HITLManager {
@@ -112,7 +135,7 @@ impl HITLManager {
         let stale_pending: Vec<String> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.created_at.elapsed() > MAX_PENDING_AGE)
+            .filter(|(_, p)| p.created_at.elapsed() > p.max_age.max(MAX_PENDING_AGE))
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -130,7 +153,7 @@ impl HITLManager {
         let stale_decisions: Vec<String> = self
             .decisions
             .iter()
-            .filter(|(_, (_, ts))| ts.elapsed() > MAX_PENDING_AGE)
+            .filter(|(_, (_, _, ts))| ts.elapsed() > MAX_PENDING_AGE)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -192,6 +215,20 @@ impl HITLManager {
                     from_default_policy: false,
                 };
             }
+        }
+
+        // A tool whose call is itself a question for the user. Ahead of the
+        // allow patterns and stored rules on purpose: an "always allow" saved
+        // against it would silently answer the question. Not marked
+        // `from_default_policy`, so neither the app's auto-approval nor a
+        // delegate's `tool_allow` can answer it either.
+        if is_always_ask(tool_name, &self.config) {
+            let decision =
+                self.create_pending(session_id, tool_name, args, "asks for your decision");
+            if let Some(id) = decision.pending_action_id.as_deref() {
+                self.set_pending_max_age(id, ALWAYS_ASK_TIMEOUT);
+            }
+            return decision;
         }
 
         // Check always-allow patterns.
@@ -314,6 +351,7 @@ impl HITLManager {
             tool_args: args.clone(),
             created_at: Instant::now(),
             created_at_utc: Utc::now(),
+            max_age: MAX_PENDING_AGE,
         };
         self.pending.insert(action_id.clone(), pending);
         self.session_pending
@@ -336,10 +374,14 @@ impl HITLManager {
     /// serializes behind a storage round-trip). Returns the decision plus the
     /// `always_allow` rule to persist, so the caller can perform that one
     /// async side-effect OUTSIDE the lock.
+    ///
+    /// `message` is the user's own words, passed on to the model: what to
+    /// change for `revise`, optionally why for `reject`.
     pub fn record_decision(
         &mut self,
         action_id: &str,
         decision: &str,
+        message: Option<&str>,
     ) -> (HITLDecision, Option<String>) {
         let pending = match self.pending.remove(action_id) {
             Some(p) => p,
@@ -363,9 +405,13 @@ impl HITLManager {
             }
         }
 
+        let message = message
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| m.chars().take(MAX_MESSAGE_CHARS).collect::<String>());
         self.decisions.insert(
             action_id.to_string(),
-            (decision.to_string(), Instant::now()),
+            (decision.to_string(), message.clone(), Instant::now()),
         );
 
         match decision {
@@ -387,6 +433,17 @@ impl HITLManager {
                 },
                 Some(pending.tool_name),
             ),
+            // Not run: the user's message goes back to the model as the
+            // call's result, so it can change the call and ask again.
+            "revise" => (
+                HITLDecision {
+                    action: "revise".to_string(),
+                    reason: message,
+                    pending_action_id: None,
+                    from_default_policy: false,
+                },
+                None,
+            ),
             "allow" | "proceed" => (
                 HITLDecision {
                     action: "proceed".to_string(),
@@ -403,7 +460,7 @@ impl HITLManager {
                     action: "rejected".to_string(),
                     reason: Some(format!(
                         "Unknown decision '{other}' — expected one of \
-                         allow/proceed/always_allow/reject"
+                         allow/proceed/always_allow/reject/revise"
                     )),
                     pending_action_id: None,
                     from_default_policy: false,
@@ -431,11 +488,19 @@ impl HITLManager {
         }
     }
 
-    /// Consume the resolved decision for an action.
-    pub fn pop_decision(&mut self, action_id: &str) -> Option<String> {
+    /// Consume the resolved decision for an action, with the user's message.
+    pub fn pop_decision(&mut self, action_id: &str) -> Option<(String, Option<String>)> {
         self.decisions
             .remove(action_id)
-            .map(|(decision, _)| decision)
+            .map(|(decision, message, _)| (decision, message))
+    }
+
+    /// Let a pending action wait longer than the default before the sweep
+    /// drops it: the waiter's own timeout.
+    pub fn set_pending_max_age(&mut self, action_id: &str, max_age: Duration) {
+        if let Some(p) = self.pending.get_mut(action_id) {
+            p.max_age = max_age;
+        }
     }
 
     /// Get pending approvals for a session.
@@ -567,6 +632,7 @@ mod tests {
             tool_args: json!({"path": "/test.txt"}),
             created_at: Instant::now(),
             created_at_utc: Utc::now(),
+            max_age: MAX_PENDING_AGE,
         };
         let dict = action.to_dict();
         assert_eq!(
@@ -742,6 +808,7 @@ mod tests {
             tool_args: json!({}),
             created_at,
             created_at_utc: Utc::now(),
+            max_age: MAX_PENDING_AGE,
         }
     }
 
@@ -799,7 +866,7 @@ mod tests {
         let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
         let action_id = decision.pending_action_id.unwrap();
 
-        let (outcome, rule) = mgr.record_decision(&action_id, "definitely-not-a-decision");
+        let (outcome, rule) = mgr.record_decision(&action_id, "definitely-not-a-decision", None);
         assert_eq!(outcome.action, "rejected");
         assert!(
             outcome
@@ -815,12 +882,12 @@ mod tests {
         // The explicit approvals still map the way the route relies on.
         let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
         let action_id = decision.pending_action_id.unwrap();
-        let (outcome, _) = mgr.record_decision(&action_id, "allow");
+        let (outcome, _) = mgr.record_decision(&action_id, "allow", None);
         assert_eq!(outcome.action, "proceed");
 
         let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
         let action_id = decision.pending_action_id.unwrap();
-        let (outcome, rule) = mgr.record_decision(&action_id, "always_allow");
+        let (outcome, rule) = mgr.record_decision(&action_id, "always_allow", None);
         assert_eq!(outcome.action, "always_allow");
         assert_eq!(rule.as_deref(), Some("tool"));
     }
@@ -834,11 +901,66 @@ mod tests {
         let action_id = decision.pending_action_id.unwrap();
         // A decision that raced in just before the timeout fired.
         mgr.decisions
-            .insert(action_id.clone(), ("allow".to_string(), Instant::now()));
+            .insert(action_id.clone(), ("allow".to_string(), None, Instant::now()));
 
         mgr.remove_pending(&action_id);
 
         assert!(mgr.get_pending_approvals("sess-1").is_empty());
         assert!(mgr.pop_decision(&action_id).is_none());
+    }
+
+    /// A plan-approval tool asks every time: a stored "always allow" and an
+    /// allow pattern must not answer for the user, and the decision is never
+    /// the default policy's, so no auto-approval can take it either.
+    #[tokio::test]
+    async fn an_always_ask_tool_beats_allow_rules_and_patterns() {
+        let mut mgr = test_manager().await;
+        mgr.config.always_allow_patterns = vec!["submit".into()];
+        let rules = vec![rule_row(None, "always_allow")];
+        let d = mgr.check_tool_call_with_rules("sess-1", "submit_research_plan", &json!({}), &rules);
+        assert_eq!(d.action, "needs_approval");
+        assert!(!d.from_default_policy);
+        let id = d.pending_action_id.unwrap();
+        let pending = mgr.get_pending_approvals("sess-1");
+        assert_eq!(pending[0].max_age, ALWAYS_ASK_TIMEOUT);
+        assert_eq!(pending[0].action_id, id);
+    }
+
+    #[tokio::test]
+    async fn configured_always_ask_tools_are_honoured() {
+        let mut mgr = test_manager().await;
+        mgr.config.default_policy = "auto_allow".into();
+        mgr.config.always_ask_tools = vec!["deploy".into()];
+        let d = mgr.check_tool_call_with_rules("s", "deploy", &json!({}), &[]);
+        assert_eq!(d.action, "needs_approval");
+        let d = mgr.check_tool_call_with_rules("s", "deploy_preview", &json!({}), &[]);
+        assert_eq!(d.action, "proceed", "exact names only");
+    }
+
+    #[tokio::test]
+    async fn a_revise_keeps_the_users_message_for_the_waiter() {
+        let mut mgr = test_manager().await;
+        let id = mgr
+            .create_pending("sess-1", "submit_research_plan", &json!({}), "t")
+            .pending_action_id
+            .unwrap();
+        let (d, rule) = mgr.record_decision(&id, "revise", Some("  add radio drama "));
+        assert_eq!(d.action, "revise");
+        assert!(rule.is_none());
+        assert_eq!(
+            mgr.pop_decision(&id),
+            Some(("revise".to_string(), Some("add radio drama".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_checkpoint_outlives_the_ordinary_sweep() {
+        let mut mgr = test_manager().await;
+        let mut old = pending_at("a1", "s", Instant::now() - Duration::from_secs(7200));
+        old.max_age = ALWAYS_ASK_TIMEOUT;
+        mgr.pending.insert("a1".into(), old);
+        mgr.session_pending.insert("s".into(), vec!["a1".into()]);
+        mgr.sweep_stale_now();
+        assert_eq!(mgr.get_pending_approvals("s").len(), 1);
     }
 }

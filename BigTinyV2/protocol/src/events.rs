@@ -26,6 +26,12 @@ pub enum SSEEventType {
     /// `content` the outcome (`started` | `finished` | `failed` |
     /// `denied_by_timeout`).
     ScheduleRun,
+    /// A deep research run moved on (2.8.0). App stream and the run's chat.
+    /// `research_id` names the run, `session_id` its chat, `content` its
+    /// status (`planning` | `researching` | `critiquing` | `writing` | `done`
+    /// | `failed` | `cancelled`), and `tool_args` the detail: turn, wave,
+    /// budget, counts, coverage, tokens, and the step sessions.
+    ResearchProgress,
 }
 
 /// Wire-format event pushed over SSE from the agent loop to the frontend.
@@ -103,6 +109,9 @@ pub struct SSEEvent {
     /// On `ScheduleRun`: the schedule this run belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_id: Option<String>,
+    /// On `ResearchProgress`: the research run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -175,6 +184,7 @@ impl Default for SSEEvent {
             reason: None,
             from_provider_id: None,
             schedule_id: None,
+            research_id: None,
         }
     }
 }

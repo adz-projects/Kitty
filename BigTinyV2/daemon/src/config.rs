@@ -700,6 +700,10 @@ pub struct HITLConfig {
     pub always_allow_patterns: Vec<String>,
     #[serde(default = "default_auto_reject_patterns")]
     pub auto_reject_patterns: Vec<String>,
+    /// Tools every call of which is put to the user, beyond the built-in
+    /// `hitl::manager::ALWAYS_ASK_TOOLS`. Exact tool names.
+    #[serde(default)]
+    pub always_ask_tools: Vec<String>,
 }
 
 fn default_hitl_policy() -> String {
@@ -721,6 +725,7 @@ impl Default for HITLConfig {
             default_policy: default_hitl_policy(),
             always_allow_patterns: vec![],
             auto_reject_patterns: default_auto_reject_patterns(),
+            always_ask_tools: vec![],
         }
     }
 }

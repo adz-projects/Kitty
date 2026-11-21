@@ -247,6 +247,7 @@ const REGISTERED_BUILTINS: &[&str] = &[
     "pathway",
     "memorabilia",
     "specialists",
+    "research",
     "kitty-wasm",
     "kitty-tools",
     "kitty-web",
@@ -499,6 +500,32 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
             // not go through MCP and is bounded by those deadlines alone.)
             timeout_s: Some((specialist_timeout_secs * SPECIALIST_FAN_OUT_WAVES + 30) as i64),
             enabled: specialists_enabled,
+        },
+    )
+    .await;
+
+    // `research` is the daemon's deep research ledger server
+    // (`BigTinyV2/daemon/src/research/server.rs`): `submit_research_plan` for
+    // a run's turn 0 and the wave planner's `research_view` / `research_record`
+    // / `research_set_frontier`. In-process like `specialists`, and always on:
+    // the daemon withholds every one of its tools from a session that has no
+    // research role, so registering it offers ordinary chats nothing.
+    upsert_builtin(
+        &client,
+        &mut report,
+        "research",
+        &McpServerSpec {
+            name: "research".to_string(),
+            transport: "in_process".to_string(),
+            command: Some("research".to_string()),
+            args: vec![],
+            url: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            // Plan approval waits on the person, not on this call: the call
+            // runs only after they answer. Ledger writes are quick.
+            timeout_s: Some(60),
+            enabled: true,
         },
     )
     .await;
@@ -917,13 +944,14 @@ mod tests {
     /// the daemon crate on desktop — it talks to it over HTTP. The Android
     /// target does link it, and asserts against the real thing below, so this
     /// mirror cannot rot silently in both places at once.
-    const DAEMON_BUILTIN_SERVERS: [&str; 6] = [
+    const DAEMON_BUILTIN_SERVERS: [&str; 7] = [
         "kitty-tools",
         "kitty-web",
         "kitty-wasm",
         "pathway",
         "memorabilia",
         "specialists",
+        "research",
     ];
 
     #[test]

@@ -121,6 +121,19 @@ pub async fn connect(
             })
             .await
         }
+        "research" => {
+            // Deep research's ledger tools (`crate::research::server`). Like
+            // `specialists` it reaches back into the daemon, for the pool; the
+            // orchestrator only sizes the frontier, so a host without one
+            // still connects.
+            MCPServerClient::connect_in_process(server_id, |stream| async move {
+                let server = crate::research::server::ResearchServer::new(pool, orchestrator);
+                if let Err(e) = server.serve_in_process(stream).await {
+                    tracing::error!("research in-process server exited with error: {e}");
+                }
+            })
+            .await
+        }
         "kitty-tools" => {
             let config = kitty_tools::InProcessConfig::from_map(&env);
             MCPServerClient::connect_in_process(server_id, |stream| async move {
@@ -174,13 +187,14 @@ fn env_map(env: Option<&serde_json::Value>) -> HashMap<String, String> {
 
 /// Every registered built-in name, for callers that want to validate a
 /// configured name before attempting a connect.
-pub const BUILTIN_SERVERS: [&str; 6] = [
+pub const BUILTIN_SERVERS: [&str; 7] = [
     "kitty-tools",
     "kitty-web",
     "kitty-wasm",
     "pathway",
     "memorabilia",
     "specialists",
+    "research",
 ];
 
 /// Tool names owned by the `pathway` server, which need the executing

@@ -223,6 +223,29 @@ engine-managed) and why mixing them is a bug.
   specialist tag and the denylist. Round 1 runs in parallel, later rounds one
   speaker at a time in a random order (`debate_order`). With one model, or
   without `/debate`, the chat's model voices every persona itself.
+- **Deep research** (`bigtiny/research.rs`, `commands/research.rs`,
+  `lib/research.ts`, `ResearchPlanPrompt`, `ResearchProgressCard`; engine
+  `BigTinyV2/daemon/src/research/`). A message starting
+  `/deepresearch [turns=N]` runs a brief to a sourced deliverable over N
+  turns (default 4). Turn 0 drafts a plan: deliverable, outline, coverage
+  cells, first questions, budget. The plan is put to the user through the
+  approval system (`submit_research_plan` is an always-ask tool), with
+  Approve, Revise and Reject, where Revise sends the user's words back to the
+  model.
+
+  The engine then drives the run in the background:
+  - **Waves:** a planner on a fresh session reads a projection of an
+    append-only ledger. It records leads read out of the findings, at least
+    one a productive tangent, and sets a frontier. The frontier's tasks run
+    as parallel `researcher`, `summarizer` and `analyst` delegates. `analyst`
+    is used here even though Kitty retires it from chats.
+  - **Critique:** an adversarial pass, on a second model when one is
+    eligible, whose gaps get one targeted search.
+  - **Write-up:** written section by section and citation-checked. The
+    report lands in the chat and in `outputs/`.
+
+  The card above the composer shows the phase, coverage and Stop. No local
+  compute, and memorabilia is not involved.
 - **Scheduled tasks** (`commands/scheduled_tasks.rs` over `/api/schedules`,
   `components/settings/ScheduledTasks.tsx`) — instructions the engine runs
   later, once or on an interval, on a chosen provider card with its system

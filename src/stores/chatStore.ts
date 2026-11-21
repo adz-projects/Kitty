@@ -286,7 +286,10 @@ interface ChatState {
   ) => Promise<void>;
   reloadCurrent: () => Promise<void>;
   /** `debate`: the turn was sent with `/debate` (`bigtiny::debate`). */
-  send: (text: string, opts?: { debate?: boolean }) => Promise<void>;
+  send: (
+    text: string,
+    opts?: { debate?: boolean; research?: { maxTurns: number | null } }
+  ) => Promise<void>;
   cancel: () => Promise<void>;
   /** Hard-reset a stuck turn the user chose to force-stop (Round-5): clears
       `busy`, ends the in-flight message, and abandons the turn so late events
@@ -848,7 +851,9 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       attachments: Attachment[];
       pendingImages: PendingImage[];
     },
-    debate = false
+    debate = false,
+    /** `/deepresearch`: start a research run with this turn as its turn 0. */
+    research?: { maxTurns: number | null }
   ): Promise<boolean> => {
     const trimmed = text;
     // Captured before ANY await — see the note above. This is also what makes
@@ -945,6 +950,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           kind: 'image' as const,
         })),
         ...(debate ? [{ name: 'Debate brief', kind: 'debate' as const }] : []),
+        ...(research ? [{ name: 'Deep research instructions', kind: 'document' as const }] : []),
       ];
 
       const userMsg: Message = {
@@ -1000,7 +1006,15 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       lastSentProvider = get().providerName;
       lastSentModel = get().model;
       submitted = true;
-      await ipc.sendPrompt(sessionId, trimmed, images, attachedPaths, documents, debate);
+      await ipc.sendPrompt(
+        sessionId,
+        trimmed,
+        images,
+        attachedPaths,
+        documents,
+        debate,
+        research ? { max_turns: research.maxTurns } : undefined
+      );
       // A turn that carried attachments just widened the session's grant set
       // daemon-side. Re-read it now, before the model's first tool call, or
       // the approval check still judges those files against chat_dir/cwd
@@ -2036,9 +2050,15 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       }
     },
 
-    send: async (text: string, opts?: { debate?: boolean }) => {
+    send: async (
+      text: string,
+      opts?: { debate?: boolean; research?: { maxTurns: number | null } }
+    ) => {
       const trimmed = text.trim();
       const debate = opts?.debate ?? false;
+      const research = opts?.research;
+      // A research run needs a brief to plan from.
+      if (research && !trimmed) return;
       // `/debate` alone is a request too: the brief says what to do.
       if (sendInFlight || get().busy || !(debate || hasSomethingToSend(trimmed, get()))) {
         return;
@@ -2049,7 +2069,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // and enqueue two prompts.
       sendInFlight = true;
       try {
-        await doSend(trimmed, undefined, debate);
+        await doSend(trimmed, undefined, debate, research);
       } finally {
         sendInFlight = false;
       }
