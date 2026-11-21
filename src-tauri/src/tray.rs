@@ -1,63 +1,21 @@
 //! System tray icon + menu — the app's persistent visible presence.
-//! Menu: Toggle Overlay, Open Chat Window, New Session, Ask about clipboard,
-//! Open Settings, Quit.
+//! Menu: Toggle Overlay, New Window, Settings, Quit.
 //! Left-click also toggles the overlay (or focuses the main window if it's open).
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
-use crate::{hotkey, windows};
+use crate::windows;
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle_overlay", "Toggle Overlay", true, None::<&str>)?;
-    // Opens the full chat window directly — no overlay involved at all (owner
-    // ask: a way to reach the chat window without summoning the overlay first).
-    let open_main = MenuItem::with_id(app, "open_main", "Open Chat Window", true, None::<&str>)?;
-    // Always creates a brand-new chat window with its own fresh session
-    // (Feature 5), unlike "Open Chat Window" above which reuses the one
-    // classic singleton window — left as-is on purpose (see `windows.rs`'s
-    // `open_new_chat_window` doc comment).
-    let new_chat_window = MenuItem::with_id(
-        app,
-        "new_chat_window",
-        "New Chat Window",
-        true,
-        None::<&str>,
-    )?;
-    let new_session = MenuItem::with_id(app, "new_session", "New Session", true, None::<&str>)?;
-    let ask_clipboard = MenuItem::with_id(
-        app,
-        "ask_clipboard",
-        "Ask about clipboard",
-        true,
-        None::<&str>,
-    )?;
-    let scheduled_tasks = MenuItem::with_id(
-        app,
-        "scheduled_tasks",
-        "Scheduled Tasks…",
-        true,
-        None::<&str>,
-    )?;
-    let settings = MenuItem::with_id(app, "open_settings", "Open Settings", true, None::<&str>)?;
+    // A new chat window with its own fresh chat.
+    let new_window = MenuItem::with_id(app, "new_window", "New Window", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "open_settings", "Settings", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &toggle,
-            &open_main,
-            &new_chat_window,
-            &new_session,
-            &ask_clipboard,
-            &scheduled_tasks,
-            &sep,
-            &settings,
-            &sep,
-            &quit,
-        ],
-    )?;
+    let menu = Menu::with_items(app, &[&toggle, &new_window, &settings, &sep, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("Kitty")
@@ -67,22 +25,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             "toggle_overlay" => {
                 let _ = windows::toggle_or_focus_main(app);
             }
-            "open_main" => {
-                let _ = windows::open_main(app);
-            }
-            "new_chat_window" => {
+            "new_window" => {
                 let _ = windows::open_new_chat_window(app, None);
-            }
-            "new_session" => {
-                let _ = windows::show_overlay(app);
-                // Ask the overlay to start a fresh session.
-                let _ = app.emit("session://new", ());
-            }
-            "ask_clipboard" => {
-                hotkey::attach_clipboard(app);
-            }
-            "scheduled_tasks" => {
-                let _ = windows::open_settings(app, Some("scheduled_tasks".to_string()), None);
             }
             "open_settings" => {
                 let _ = windows::open_settings(app, None, None);

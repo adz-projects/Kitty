@@ -177,7 +177,7 @@ fn report_failures(app: &AppHandle, errors: Vec<String>) {
 }
 
 /// Summon the overlay with the current clipboard pre-attached (Round-4
-/// clipboard hotkey + tray "Ask about clipboard" item): image takes priority
+/// clipboard hotkey): image takes priority
 /// over text (arboard only ever surfaces one or the other in practice).
 /// Clipboard reads happen off the main thread per the plugin's own guidance;
 /// `show_overlay` (a window op) is then dispatched back onto it.
