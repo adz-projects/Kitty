@@ -13,7 +13,9 @@
 //!   them where the model and its delegates can read them, or inlines them
 //!   when it cannot ([`GuideSource`]).
 //! - the **options** a `/critique` command line carries ([`parse_options`]).
-//! - the **playbook** ([`playbook`]), the brief the app adds to the turn.
+//! - the **playbook** ([`playbook`]), the brief the app adds to the turn;
+//!   [`playbook_on`] words it for another [`Surface`] (a button instead of
+//!   the slash command, plus any output format the app reads from the run).
 //!
 //! Author context (voice anchors, habits to watch) is optional input: an app
 //! with a behavioural-memory engine may fill it from there, one without
@@ -326,12 +328,35 @@ fn guide_ref(source: &GuideSource, file: &str) -> String {
     }
 }
 
-const INTRO: &str = "\
-You are the editor for a writing critique the user started with /critique. You read the draft, \
-agree a brief with the user, have the critique's lenses applied, decide what matters most, and \
-write the editorial memo. You diagnose and direct; you never rewrite the draft as a whole.";
+/// Where the critique runs: how the user started it, how they confirm the
+/// brief, and anything the app adds to the run. Kitty's chat is
+/// [`SLASH_COMMAND`]; an app with buttons (Bacon's partner pane) words its
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Surface<'a> {
+    /// Completes "a writing critique the user started …" (no full stop).
+    pub started: &'a str,
+    /// The line the brief ends with: how the user runs the critique.
+    pub go_line: &'a str,
+    /// Extra instructions for the run (an output format the app reads, say),
+    /// placed after the memo's shape.
+    pub run_extra: Option<&'a str>,
+}
 
-const BRIEF_TURN: &str = "\
+/// The `/critique` command in a chat: what [`playbook`] uses.
+pub const SLASH_COMMAND: Surface<'static> = Surface {
+    started: "with /critique",
+    go_line: "Reply **go** to run the critique, or correct anything above.",
+    run_extra: None,
+};
+
+/// The intro after its first sentence (which names the [`Surface`]).
+const INTRO_TAIL: &str = "\
+You read the draft, agree a brief with the user, have the critique's lenses applied, decide what \
+matters most, and write the editorial memo. You diagnose and direct; you never rewrite the draft as \
+a whole.";
+
+const BRIEF_TURN_HEAD: &str = "\
 ## This turn: the brief
 
 1. Read the whole draft.
@@ -354,8 +379,11 @@ choose from the menu below.
 **Fact-check:** on or off
 **Sketches:** on or off
 
-End with: \"Reply **go** to run the critique, or correct anything above.\" Do not begin the \
-critique in this turn. If there is no draft to read, ask the user for it instead.";
+End with: \"";
+
+/// What follows the [`Surface::go_line`] in the brief turn.
+const BRIEF_TURN_TAIL: &str = "\" Do not begin the critique in this turn. If there is no draft to \
+read, ask the user for it instead.";
 
 const LENS_RULES: &str = "\
 Which lenses run:
@@ -408,10 +436,19 @@ A table: claim, location, verdict, source, and what the source actually says.
 
 /// The brief the app adds to a `/critique` turn.
 pub fn playbook(input: &PlaybookInput) -> String {
+    playbook_on(input, &SLASH_COMMAND)
+}
+
+/// The brief for a critique started on `surface`.
+pub fn playbook_on(input: &PlaybookInput, surface: &Surface) -> String {
     let opts = input.options;
     let g = |file: &str| guide_ref(&input.guides, file);
     let mut out = String::new();
-    out.push_str(INTRO);
+    let _ = write!(
+        out,
+        "You are the editor for a writing critique the user started {}. {INTRO_TAIL}",
+        surface.started
+    );
     out.push_str("\n\n");
 
     let _ = writeln!(
@@ -450,7 +487,9 @@ pub fn playbook(input: &PlaybookInput) -> String {
     let _ = writeln!(out, "- sketches: {}", g(SKETCHES.file));
 
     out.push('\n');
-    out.push_str(BRIEF_TURN);
+    out.push_str(BRIEF_TURN_HEAD);
+    out.push_str(surface.go_line);
+    out.push_str(BRIEF_TURN_TAIL);
     out.push_str("\n\n## Next turn: the run\n\n");
     out.push_str(
         "When the user answers the brief, apply their corrections and run the critique in that \
@@ -542,6 +581,11 @@ pub fn playbook(input: &PlaybookInput) -> String {
     out.push_str("\n\n");
     out.push_str(MEMO);
     out.push('\n');
+    if let Some(extra) = surface.run_extra.map(str::trim).filter(|e| !e.is_empty()) {
+        out.push('\n');
+        out.push_str(extra);
+        out.push('\n');
+    }
     if let Some(dir) = input.outputs_dir {
         let _ = writeln!(
             out,
@@ -695,6 +739,33 @@ mod tests {
             !text.contains("<guide file=\"op-ed.md\">"),
             "a known genre inlines its own pack only"
         );
+    }
+
+    #[test]
+    fn a_surface_words_the_start_and_the_go_line_and_adds_to_the_run() {
+        let i = input(Delegation::Solo, GuideSource::Inline, &[]);
+        let slash = playbook(&i);
+        assert_eq!(slash, playbook_on(&i, &SLASH_COMMAND));
+        assert!(slash.contains("the user started with /critique. You read the draft"));
+        assert!(slash.contains(
+            "End with: \"Reply **go** to run the critique, or correct anything above.\" Do not \
+             begin the critique in this turn."
+        ));
+
+        let button = Surface {
+            started: "with the Critique button",
+            go_line: "Press **Run critique** to run it.",
+            run_extra: Some("  EXTRA RULES  "),
+        };
+        let text = playbook_on(&i, &button);
+        assert!(text.contains("the user started with the Critique button. You read"));
+        assert!(text.contains("End with: \"Press **Run critique** to run it.\" Do not begin"));
+        assert!(!text.contains("/critique"));
+        assert!(!text.contains("Reply **go**"));
+        let memo = text.find("## If you have time").unwrap();
+        let extra = text.find("\nEXTRA RULES\n").unwrap();
+        assert!(memo < extra, "the app's run rules follow the memo's shape");
+        assert!(!slash.contains("EXTRA RULES"));
     }
 
     #[test]
