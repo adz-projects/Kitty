@@ -34,6 +34,19 @@ pub fn is_debate_turn(stored: &str) -> bool {
     ))
 }
 
+/// Label of the editor's playbook a `/critique` turn carries as an inline
+/// document (`bigtiny::critique`). Shown as a "critique" chip on replay.
+pub const CRITIQUE_LABEL: &str = "Critique playbook";
+
+/// Whether a stored user turn was sent with `/critique`.
+pub fn is_critique_turn(stored: &str) -> bool {
+    stored.contains(&format!(
+        "{}
+",
+        doc_open(CRITIQUE_LABEL, false)
+    ))
+}
+
 /// A document pasted or dropped into a turn and sent inline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineDocument {
@@ -57,7 +70,7 @@ pub const PINNED_TOKEN: &str = "[remember]";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttachmentChip {
     pub name: String,
-    /// `file`, `document`, `image` or `debate`.
+    /// `file`, `document`, `image`, `debate` or `critique`.
     pub kind: &'static str,
     /// Marked "Remember this" by the user (shown pinned on replay).
     #[serde(default)]
@@ -126,10 +139,10 @@ pub fn parse(stored: &str) -> ParsedTurn {
         let close = format!("\n{}", doc_close(label));
         match after_open.find(&close) {
             Some(end) => {
-                let kind = if label == DEBATE_LABEL {
-                    "debate"
-                } else {
-                    "document"
+                let kind = match label {
+                    DEBATE_LABEL => "debate",
+                    CRITIQUE_LABEL => "critique",
+                    _ => "document",
                 };
                 attachments.push(AttachmentChip {
                     name: label.to_string(),
@@ -300,6 +313,20 @@ panel",
         let kinds: Vec<&str> = parsed.attachments.iter().map(|a| a.kind).collect();
         assert_eq!(kinds, ["document", "debate"]);
         assert!(!is_debate_turn(&compose("q", &[doc("a", "b")], &[])));
+    }
+
+    #[test]
+    fn a_critique_playbook_round_trips_as_a_critique_chip() {
+        let docs = [
+            doc("op-ed.md", "the draft"),
+            doc(CRITIQUE_LABEL, "the playbook"),
+        ];
+        let sent = compose("genre=op-ed", &docs, &[]);
+        assert!(is_critique_turn(&sent));
+        assert!(!is_debate_turn(&sent));
+        let kinds: Vec<&str> = parse(&sent).attachments.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, ["document", "critique"]);
+        assert!(!is_critique_turn(&compose("q", &[doc("a", "b")], &[])));
     }
 
     #[test]

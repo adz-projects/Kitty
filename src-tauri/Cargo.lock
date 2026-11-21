@@ -3743,6 +3743,7 @@ dependencies = [
  "futures-util",
  "image",
  "keyring",
+ "kitty-critique",
  "mockito",
  "notify-rust",
  "rand 0.8.6",
@@ -3772,6 +3773,10 @@ dependencies = [
  "windows-core 0.61.2",
  "winreg 0.52.0",
 ]
+
+[[package]]
+name = "kitty-critique"
+version = "1.0.0"
 
 [[package]]
 name = "kitty-doc"

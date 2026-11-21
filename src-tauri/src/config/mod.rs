@@ -359,6 +359,9 @@ pub struct Config {
     /// vars at spawn.
     #[serde(default)]
     pub specialists: SpecialistSettings,
+    /// `/critique` (`bigtiny::critique`).
+    #[serde(default)]
+    pub critique: CritiqueSettings,
     /// The optional decision model (`lifecycle::decider`): where it is, which
     /// of its uses are on, and any threshold overrides. Relayed to the engine
     /// per app (`/api/apps/me/decider`) and to kitty-web through its MCP row.
@@ -517,6 +520,7 @@ impl Default for Config {
             bigtiny_args: default_bigtiny_args(),
             summarizer: SummarizerSettings::default(),
             specialists: SpecialistSettings::default(),
+            critique: CritiqueSettings::default(),
             decider: DeciderSettings::default(),
             overnight: OvernightSettings::default(),
             token_management: TokenManagementSettings::default(),
@@ -865,6 +869,16 @@ pub(crate) fn backup_corrupt_config_file(path: &Path) -> Option<PathBuf> {
     } else {
         fs::copy(path, &backup).ok().map(|_| backup)
     }
+}
+
+/// `/critique` settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CritiqueSettings {
+    /// What the author says about their own writing — voice anchors to
+    /// calibrate against, habits to watch, suggestions they always reject.
+    /// Optional; sent with every critique when set.
+    #[serde(default)]
+    pub author_context: String,
 }
 
 /// Limits on delegate (specialist) runs.

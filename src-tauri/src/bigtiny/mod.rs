@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod context_window;
+pub mod critique;
 pub mod debate;
 pub mod effort;
 pub mod kitty_specialists;

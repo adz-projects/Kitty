@@ -59,6 +59,7 @@ jobs:
           - plugins/kitty-tools
           - plugins/kitty-web
           - plugins/kitty-wasm
+          - plugins/kitty-critique
           - plugins/adaptive-pathway_rust
           - plugins/memorabilia_rust
     steps:
@@ -126,6 +127,7 @@ jobs:
           - plugins/kitty-tools
           - plugins/kitty-web
           - plugins/kitty-wasm
+          - plugins/kitty-critique
           - plugins/adaptive-pathway_rust
           - plugins/memorabilia_rust
     steps:

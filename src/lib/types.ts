@@ -49,6 +49,8 @@ export interface Config {
       needed for a change here to take effect. */
   summarizer: SummarizerSettings;
   specialists: SpecialistSettings;
+  /** `/critique` (Rust `config::CritiqueSettings`). */
+  critique: { author_context: string };
   /** BigTiny context-window/compaction budget settings — relayed as
       `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn time (Rust
       `Config::token_management`, mirrors `bigtiny/config.py`'s
@@ -975,7 +977,7 @@ export interface TextDeltaEvent {
 /** `chat://user-message`: a (replayed) user turn, as typed, with the chips of
     what it carried. */
 export interface UserMessageEvent extends TextDeltaEvent {
-  attachments?: { name: string; kind: 'file' | 'document' | 'image' | 'debate' }[];
+  attachments?: { name: string; kind: 'file' | 'document' | 'image' | 'debate' | 'critique' }[];
 }
 
 export interface ToolCallEvent {

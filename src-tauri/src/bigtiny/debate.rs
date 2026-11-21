@@ -25,12 +25,65 @@ pub struct DebateTurn {
 }
 
 /// A panel host with what the moderator should know to choose between them.
-struct Seat {
-    host: PanelHost,
+/// Shared with `/critique` (`bigtiny::critique`), which arms the same panel.
+pub(crate) struct Seat {
+    pub(crate) host: PanelHost,
     /// 0–100 from the OpenRouter catalog, when it knows the model.
     capability: Option<i32>,
     /// `$`, `$$` or `$$$` by output price, likewise.
     price: Option<&'static str>,
+}
+
+impl Seat {
+    /// `name — provider / model — capability, price`, as briefs list a host.
+    pub(crate) fn label(&self) -> String {
+        let capability = self.capability.map_or_else(
+            || "capability unknown".to_string(),
+            |c| format!("capability {c}"),
+        );
+        let price = self.price.unwrap_or("price unknown");
+        format!(
+            "{} — {} / {} — {capability}, {price}",
+            self.host.name, self.host.provider_name, self.host.model
+        )
+    }
+}
+
+/// The panel's hosts, and whether this chat may delegate at all: specialists
+/// are a desktop feature, switched on globally and not off for this chat.
+pub(crate) async fn panel_seats(app: &AppHandle, session_id: &str) -> (Vec<Seat>, bool) {
+    let (seats, enabled) = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        let catalog = state.openrouter_catalog.lock().unwrap();
+        let entries = catalog
+            .as_ref()
+            .map(|c| c.entries.as_slice())
+            .unwrap_or(&[]);
+        let seats: Vec<Seat> = cfg
+            .debate_hosts()
+            .into_iter()
+            .map(|host| {
+                let entry = crate::openrouter::catalog::match_in_catalog(&host.model, entries);
+                Seat {
+                    capability: entry
+                        .and_then(|e| e.agentic_index.or(e.coding_index).or(e.intelligence_index))
+                        .map(|r| r.clamp(0.0, 100.0) as i32),
+                    price: entry.and_then(|e| e.cost_tier).map(|t| match t {
+                        crate::openrouter::catalog::CostTier::Economy => "$",
+                        crate::openrouter::catalog::CostTier::Moderate => "$$",
+                        crate::openrouter::catalog::CostTier::Premium => "$$$",
+                    }),
+                    host,
+                }
+            })
+            .collect();
+        (seats, cfg.specialists.enabled)
+    };
+    let can_delegate = cfg!(desktop)
+        && enabled
+        && !crate::bigtiny::sessions::specialists_disabled(app, session_id).await;
+    (seats, can_delegate)
 }
 
 const RULES: &str = "\
@@ -73,39 +126,8 @@ pub async fn prepare(
     documents: &[InlineDocument],
     attached_paths: &[String],
 ) -> DebateTurn {
-    let (seats, enabled) = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        let catalog = state.openrouter_catalog.lock().unwrap();
-        let entries = catalog
-            .as_ref()
-            .map(|c| c.entries.as_slice())
-            .unwrap_or(&[]);
-        let seats: Vec<Seat> = cfg
-            .debate_hosts()
-            .into_iter()
-            .map(|host| {
-                let entry = crate::openrouter::catalog::match_in_catalog(&host.model, entries);
-                Seat {
-                    capability: entry
-                        .and_then(|e| e.agentic_index.or(e.coding_index).or(e.intelligence_index))
-                        .map(|r| r.clamp(0.0, 100.0) as i32),
-                    price: entry.and_then(|e| e.cost_tier).map(|t| match t {
-                        crate::openrouter::catalog::CostTier::Economy => "$",
-                        crate::openrouter::catalog::CostTier::Moderate => "$$",
-                        crate::openrouter::catalog::CostTier::Premium => "$$$",
-                    }),
-                    host,
-                }
-            })
-            .collect();
-        (seats, cfg.specialists.enabled)
-    };
+    let (seats, can_delegate) = panel_seats(app, session_id).await;
 
-    // Specialists are a desktop feature, and a chat may have them switched off.
-    let can_delegate = cfg!(desktop)
-        && enabled
-        && !crate::bigtiny::sessions::specialists_disabled(app, session_id).await;
     if !can_delegate || seats.len() < 2 {
         return DebateTurn {
             brief: brief(SOLO.to_string()),
@@ -117,7 +139,7 @@ pub async fn prepare(
     if !documents.is_empty() {
         if let Some(dir) = chat_dir(app, session_id).await {
             for doc in documents {
-                match write_item(&dir, doc) {
+                match write_item(&dir, "debate", doc) {
                     Ok(path) => items.push(path.to_string_lossy().into_owned()),
                     Err(e) => tracing::warn!("could not save a debate item: {e}"),
                 }
@@ -144,15 +166,7 @@ fn compose_brief(seats: &[Seat], items: &[String]) -> String {
     let mut out = String::from(RULES);
     out.push_str("\n\nPanel (host — name — provider / model — capability, price):\n");
     for s in seats {
-        let capability = s.capability.map_or_else(
-            || "capability unknown".to_string(),
-            |c| format!("capability {c}"),
-        );
-        let price = s.price.unwrap_or("price unknown");
-        out.push_str(&format!(
-            "- {} — {} — {} / {} — {capability}, {price}\n",
-            s.host.id, s.host.name, s.host.provider_name, s.host.model
-        ));
+        out.push_str(&format!("- {} — {}\n", s.host.id, s.label()));
     }
     out.push_str("\nItem under debate: ");
     if items.is_empty() {
@@ -171,7 +185,7 @@ fn compose_brief(seats: &[Seat], items: &[String]) -> String {
 
 /// The chat's own folder, where a pasted draft is saved for the debaters.
 /// Delegates inherit the chat's folder grants, so they can read it there.
-async fn chat_dir(app: &AppHandle, session_id: &str) -> Option<PathBuf> {
+pub(crate) async fn chat_dir(app: &AppHandle, session_id: &str) -> Option<PathBuf> {
     let client = crate::bigtiny::client::ensure_client(app).ok()?;
     let meta = crate::bigtiny::sessions::metadata(&client, session_id).await;
     ["chat_dir", "cwd"]
@@ -181,10 +195,14 @@ async fn chat_dir(app: &AppHandle, session_id: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Save a pasted document as `<chat>/debate/<label>.md`, numbering it when
+/// Save a pasted document as `<chat>/<folder>/<label>.md`, numbering it when
 /// that name is taken by a different text.
-fn write_item(dir: &Path, doc: &InlineDocument) -> std::io::Result<PathBuf> {
-    let folder = dir.join("debate");
+pub(crate) fn write_item(
+    dir: &Path,
+    folder: &str,
+    doc: &InlineDocument,
+) -> std::io::Result<PathBuf> {
+    let folder = dir.join(folder);
     std::fs::create_dir_all(&folder)?;
     let stem = safe_stem(&doc.label);
     for n in 0..100 {
@@ -203,9 +221,7 @@ fn write_item(dir: &Path, doc: &InlineDocument) -> std::io::Result<PathBuf> {
             }
         }
     }
-    Err(std::io::Error::other(
-        "too many debate items with that name",
-    ))
+    Err(std::io::Error::other("too many items with that name"))
 }
 
 /// A file name from a document label: path separators and characters Windows
@@ -283,13 +299,13 @@ mod tests {
             content: content.into(),
             pinned: false,
         };
-        let first = write_item(&dir, &doc("one")).unwrap();
+        let first = write_item(&dir, "debate", &doc("one")).unwrap();
         assert_eq!(
-            write_item(&dir, &doc("one")).unwrap(),
+            write_item(&dir, "debate", &doc("one")).unwrap(),
             first,
             "same text, same file"
         );
-        let second = write_item(&dir, &doc("two")).unwrap();
+        let second = write_item(&dir, "debate", &doc("two")).unwrap();
         assert_ne!(first, second);
         assert!(first
             .file_name()

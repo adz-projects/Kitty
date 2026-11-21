@@ -712,19 +712,29 @@ pub async fn regenerate_last(app: &AppHandle, session_id: &str) -> Result<(), St
     if !matches!(last_role, Some("assistant" | "tool")) {
         return Err("There is no answer to regenerate yet.".to_string());
     }
-    let question = rows
+    let mut user_rows = rows
         .iter()
         .rev()
-        .find(|r| r.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .filter(|r| r.get("role").and_then(|v| v.as_str()) == Some("user"));
+    let question = user_rows
+        .next()
         .ok_or("There is no question to ask again.")?;
+    let previous = user_rows.next().map(extract_text);
     let text = extract_text(question);
     let original = text
         .strip_suffix(crate::bigtiny::turn_text::REGENERATE_NOTE)
         .unwrap_or(&text);
     let images = stored_images(question);
     // A `/debate` turn asked again is a debate again, on today's panel.
+    // So is the run that answers a critique's brief.
     let debate_panel =
-        crate::bigtiny::debate::panel_for_regenerate(app, session_id, original).await;
+        match crate::bigtiny::debate::panel_for_regenerate(app, session_id, original).await {
+            Some(panel) => Some(panel),
+            None => {
+                crate::bigtiny::critique::panel_for_regenerate(app, session_id, previous.as_deref())
+                    .await
+            }
+        };
     crate::bigtiny::stream::send_prompt(
         app.clone(),
         session_id.to_string(),

@@ -4,7 +4,7 @@ import { ImageIcon } from '@/components/icons/ImageIcon';
 import { SparkIcon } from '@/components/icons/SparkIcon';
 
 const ICON: Record<
-  'file' | 'document' | 'image' | 'debate',
+  'file' | 'document' | 'image' | 'debate' | 'critique',
   (props: { size?: number }) => JSX.Element
 > = {
   file: DocumentIcon,
@@ -12,6 +12,8 @@ const ICON: Record<
   image: ImageIcon,
   // The moderator brief a `/debate` turn carries (`bigtiny::debate`).
   debate: SparkIcon,
+  // The editor's playbook a `/critique` turn carries (`bigtiny::critique`).
+  critique: SparkIcon,
 };
 
 /** Read-only chips showing what was attached to a sent user turn (Round-7 fix)

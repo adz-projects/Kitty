@@ -60,9 +60,13 @@ lib.rs (app setup, window creation, generate_handler! list;
   │                     parsed back for replay
   │     debate.rs      `/debate`: the moderator brief and the panel armed for
   │                     the turn (pasted items saved to <chat>/debate/)
+  │     critique.rs    `/critique`: the editor's playbook (from the
+  │                     `kitty-critique` crate) on the first turn, the panel
+  │                     armed on the answer to its brief; guides and pasted
+  │                     drafts written to <chat>/critique/
   │     research.rs    `/deepresearch`: starts an engine research run, whose
   │                     turn-0 instructions ride with the brief; reads/stops runs
-  │     kitty_specialists.rs  the `debater` specialist, and extractor/analyst
+  │     kitty_specialists.rs  the `debater` and `critic` specialists, and extractor/analyst
   │                     switched off for Kitty (once, after each MCP self-heal)
   │     providers.rs   sync every setup's card into the engine (one row each)
   │     specialists.rs, mcp.rs (bundled servers self-heal), pathway.rs,
@@ -224,6 +228,11 @@ binaries match their source.
   hides (`discover.rs`).
 - **`kitty-wasm`**: 4 tools running Python or any WASI module in a wasmtime
   sandbox.
+
+Two plugins are plain libraries, linked rather than run: **`kitty-doc`** (the
+document code, under kitty-tools and in Bacon) and **`kitty-critique`**, the
+`/critique` playbook: its genre guides are markdown files (`packs/`), built
+into the crate and written to the chat's folder for the critic delegates.
 
 The two memory engines — behavioural (`plugins/adaptive-pathway_rust`) and
 factual (`plugins/memorabilia_rust`) — are linked into the engine and hosted per

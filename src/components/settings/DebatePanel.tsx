@@ -66,7 +66,8 @@ export function DebatePanel() {
         or link what is being debated. Your chat&apos;s model moderates and gives each persona one
         of these models. Seats are picked for what they can do, so the subagent denylist and each
         setup&apos;s specialist setting do not apply here. With no seats, a debate uses your setups;
-        with only one model available, your chat&apos;s model voices every persona itself.
+        with only one model available, your chat&apos;s model voices every persona itself. A{' '}
+        <code>/critique</code> puts its lenses on the same panel.
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-list">

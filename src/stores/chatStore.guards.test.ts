@@ -93,6 +93,7 @@ describe('chatStore send in-flight guard', () => {
       undefined,
       undefined,
       false,
+      undefined,
       undefined
     );
   });
@@ -386,6 +387,7 @@ describe('chatStore /debate', () => {
       undefined,
       undefined,
       true,
+      undefined,
       undefined
     );
     const bubble = useChatStore.getState().messages.find((m) => m.role === 'user');
@@ -401,6 +403,32 @@ describe('chatStore /debate', () => {
   });
 });
 
+describe('chatStore /critique', () => {
+  it('starts with the playbook, runs on the answer to the brief, then stops', async () => {
+    useChatStore.setState({ sessionId: 's1', cwd: 'C:/c', busy: false });
+    await useChatStore.getState().send('genre=memo', { critique: true });
+    expect(vi.mocked(ipc.sendPrompt).mock.lastCall?.[7]).toBe('start');
+    const bubble = useChatStore.getState().messages.find((m) => m.role === 'user');
+    expect(bubble?.attachedFiles).toEqual([{ name: 'Critique playbook', kind: 'critique' }]);
+
+    useChatStore.setState({ busy: false });
+    await useChatStore.getState().send('go');
+    expect(vi.mocked(ipc.sendPrompt).mock.lastCall?.[7]).toBe('continue');
+
+    useChatStore.setState({ busy: false });
+    await useChatStore.getState().send('thanks');
+    expect(vi.mocked(ipc.sendPrompt).mock.lastCall?.[7]).toBeUndefined();
+  });
+
+  it('sends a bare /critique', async () => {
+    useChatStore.setState({ sessionId: 's1', cwd: 'C:/c', busy: false });
+    vi.mocked(ipc.sendPrompt).mockClear();
+    await useChatStore.getState().send('', { critique: true });
+    expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().messages.slice(-1)[0]?.text).toBe('/critique');
+  });
+});
+
 describe('chatStore /deepresearch', () => {
   it('sends the brief with the research flag and its budget', async () => {
     useChatStore.setState({ sessionId: 's1', cwd: 'C:/c', busy: false });
@@ -412,7 +440,8 @@ describe('chatStore /deepresearch', () => {
       undefined,
       undefined,
       false,
-      { max_turns: 6 }
+      { max_turns: 6 },
+      undefined
     );
   });
 

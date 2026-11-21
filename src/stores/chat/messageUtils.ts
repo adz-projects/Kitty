@@ -17,6 +17,23 @@ export function parseDebateCommand(text: string): string | null {
   return (m[1] ?? '').trim();
 }
 
+/** The text after a leading `/critique` command (its options and any
+    instructions), or `null` when the text is not one. `/critique` alone
+    yields `''`: the draft may come entirely from attachments. */
+export function parseCritiqueCommand(text: string): string | null {
+  const m = /^\/critique(?:\s+([\s\S]*))?$/.exec(text.trim());
+  if (!m) return null;
+  return (m[1] ?? '').trim();
+}
+
+/** Whether the next message answers a critique's brief: the chat's latest
+    user turn was the `/critique` turn. That answer is where the critique runs,
+    so it is sent armed with the panel (`bigtiny::critique`). Pure. */
+export function answersCritiqueBrief(messages: Message[]): boolean {
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user' && !m.superseded);
+  return lastUser?.attachedFiles?.some((f) => f.kind === 'critique') ?? false;
+}
+
 export function hasSomethingToSend(
   text: string,
   s: { droppedFiles: unknown[]; attachments: unknown[]; pendingImages: unknown[] }

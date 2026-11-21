@@ -127,6 +127,36 @@ version stays 2:
 | `research_progress` on the app and chat streams (`research_id`, status in `content`, detail in `tool_args`) | `research://progress` for the progress card |
 | in-process MCP server `research`, withheld from sessions without a research role | Registered by `bigtiny::mcp::ensure_builtin_servers` like `specialists` |
 
+`/critique` (after Kitty 1.1.0) needs no engine change: it arms the same per-turn
+`debate.panel` as `/debate`, and its `critic` specialist is caller-hosted like
+the `debater`. The engine's refusal outside an armed turn still names
+`/debate`; Kitty never calls the critic outside one.
+
+## Writing critique (`/critique`, after Kitty 1.1.0)
+
+A two-turn exchange run by the chat's own model as the editor, with the
+playbook from `plugins/kitty-critique` (shared with Bacon, no dependencies).
+
+- **Turn 1, the brief** (`/critique [options] [instructions]`): the playbook
+  rides as an inline document labelled `Critique playbook`. The editor reads
+  the draft and proposes genre, reader, purpose, stage and the preservation
+  lock, then stops. Not armed: nothing is delegated yet.
+- **Turn 2, the run**: the user's next message. The webview sends it with
+  `critique: "continue"` when the latest user turn carries the critique chip
+  (`answersCritiqueBrief`), and Kitty arms the panel. Regenerate re-arms it
+  when the user turn before the regenerated one was the `/critique` turn.
+- **Options**, read from the start of the text: `genre=` op-ed, essay,
+  academic, memo, proposal or other (or a bare genre word); `stage=` early,
+  revising or polish; `factcheck`; `sketches=off`.
+- **Delegation**: with specialists on (desktop) and at least one panel host
+  (the Debate panel's seats, else the setups), each lens is a fresh `critic`
+  delegate; the guides and any pasted draft are written to
+  `<chat>/critique/` (guides under `guides/`, rewritten when they change).
+  Otherwise the editor applies every lens itself and the guides are inlined:
+  all of them while the genre is `auto`, else that genre's only.
+- **Author context**: optional, Settings → Specialists → Writing critique
+  (`config.critique.author_context`). Behavioural memory is not involved.
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it

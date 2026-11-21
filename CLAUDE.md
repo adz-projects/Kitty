@@ -215,7 +215,7 @@ engine-managed) and why mixing them is a bug.
   collects reports with `await_specialists`, and a turn cannot end until every
   ticket is collected (`docs/VERSIONS.md`, 0.10.7). Desktop only.
   Kitty switches off the `extractor` and `analyst` built-ins for itself and
-  defines a `debater` (`bigtiny/kitty_specialists.rs`). A message starting
+  defines a `debater` and a `critic` (`bigtiny/kitty_specialists.rs`). A message starting
   `/debate` (`bigtiny/debate.rs`) makes the chat's model a moderator: Kitty
   adds a brief to the turn and arms a panel of hosts for that turn alone —
   Settings → Specialists → Debate panel, any model a provider lists, else the
@@ -223,6 +223,18 @@ engine-managed) and why mixing them is a bug.
   specialist tag and the denylist. Round 1 runs in parallel, later rounds one
   speaker at a time in a random order (`debate_order`). With one model, or
   without `/debate`, the chat's model voices every persona itself.
+- **Writing critique** (`bigtiny/critique.rs`, the `plugins/kitty-critique`
+  library, `CritiquePanel`). A message starting `/critique [options]` with a
+  draft attached or pasted makes the chat's model an editor. It proposes a
+  brief (genre, reader, purpose, stage, a preservation lock) and stops; the
+  user's answer runs the critique. The run maps every paragraph's jobs (the
+  multivalence map), applies the genre's anatomy and lenses as parallel
+  `critic` delegates on the Debate panel's hosts (or alone, without
+  specialists), fact-checks only when asked, triages into four buckets,
+  sketches the top fixes two ways, and writes the memo. Genre packs (op-ed,
+  essay, academic, memo after *Writing for Busy Readers*, proposal, other)
+  are markdown in the crate, which Bacon can link. `docs/VERSIONS.md` has the
+  turn mechanics.
 - **Deep research** (`bigtiny/research.rs`, `commands/research.rs`,
   `lib/research.ts`, `ResearchPlanPrompt`, `ResearchProgressCard`; engine
   `BigTinyV2/daemon/src/research/`). A message starting
@@ -303,7 +315,8 @@ src/             React frontend (windows/, components/, stores/, lib/, themes/)
 src-tauri/       Rust core (src/), Tauri config, bundled binaries, Android project (gen/android)
 BigTinyV2/       the engine: daemon/, client/, protocol/
 plugins/         kitty-tools, kitty-web, kitty-wasm, the two memory engines,
-                 build.py; bigtiny_rust/ is frozen V1
+                 the kitty-doc and kitty-critique libraries, build.py;
+                 bigtiny_rust/ is frozen V1
 ```
 
 ## Core architectural rules

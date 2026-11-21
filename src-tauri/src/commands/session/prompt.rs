@@ -39,6 +39,7 @@ pub async fn send_prompt(
     documents: Option<Vec<crate::bigtiny::turn_text::InlineDocument>>,
     debate: Option<bool>,
     research: Option<crate::bigtiny::research::ResearchArgs>,
+    critique: Option<String>,
 ) -> Result<(), String> {
     // `/debate`: a moderator brief rides as the turn's last document, and the
     // panel it names is armed in the engine for this turn only.
@@ -55,6 +56,27 @@ pub async fn send_prompt(
         turn.panel
     } else {
         None
+    };
+    // `/critique`: the editor's playbook rides with the first turn; the
+    // user's answer to its brief is armed with the panel the lenses run on.
+    let debate_panel = match critique
+        .as_deref()
+        .and_then(crate::bigtiny::critique::Stage::parse)
+    {
+        Some(stage) => {
+            let turn = crate::bigtiny::critique::prepare(
+                &app,
+                &session_id,
+                stage,
+                &text,
+                &documents,
+                attached_paths.as_deref().unwrap_or_default(),
+            )
+            .await;
+            documents.extend(turn.playbook);
+            turn.panel
+        }
+        None => debate_panel,
     };
     // `/deepresearch`: the engine ties this chat to a new run and returns turn
     // 0's instructions, which ride with the brief so this turn drafts the
@@ -181,8 +203,7 @@ pub async fn answer_approval(
     if decision == "revise" && message.as_deref().map(str::trim).unwrap_or("").is_empty() {
         return Err("Say what should change.".into());
     }
-    crate::bigtiny::stream::answer_approval(&app, &action_id, &decision, message.as_deref())
-        .await
+    crate::bigtiny::stream::answer_approval(&app, &action_id, &decision, message.as_deref()).await
 }
 
 /// The whole output of a tool call whose card showed a truncated result.

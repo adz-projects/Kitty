@@ -1,0 +1,15 @@
+[package]
+name = "kitty-critique"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "The writing-critique playbook behind /critique: genre packs as markdown data, option parsing, and the orchestrator brief. Pure library, no dependencies — Kitty links it, and Bacon can link it the same way."
+
+# Standalone package, NOT a workspace member of src-tauri — same rationale as
+# kitty-doc. Deliberately dependency-free: it is text and string assembly.
+
+[lib]
+name = "kitty_critique"
+path = "src/lib.rs"
+
+[dependencies]

@@ -50,6 +50,9 @@ semver = "1"
 # no business linking sqlx, rmcp and LiteRT to do it.
 bigtiny2-client = { path = "../BigTinyV2/client" }
 bigtiny2-protocol = { path = "../BigTinyV2/protocol" }
+# The `/critique` playbook and its genre guides (`bigtiny::critique`). A
+# dependency-free library shared with Bacon.
+kitty-critique = { path = "../plugins/kitty-critique" }
 # The always-allow scope's argument pattern and the approval policy's
 # security-sensitive command list (`approvals.rs`).
 regex = "1"

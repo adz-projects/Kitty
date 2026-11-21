@@ -52,6 +52,7 @@ import {
 } from './chat/errorUtils';
 import { hasRepetitionLoop, splitLeakedThinkTag } from './chat/loopGuards';
 import {
+  answersCritiqueBrief,
   closeOpen,
   deriveArtifact,
   extractGooseToolMeta,
@@ -288,7 +289,7 @@ interface ChatState {
   /** `debate`: the turn was sent with `/debate` (`bigtiny::debate`). */
   send: (
     text: string,
-    opts?: { debate?: boolean; research?: { maxTurns: number | null } }
+    opts?: { debate?: boolean; critique?: boolean; research?: { maxTurns: number | null } }
   ) => Promise<void>;
   cancel: () => Promise<void>;
   /** Hard-reset a stuck turn the user chose to force-stop (Round-5): clears
@@ -853,7 +854,10 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
     },
     debate = false,
     /** `/deepresearch`: start a research run with this turn as its turn 0. */
-    research?: { maxTurns: number | null }
+    research?: { maxTurns: number | null },
+    /** `/critique`: `start` for the command's own turn, `continue` for the
+        answer to its brief. */
+    critique?: 'start' | 'continue'
   ): Promise<boolean> => {
     const trimmed = text;
     // Captured before ANY await — see the note above. This is also what makes
@@ -941,7 +945,10 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // Snapshot what's attached to this turn before the set() below clears
       // droppedFiles/attachments/pendingImages from composer state — otherwise
       // there'd be no record of it on the sent message at all (Round-7 fix).
-      const attachedFiles: { name: string; kind: 'file' | 'document' | 'image' | 'debate' }[] = [
+      const attachedFiles: {
+        name: string;
+        kind: 'file' | 'document' | 'image' | 'debate' | 'critique';
+      }[] = [
         ...otherFiles.map((f) => ({ name: f.name, kind: 'file' as const })),
         ...imageFiles.map((f) => ({ name: f.name, kind: 'image' as const })),
         ...attachments.map((a) => ({ name: a.label, kind: 'document' as const })),
@@ -950,6 +957,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           kind: 'image' as const,
         })),
         ...(debate ? [{ name: 'Debate brief', kind: 'debate' as const }] : []),
+        ...(critique === 'start' ? [{ name: 'Critique playbook', kind: 'critique' as const }] : []),
         ...(research ? [{ name: 'Deep research instructions', kind: 'document' as const }] : []),
       ];
 
@@ -959,6 +967,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         text:
           trimmed ||
           (debate ? '/debate' : '') ||
+          (critique === 'start' ? '/critique' : '') ||
           (attachments.length
             ? `(${attachments.length} document(s))`
             : pendingImages.length
@@ -1013,7 +1022,8 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         attachedPaths,
         documents,
         debate,
-        research ? { max_turns: research.maxTurns } : undefined
+        research ? { max_turns: research.maxTurns } : undefined,
+        critique
       );
       // A turn that carried attachments just widened the session's grant set
       // daemon-side. Re-read it now, before the model's first tool call, or
@@ -2052,15 +2062,25 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
 
     send: async (
       text: string,
-      opts?: { debate?: boolean; research?: { maxTurns: number | null } }
+      opts?: { debate?: boolean; critique?: boolean; research?: { maxTurns: number | null } }
     ) => {
       const trimmed = text.trim();
       const debate = opts?.debate ?? false;
       const research = opts?.research;
+      // `/critique` starts one; the next message answers its brief and runs it.
+      const critique: 'start' | 'continue' | undefined = opts?.critique
+        ? 'start'
+        : answersCritiqueBrief(get().messages)
+          ? 'continue'
+          : undefined;
       // A research run needs a brief to plan from.
       if (research && !trimmed) return;
-      // `/debate` alone is a request too: the brief says what to do.
-      if (sendInFlight || get().busy || !(debate || hasSomethingToSend(trimmed, get()))) {
+      // `/debate` and `/critique` alone are requests too: the brief says what to do.
+      if (
+        sendInFlight ||
+        get().busy ||
+        !(debate || critique === 'start' || hasSomethingToSend(trimmed, get()))
+      ) {
         return;
       }
       // Acquire the synchronous in-flight guard BEFORE any await — `busy` is
@@ -2069,7 +2089,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // and enqueue two prompts.
       sendInFlight = true;
       try {
-        await doSend(trimmed, undefined, debate, research);
+        await doSend(trimmed, undefined, debate, research, critique);
       } finally {
         sendInFlight = false;
       }

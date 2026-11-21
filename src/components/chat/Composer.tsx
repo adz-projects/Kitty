@@ -1,7 +1,7 @@
 import { DEFAULT_RESEARCH_TURNS, parseResearchCommand } from '@/lib/research';
 import { useEffect, useRef, useState } from 'react';
 import { hasSomethingToSend, useChatStore } from '@/stores/chatStore';
-import { parseDebateCommand } from '@/stores/chat/messageUtils';
+import { parseCritiqueCommand, parseDebateCommand } from '@/stores/chat/messageUtils';
 import { pastedFileKind, readAsDataUrl } from '@/lib/pasteFiles';
 import { ipc, pickFiles } from '@/lib/ipc';
 import { UploadIcon } from '@/components/icons/UploadIcon';
@@ -42,7 +42,7 @@ export function Composer({
 }: {
   onSend: (
     text: string,
-    opts?: { debate?: boolean; research?: { maxTurns: number | null } }
+    opts?: { debate?: boolean; critique?: boolean; research?: { maxTurns: number | null } }
   ) => void;
   onStop: () => void;
   disabled: boolean;
@@ -129,11 +129,19 @@ ${prefill}`
   const submit = () => {
     const value = text.trim();
     const debate = parseDebateCommand(value);
+    const critique = parseCritiqueCommand(value);
     const research = parseResearchCommand(value);
     if (research !== null) {
       // `/deepresearch` alone has nothing to plan from: the hint says what to add.
       if (!research.brief || disabled || readOnly || sendBlocked) return;
       onSend(research.brief, { research: { maxTurns: research.maxTurns } });
+      setText('');
+      resetTextareaHeight();
+      return;
+    }
+    if (critique !== null) {
+      if (disabled || readOnly || sendBlocked) return;
+      onSend(critique, { critique: true });
       setText('');
       resetTextareaHeight();
       return;
@@ -211,6 +219,7 @@ ${prefill}`
   };
 
   const debating = parseDebateCommand(text) !== null;
+  const critiquing = parseCritiqueCommand(text) !== null;
   const researching = parseResearchCommand(text) !== null;
 
   return (
@@ -219,6 +228,13 @@ ${prefill}`
         <div className="composer-hint" role="status">
           Debate: say who the personas are, how many rounds, and what the debate should examine.
           Attach or link the item under debate. The panel is set in Settings → Specialists.
+        </div>
+      )}
+      {critiquing && (
+        <div className="composer-hint" role="status">
+          Critique: attach or paste the draft. Options: genre=op-ed, essay, academic, memo, proposal
+          or other; stage=early, revising or polish; factcheck; sketches=off. You confirm the brief
+          before the critique runs.
         </div>
       )}
       {researching && (

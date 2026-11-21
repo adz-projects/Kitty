@@ -192,7 +192,10 @@ export const ipc = {
     debate?: boolean,
     /** `/deepresearch`: the engine ties the chat to a new research run and
         this turn drafts its plan (`bigtiny::research`). */
-    research?: { max_turns: number | null }
+    research?: { max_turns: number | null },
+    /** `/critique`: `start` adds the editor's playbook; `continue` (the answer
+        to its brief) arms the panel the lenses run on (`bigtiny::critique`). */
+    critique?: 'start' | 'continue'
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
@@ -202,6 +205,7 @@ export const ipc = {
       documents: documents ?? null,
       debate: debate ?? null,
       research: research ?? null,
+      critique: critique ?? null,
     }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   /** Fresh (not client-cached) check of whether `session/prompt` is currently

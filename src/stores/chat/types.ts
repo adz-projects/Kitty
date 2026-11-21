@@ -67,7 +67,7 @@ export interface Message {
       like the metrics fields above, a replayed/resumed message won't have
       this (goosed's stored history has no structured "what was attached"
       metadata to reconstruct it from — a known, accepted limitation). */
-  attachedFiles?: { name: string; kind: 'file' | 'document' | 'image' | 'debate' }[];
+  attachedFiles?: { name: string; kind: 'file' | 'document' | 'image' | 'debate' | 'critique' }[];
   /** Set by `regenerate()`: this assistant turn was superseded by a
       reconsidered answer right after it, in the same session — rendered
       collapsed (like the thinking container) instead of as a normal bubble. */

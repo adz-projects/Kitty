@@ -6,12 +6,15 @@
 //! - `debater`, the participant in a `/debate` (`commands::session::debate`).
 //!   Its host is named by the moderator per call (`host_policy: "caller"`), so
 //!   the engine runs it only in a turn Kitty armed with a debate panel.
+//! - `critic`, which applies one lens of a `/critique` (`bigtiny::critique`),
+//!   also caller-hosted: the editor puts each lens on a host of the panel
+//!   Kitty armed for that turn.
 //! - `extractor` and `analyst` are switched off for Kitty by saving disabled
 //!   copies of them, once. A user who switches one back on keeps it on.
 //!
 //! Run from the self-heal pass that follows each built-in MCP sync, because
 //! the engine refuses a definition whose tools no connected server provides:
-//! before kitty-tools and kitty-web are up, the debater cannot be written.
+//! before kitty-tools and kitty-web are up, the debater and the critic cannot be written.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,6 +26,7 @@ use super::specialists::{self, Specialist, SpecialistSpec};
 use crate::state::AppState;
 
 pub const DEBATER: &str = "debater";
+pub const CRITIC: &str = kitty_critique::CRITIC;
 
 /// Built-ins Kitty does not offer its model.
 pub const RETIRED_BUILTINS: [&str; 2] = ["extractor", "analyst"];
@@ -96,12 +100,66 @@ not an essay."
     }
 }
 
+/// The tools a critic may use: read the draft and its guides, and search and
+/// read the web for a fact-check. Nothing that writes or runs.
+const CRITIC_TOOLS: [&str; 8] = [
+    "lean_file_read",
+    "lean_pdf_read_text",
+    "lean_word_read_text",
+    "lean_doc_read_chunk",
+    "lean_doc_search",
+    "lean_web_scrape",
+    "lean_web_search",
+    "lean_web_search_read_chunk",
+];
+
+pub fn critic_spec() -> SpecialistSpec {
+    SpecialistSpec {
+        name: CRITIC.into(),
+        description: "Applies one lens of a writing critique the user started with /critique.                       Give it the task named as its guide names it, the confirmed brief, the                       map once there is one, and in `refs` the draft and the guide files; name                       its `host` from the panel. It reports findings and never rewrites the                       draft, except a sketch when the task is one."
+            .into(),
+        system_prompt: "You are one reader on an editorial team critiquing a draft. The request names your task (a lens, the map, a fact-check batch, or a sketch), the brief the author agreed, and the map of the draft once it exists. Your sources are the draft and the guide files.
+
+- Read the draft in full, and the section of the guide that defines your task. Follow that section exactly; do nothing outside it.
+- Ground every finding in a paragraph number from the map and a verbatim quote from the draft. Report the most consequential findings first, at most eight.
+- Never invent facts, sources or experiences for the author. Where a fix needs what only the author knows, ask the question that would surface it.
+- Unless your task is a sketch, diagnose only: do not rewrite the draft.
+- For a fact-check, decide every verdict from a source you actually read."
+            .into(),
+        provider: None,
+        model: None,
+        tool_allow: CRITIC_TOOLS.iter().map(|t| t.to_string()).collect(),
+        response_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Your task, as the request named it."},
+                "report": {
+                    "type": "string",
+                    "description": "Your findings, map, verdicts or sketch, in markdown, in the                                     format the guide asks for."
+                }
+            },
+            "required": ["task", "report"],
+            "additionalProperties": false
+        })),
+        max_steps: Some(20),
+        reasoning_cap_tokens: None,
+        reasoning_cap_fraction: None,
+        fan_out: None,
+        max_concurrent: None,
+        host_policy: Some("caller".into()),
+        enabled: true,
+    }
+}
+
 /// What to write, given the app's current view and whether the built-ins were
 /// already retired once. Pure, for the tests.
 fn plan(list: &[Specialist], retired: bool) -> Vec<SpecialistSpec> {
     let mut writes = Vec::new();
     if !list.iter().any(|s| s.name == DEBATER && !s.builtin) {
         writes.push(debater_spec());
+    }
+    if !list.iter().any(|s| s.name == CRITIC && !s.builtin) {
+        writes.push(critic_spec());
     }
     if !retired {
         for name in RETIRED_BUILTINS {
@@ -117,7 +175,7 @@ fn plan(list: &[Specialist], retired: bool) -> Vec<SpecialistSpec> {
     writes
 }
 
-/// Create the debater if missing, and retire the built-ins once. Best-effort:
+/// Create the debater and the critic if missing, and retire the built-ins once. Best-effort:
 /// a failure is retried at the next self-heal pass.
 pub async fn ensure(app: &AppHandle, client: &BigTinyClient) {
     if DONE.load(Ordering::Relaxed) {
@@ -178,10 +236,11 @@ mod tests {
         ];
         let writes = plan(&list, false);
         let names: Vec<_> = writes.iter().map(|w| w.name.as_str()).collect();
-        assert_eq!(names, ["debater", "extractor", "analyst"]);
-        assert!(!writes[1].enabled && !writes[2].enabled);
+        assert_eq!(names, ["debater", "critic", "extractor", "analyst"]);
+        assert!(!writes[2].enabled && !writes[3].enabled);
+        assert_eq!(writes[1].host_policy.as_deref(), Some("caller"));
         assert_eq!(
-            writes[1].fan_out.as_deref(),
+            writes[2].fan_out.as_deref(),
             Some("per_ref"),
             "the copy is faithful"
         );
@@ -190,13 +249,25 @@ mod tests {
 
     #[test]
     fn nothing_is_rewritten_once_done() {
-        let list = vec![spec_row("debater", false), spec_row("extractor", true)];
+        let list = vec![
+            spec_row("debater", false),
+            spec_row("critic", false),
+            spec_row("extractor", true),
+        ];
         assert!(
             plan(&list, true).is_empty(),
             "a re-enabled built-in stays as the user left it"
         );
         // An app copy already there is the user's decision, retired or not.
-        let list = vec![spec_row("debater", false), spec_row("extractor", false)];
+        let list = vec![
+            spec_row("debater", false),
+            spec_row("critic", false),
+            spec_row("extractor", false),
+        ];
         assert!(plan(&list, false).is_empty());
+        // An install from before /critique gets the critic alone.
+        let list = vec![spec_row("debater", false), spec_row("extractor", false)];
+        let names: Vec<_> = plan(&list, true).into_iter().map(|w| w.name).collect();
+        assert_eq!(names, ["critic"]);
     }
 }
