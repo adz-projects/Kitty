@@ -127,12 +127,12 @@ version stays 2:
 | `research_progress` on the app and chat streams (`research_id`, status in `content`, detail in `tool_args`) | `research://progress` for the progress card |
 | in-process MCP server `research`, withheld from sessions without a research role | Registered by `bigtiny::mcp::ensure_builtin_servers` like `specialists` |
 
-`/critique` (after Kitty 1.1.0) needs no engine change: it arms the same per-turn
+`/critique` (Kitty 1.1.1) needs no engine change: it arms the same per-turn
 `debate.panel` as `/debate`, and its `critic` specialist is caller-hosted like
 the `debater`. The engine's refusal outside an armed turn still names
 `/debate`; Kitty never calls the critic outside one.
 
-## Writing critique (`/critique`, after Kitty 1.1.0)
+## Writing critique (`/critique`, Kitty 1.1.1)
 
 A two-turn exchange run by the chat's own model as the editor, with the
 playbook from `plugins/kitty-critique` (shared with Bacon, no dependencies).
