@@ -116,6 +116,17 @@ Added in daemon **2.7.0** (`/debate`). All additive; API version stays 2:
 | `debate_order({personas, rounds})`; session metadata `debate_used` (sticky) offers it | A random speaking order per round from round 2; the tool list only grows (`prompt_determinism.md`) |
 | `call_specialist`'s description no longer names `extractor` / `analyst` | Kitty retires both with disabled app copies (`bigtiny/kitty_specialists.rs`); other apps still have them |
 
+Added in daemon **2.8.0** (Kitty 1.1.0, `/deepresearch`). All additive; API
+version stays 2:
+
+| Surface | Used for |
+|---|---|
+| `POST /api/chat/{id}/approve` `decision: "revise"` with `message`; `message` also explains a `reject`; `hitl_resolved` carries it in `reason` | The plan card's Revise and Reject (`bigtiny/stream.rs`, `lifecycle/app_events.rs`) |
+| always-ask tools (`submit_research_plan`, `hitl.always_ask_tools`): every call pauses, beats rules, allow patterns, app auto-approval and delegate allow-lists, waits up to 24 h | Kitty never answers a research plan itself (`approvals::ALWAYS_ASK_TOOLS`) |
+| `POST /api/research`, `GET /api/research/{id}`, `/entries`, `POST /api/research/{id}/cancel`, `GET /api/apps/me/research` | Starting a run from a `/deepresearch` turn, the progress card, Stop (`bigtiny/research.rs`) |
+| `research_progress` on the app and chat streams (`research_id`, status in `content`, detail in `tool_args`) | `research://progress` for the progress card |
+| in-process MCP server `research`, withheld from sessions without a research role | Registered by `bigtiny::mcp::ensure_builtin_servers` like `specialists` |
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
