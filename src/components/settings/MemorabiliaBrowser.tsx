@@ -1,29 +1,28 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { MemorabiliaItem } from '@/lib/types';
 
-/** Lists the factual-memory items (active propositions) the memorabilia
-    engine currently holds — the "what it remembers, and correct it" surface,
-    parallel to the pathway `BeliefBrowser` but for substantive facts rather
-    than behavioral beliefs. Claim / confidence / importance / disputed are
-    exactly what `GET /api/memorabilia/items` returns
-    (`BigTinyV2/daemon/src/routes/memorabilia.rs::list_items`). Delete routes
-    through `forget_item` (permanent suppression + tombstone of the item's
-    supporting evidence, not a bare row delete, so a deleted fact can't be
-    silently relearned on the next extraction pass). */
-export function MemorabiliaBrowser() {
+type FactFilter = 'all' | 'high' | 'disputed';
+
+/** Searchable card-list browser for Memorabilia facts with quick importance
+    and dispute filters plus permanent forget actions. */
+export function MemorabiliaBrowser({
+  refreshKey = 0,
+  onMutated,
+}: {
+  refreshKey?: number;
+  onMutated?: () => void;
+}) {
   const [items, setItems] = useState<MemorabiliaItem[] | null>(null);
   const [error, setError] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
+  const [factFilter, setFactFilter] = useState<FactFilter>('all');
 
-  const load = () =>
+  const load = useCallback(() => {
     void ipc
       .getMemorabiliaItems()
       .then((r) => {
-        // Tolerate the daemon's soft `{ error }` shape (HTTP 200) that appears
-        // while the engine is unavailable — e.g. just after a toggle restarts
-        // the backend — instead of feeding `undefined` into the table.
         if (r && Array.isArray(r.items)) {
           setItems(r.items);
           setError('');
@@ -34,16 +33,18 @@ export function MemorabiliaBrowser() {
         }
       })
       .catch((e) => setError(String(e)));
+  }, []);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load, refreshKey]);
 
   const remove = async (id: string) => {
     setDeletingId(id);
     try {
       await ipc.deleteMemorabiliaItem(id);
       setItems((prev) => (prev ? prev.filter((i) => i.id !== id) : prev));
+      onMutated?.();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -51,54 +52,97 @@ export function MemorabiliaBrowser() {
     }
   };
 
-  if (error) return <p className="chat-error">{error}</p>;
-  if (items == null) return <p className="muted">Loading…</p>;
-  if (items.length === 0) return <p className="muted">Nothing remembered yet.</p>;
-
   const q = filter.trim().toLowerCase();
-  const visible = q ? items.filter((i) => i.claim.toLowerCase().includes(q)) : items;
+  const disputedCount = items?.filter((i) => i.disputed).length ?? 0;
+  const visible = (items ?? []).filter((i) => {
+    if (factFilter === 'high' && i.importance !== 'high') return false;
+    if (factFilter === 'disputed' && !i.disputed) return false;
+    if (!q) return true;
+    return i.claim.toLowerCase().includes(q) || i.importance.toLowerCase().includes(q);
+  });
+
+  const filters: { id: FactFilter; label: string }[] = [
+    { id: 'all', label: 'All' },
+    { id: 'high', label: 'High importance' },
+    ...(disputedCount > 0
+      ? [{ id: 'disputed' as const, label: `Disputed (${disputedCount})` }]
+      : []),
+  ];
 
   return (
-    <div className="belief-browser">
-      <input
-        className="belief-browser-filter"
-        placeholder="Filter…"
-        value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-      />
-      <table className="settings-table belief-table">
-        <thead>
-          <tr>
-            <th>Fact</th>
-            <th>Importance</th>
-            <th>Confidence</th>
-            <th>Status</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {visible.map((i) => (
-            <tr key={i.id}>
-              <td>{i.claim}</td>
-              <td>{i.importance}</td>
-              <td>{Math.round(i.confidence * 100)}%</td>
-              <td>
-                {i.disputed && <div className="belief-contradicted">Disputed</div>}
-                {i.urgency && i.urgency !== 'none' && <div className="muted">{i.urgency}</div>}
-              </td>
-              <td>
+    <div className="mem-card">
+      <div className="mem-card-head">
+        <h2>What it remembers</h2>
+        {items && items.length > 0 && (
+          <small className="muted">
+            Showing {visible.length} of {items.length}
+          </small>
+        )}
+      </div>
+
+      {error && <p className="chat-error">{error}</p>}
+      {items == null && !error && <p className="muted">Loading…</p>}
+      {items && items.length === 0 && <p className="muted">Nothing remembered yet.</p>}
+
+      {items && items.length > 0 && (
+        <>
+          <div className="mem-toolbar">
+            <input
+              className="mem-filter-input"
+              placeholder="Search remembered facts…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+            <div className="mem-chip-group" role="group" aria-label="Filter facts">
+              {filters.map((f) => (
                 <button
-                  disabled={deletingId === i.id}
-                  onClick={() => void remove(i.id)}
-                  title="This wasn't right — forget it"
+                  key={f.id}
+                  type="button"
+                  className={`mem-chip ${factFilter === f.id ? 'active' : ''}`}
+                  onClick={() => setFactFilter(f.id)}
                 >
-                  {deletingId === i.id ? 'Removing…' : 'Forget'}
+                  {f.label}
                 </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              ))}
+            </div>
+          </div>
+
+          {visible.length === 0 ? (
+            <p className="muted">No matching facts.</p>
+          ) : (
+            <div className="mem-list">
+              {visible.map((i) => (
+                <div className="mem-item" key={i.id}>
+                  <div className="mem-item-body">
+                    <div className="mem-item-text">{i.claim}</div>
+                    <div className="mem-item-meta">
+                      <span
+                        className={`mem-pill ${i.importance === 'high' ? 'mem-pill-accent' : ''}`}
+                      >
+                        {i.importance} importance
+                      </span>
+                      <span className="mem-pill">{Math.round(i.confidence * 100)}% confidence</span>
+                      {i.disputed && <span className="mem-pill mem-pill-danger">Disputed</span>}
+                      {i.urgency && i.urgency !== 'none' && i.urgency !== 'unknown' && (
+                        <span className="mem-pill mem-pill-warn">{i.urgency}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mem-item-action">
+                    <button
+                      disabled={deletingId === i.id}
+                      onClick={() => void remove(i.id)}
+                      title="This wasn't right — forget it permanently"
+                    >
+                      {deletingId === i.id ? 'Removing…' : 'Forget'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

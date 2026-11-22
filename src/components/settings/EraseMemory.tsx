@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
-/** "Erase all" for one memory engine (#72): behind a typed confirmation,
-    because nothing brings it back. */
+/** "Erase all" for one memory engine: behind a typed confirmation, because
+    nothing brings it back. */
 export function EraseMemory({
   what,
   phrase,
@@ -42,14 +42,19 @@ export function EraseMemory({
   };
 
   return (
-    <div className="field">
-      <span>Start over</span>
-      <div className="row">
-        <button className="danger" disabled={busy} onClick={() => void run()}>
-          {busy ? 'Erasing…' : `Erase all ${what}…`}
-        </button>
-        {result && <span className="muted">{result}</span>}
+    <div className="mem-danger-row">
+      <div>
+        <div>Start over</div>
+        <small className="muted">Permanently clear stored {what}. Chats are not affected.</small>
+        {result && (
+          <div>
+            <small className="muted">{result}</small>
+          </div>
+        )}
       </div>
+      <button className="danger" disabled={busy} onClick={() => void run()}>
+        {busy ? 'Erasing…' : `Erase all ${what}…`}
+      </button>
     </div>
   );
 }

@@ -1,41 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { MemorabiliaStats } from '@/lib/types';
-import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
 import { STALL_HOURS, describeAge, isStalled } from './memoryHealth';
-import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
-/** Friendly names for the importance buckets in `stats.by_importance` — a
-    plain `Record<string, number>` on the wire, so this falls back to the raw
-    key for anything not in the known set rather than dropping it silently. */
-const IMPORTANCE_LABEL: Record<string, string> = {
-  high: 'high importance',
-  low: 'low importance',
-  unknown: 'importance not yet judged',
-};
-
-/** Health view for the memorabilia (factual-memory) engine, rolled into the
-    Memorabilia pane as a section rather than its own nav tab — parallel to
-    pathway's `GraphHealth`. A read-only counts readout sourced from
-    `GET /api/memorabilia/stats`; the correct/delete surface is the fact
-    table above it. */
-export function MemorabiliaHealth() {
+/** Overview metrics and queue health for Memorabilia, rendered as a scannable
+    4-tile card matching Adaptive Pathway's `GraphHealth`. */
+export function MemorabiliaHealth({ refreshKey = 0 }: { refreshKey?: number }) {
   const [stats, setStats] = useState<MemorabiliaStats | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [repairing, setRepairing] = useState(false);
-  const [repairMsg, setRepairMsg] = useState('');
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
       const s = await ipc.getMemorabiliaStats();
-      // The daemon route returns a soft `{ error }` shape (HTTP 200) while the
-      // engine is unavailable — e.g. in the window right after a toggle
-      // restarts the backend. Treat anything without the expected numeric
-      // fields as "not ready yet" rather than letting the render throw on a
-      // missing field (which would blank the whole Settings window).
       if (s && typeof (s as { active?: unknown }).active === 'number') {
         setStats(s);
       } else {
@@ -48,110 +27,79 @@ export function MemorabiliaHealth() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => void load(), []);
+  useEffect(() => {
+    void load();
+  }, [load, refreshKey]);
 
-  const repair = async () => {
-    const ok = await confirmDialog({
-      title: 'Check and repair the fact database?',
-      message: DB_REPAIR_CONFIRM,
-      confirmLabel: 'Check & repair',
-    });
-    if (!ok) {
-      return;
-    }
-    setRepairing(true);
-    setRepairMsg('');
-    try {
-      setRepairMsg(await runDbRepair(ipc.recoverMemorabiliaDb));
-      await load();
-    } catch (e) {
-      setRepairMsg(String(e));
-    } finally {
-      setRepairing(false);
-    }
-  };
+  const highCount = stats?.by_importance?.high ?? 0;
 
   return (
-    <>
-      <h2>Health</h2>
-      <p className="muted">
-        A quick look at what Kitty has remembered. Nothing here needs your attention.
-      </p>
-      {loading && <p className="muted">Loading…</p>}
+    <div className="mem-card">
+      <div className="mem-card-head">
+        <h2>Overview</h2>
+        <button onClick={() => void load()} disabled={loading}>
+          {loading ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+
+      {!stats && loading && <p className="muted">Loading…</p>}
       {error && <div className="chat-error">{error}</div>}
 
       {stats && (
-        <div className="field">
-          <div>
-            Kitty is holding <strong>{stats.active}</strong> fact
-            {stats.active === 1 ? '' : 's'}
-            {Object.keys(stats.by_importance ?? {}).length > 0 && (
-              <>
-                {' '}
-                &mdash;{' '}
-                {Object.entries(stats.by_importance ?? {})
-                  .map(([k, count]) => `${count} ${IMPORTANCE_LABEL[k] ?? k}`)
-                  .join(', ')}
-              </>
-            )}
-            .
-          </div>
-          <div className="muted">
-            Backed by <strong>{stats.chunks_active}</strong> piece
-            {stats.chunks_active === 1 ? '' : 's'} of evidence.
-          </div>
-          {stats.extraction && (
-            <div className="muted">
-              {stats.extraction.pending > 0
-                ? `${stats.extraction.pending} piece${
-                    stats.extraction.pending === 1 ? '' : 's'
-                  } of evidence still to read`
-                : 'All evidence read'}
-              {' · '}last fact found {describeAge(stats.extraction.last_extracted_at)}.
+        <>
+          <div className="mem-stats-grid">
+            <div className="mem-stat">
+              <span className="mem-stat-label">Active facts</span>
+              <span className="mem-stat-value">{stats.active}</span>
+              <span className="mem-stat-sub">
+                {highCount > 0 ? `${highCount} high importance` : 'None high importance'}
+              </span>
             </div>
-          )}
+
+            <div className="mem-stat">
+              <span className="mem-stat-label">Evidence chunks</span>
+              <span className="mem-stat-value">{stats.chunks_active}</span>
+              <span className="mem-stat-sub">
+                {stats.archived > 0 ? `${stats.archived} archived` : 'Supporting active facts'}
+              </span>
+            </div>
+
+            <div className="mem-stat">
+              <span className="mem-stat-label">Extraction queue</span>
+              <span className="mem-stat-value">{stats.extraction?.pending ?? 0}</span>
+              <span className="mem-stat-sub">
+                {stats.extraction && stats.extraction.pending > 0
+                  ? 'Waiting to process'
+                  : 'All evidence read'}
+              </span>
+            </div>
+
+            <div className="mem-stat">
+              <span className="mem-stat-label">Last fact found</span>
+              <span className="mem-stat-value" style={{ fontSize: 'var(--fs-md)', paddingTop: 4 }}>
+                {stats.extraction ? describeAge(stats.extraction.last_extracted_at) : '—'}
+              </span>
+              <span className="mem-stat-sub">
+                {stats.disputed > 0 ? `${stats.disputed} disputed` : 'No open disputes'}
+              </span>
+            </div>
+          </div>
+
           {stats.extraction &&
             isStalled(stats.extraction.pending, stats.extraction.last_extracted_at) && (
               <div className="memory-stall" role="status">
-                Remembering seems to have stopped: evidence is waiting, but no facts have been found
-                for over {STALL_HOURS} hours.
+                Remembering seems to have paused: {stats.extraction.pending} piece
+                {stats.extraction.pending === 1 ? '' : 's'} of evidence waiting for over{' '}
+                {STALL_HOURS} hours.
                 {stats.extraction.last_failure && (
                   <div className="muted">Last error: {stats.extraction.last_failure}</div>
                 )}
               </div>
             )}
-          {stats.disputed > 0 && (
-            <div>
-              <strong>{stats.disputed}</strong> fact{stats.disputed === 1 ? '' : 's'} in dispute
-              <div className="muted">
-                Conflicting evidence — down-weighted in recall until it settles.
-              </div>
-            </div>
-          )}
-          {stats.archived > 0 && (
-            <div className="muted">
-              {stats.archived} archived (no longer actively supported, kept for reference).
-            </div>
-          )}
-        </div>
+        </>
       )}
-
-      <h3>Maintenance</h3>
-      <p className="muted">
-        If Kitty stops remembering, the memory database may have been corrupted (for example by a
-        crash mid-write). This checks it and, only if needed, rebuilds it — keeping every record it
-        can still read and backing up the old file first.
-      </p>
-      <div className="field">
-        <button onClick={() => void repair()} disabled={repairing}>
-          {repairing ? 'Checking…' : 'Check & repair database'}
-        </button>
-        {repairMsg && <div className="muted">{repairMsg}</div>}
-      </div>
-
-      <button onClick={() => void load()}>Refresh</button>
-    </>
+    </div>
   );
 }

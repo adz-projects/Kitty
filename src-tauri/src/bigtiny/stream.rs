@@ -903,6 +903,17 @@ fn handle_event(
                 deltas.push_reasoning(text);
             }
         }
+        "memory_recall" => {
+            if let Some(recall) = event.get("memory_recall").filter(|v| !v.is_null()) {
+                let _ = app.emit(
+                    "chat://memory-recall",
+                    json!({
+                        "session_id": session_id,
+                        "recall": recall,
+                    }),
+                );
+            }
+        }
         "tool_start" => {
             let id = open_tool_card(
                 event.get("tool_call_id").and_then(|v| v.as_str()),

@@ -21,6 +21,7 @@ pub fn desired(s: &OvernightSettings) -> Value {
         "start": s.start.trim(),
         "end": s.end.trim(),
         "pathway": s.pathway,
+        "idle_micro": s.idle_micro,
     })
 }
 
@@ -53,6 +54,35 @@ async fn apply(app: &AppHandle) -> Result<(), String> {
     };
     if have != want {
         client.put_json("/api/apps/me/overnight", &want).await?;
+    }
+    Ok(())
+}
+
+/// Bring the engine's learning-model choice in line with Settings (both
+/// platforms). Best-effort, like the window.
+pub async fn apply_learning_model(app: &AppHandle) {
+    if let Err(e) = apply_learning(app).await {
+        tracing::warn!("could not apply the memory learning model: {e}");
+    }
+}
+
+async fn apply_learning(app: &AppHandle) -> Result<(), String> {
+    let client = crate::bigtiny::client::ensure_client(app)?;
+    let want = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.learning_model_desired()
+    };
+    let have = client
+        .get_json("/api/apps/me/learning-model")
+        .await?
+        .get("learning_model")
+        .cloned()
+        .unwrap_or(Value::Null);
+    // No row is `auto`.
+    let have = if have.is_null() { json!({"kind": "auto"}) } else { have };
+    if have != want {
+        client.put_json("/api/apps/me/learning-model", &want).await?;
     }
     Ok(())
 }
@@ -91,6 +121,8 @@ mod tests {
         assert_eq!(d["end"], "05:00");
         assert_eq!(d["enabled"], true);
         assert_eq!(d["pathway"], true);
+        assert_eq!(d["idle_micro"], true);
+        assert!(d.get("prefer_provider").is_none());
         assert!(d.get("wake").is_none());
     }
 }

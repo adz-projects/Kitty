@@ -3,17 +3,17 @@ import { ipc, pickSavePath } from '@/lib/ipc';
 import type { OvernightReport, OvernightSettings, OvernightView } from '@/lib/types';
 import { describeReport, describeWhen, wakeTimerWarning } from './overnightHelpers';
 
-/** Settings → Memorabilia → Overnight learning (docs/MEMORY_OVERNIGHT.md).
-    During the day memory only screens what chats bring in; chunking,
-    embedding, deciding what has recurred and extracting facts wait for the
-    window, so they don't compete with whatever the computer is doing.
-    Desktop only. */
+/** Settings → Memorabilia → Learning schedule (desktop only).
+    Groups overnight scheduling, daytime idle micro-bursts, and provider
+    offload into one readable card, keeping labelling export tucked under
+    Developer tools. */
 export function OvernightLearning() {
   const [view, setView] = useState<OvernightView | null>(null);
   const [draft, setDraft] = useState<OvernightSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [note, setNote] = useState('');
+  const [showDevTools, setShowDevTools] = useState(false);
 
   const load = async () => {
     try {
@@ -27,7 +27,6 @@ export function OvernightLearning() {
 
   useEffect(() => {
     void load();
-    // Refresh while open: a pass may start or finish.
     const t = setInterval(() => void load(), 15_000);
     return () => clearInterval(t);
   }, []);
@@ -58,9 +57,7 @@ export function OvernightLearning() {
     setError('');
     try {
       await ipc.runOvernightNow();
-      setNote(
-        'Starting within a minute. It runs for up to an hour, even while you use the computer.'
-      );
+      setNote('Starting within a minute. Runs for up to an hour without blocking chat.');
       void load();
     } catch (e) {
       setError(String(e));
@@ -88,135 +85,172 @@ export function OvernightLearning() {
   const backlog = view.engine?.backlog;
   const report: OvernightReport | null = status?.last_report ?? null;
   const timerWarning = wakeTimerWarning(view.wake_timers);
+  const hasBacklog = Boolean(
+    backlog &&
+    (backlog.screened > 0 ||
+      backlog.candidates_waiting > 0 ||
+      backlog.pending_extraction > 0 ||
+      backlog.unscreened > 0)
+  );
 
   return (
-    <>
-      <h2>Overnight learning</h2>
-      <p className="muted">
-        During the day Memorabilia only reads what your chats bring in and keeps the paragraphs
-        worth remembering. The heavy work (deciding which topics keep coming back and learning facts
-        from them) waits for this window, so it doesn&apos;t slow the computer down while you use
-        it.
-      </p>
+    <div className="mem-card">
+      <div className="mem-card-head">
+        <h2>Learning schedule</h2>
+        <div className="mem-card-actions">
+          {status && (
+            <span className={`mem-pill ${status.running ? 'mem-pill-accent' : ''}`}>
+              {status.running
+                ? 'Running now'
+                : status.last_started
+                  ? `Last run ${describeWhen(status.last_started)}`
+                  : 'Hasn’t run yet'}
+            </span>
+          )}
+          {view.settings.enabled && (
+            <button disabled={busy || status?.running} onClick={() => void runNow()}>
+              Process now
+            </button>
+          )}
+        </div>
+      </div>
 
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={draft.enabled}
-          disabled={busy}
-          onChange={(e) => set({ enabled: e.target.checked })}
-        />
-        <span>Learn overnight</span>
-      </label>
-      {!draft.enabled && (
-        <small className="muted">
-          Off: memory does this work about once an hour, whenever it is due.
-        </small>
+      {status && !status.running && report && (
+        <small className="muted">Last summary: {describeReport(report)}</small>
       )}
 
-      {draft.enabled && (
-        <>
-          <div className="row">
-            <label>
-              From{' '}
+      {hasBacklog && backlog && (
+        <div className="mem-status-strip">
+          <span className="mem-pill">{backlog.screened} documents screened</span>
+          <span className="mem-pill">{backlog.candidates_waiting} recurring passages</span>
+          <span className="mem-pill">{backlog.pending_extraction} pending extraction</span>
+          {backlog.unscreened > 0 && (
+            <span className="mem-pill mem-pill-warn">{backlog.unscreened} awaiting gate</span>
+          )}
+        </div>
+      )}
+
+      <div className="mem-setting-list">
+        <div className="mem-setting-row">
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={draft.enabled}
+              disabled={busy}
+              onChange={(e) => set({ enabled: e.target.checked })}
+            />
+            <span>Run heavy memory learning overnight</span>
+          </label>
+          <small className="muted">
+            {draft.enabled
+              ? 'Waits until idle for 10 min inside this window and pauses immediately when you return.'
+              : 'Off: processes background batches about once an hour when due.'}
+          </small>
+
+          {draft.enabled && (
+            <div className="mem-time-row">
+              <span>Window</span>
               <input
+                aria-label="Overnight window start"
                 type="time"
                 value={draft.start}
                 disabled={busy}
                 onChange={(e) => set({ start: e.target.value })}
               />
-            </label>
-            <label>
-              to{' '}
+              <span>to</span>
               <input
+                aria-label="Overnight window end"
                 type="time"
                 value={draft.end}
                 disabled={busy}
                 onChange={(e) => set({ end: e.target.value })}
               />
-            </label>
-          </div>
-          <small className="muted">
-            It starts once you&apos;ve been away for ten minutes and pauses when you come back. If a
-            night is missed, it catches up the next time the computer is idle and plugged in.
-          </small>
-
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={draft.pathway}
-              disabled={busy}
-              onChange={(e) => set({ pathway: e.target.checked })}
-            />
-            <span>Learn about you (Adaptive Pathway) overnight too</span>
-          </label>
-
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={draft.wake}
-              disabled={busy}
-              onChange={(e) => set({ wake: e.target.checked })}
-            />
-            <span>Wake this computer to do it</span>
-          </label>
-          <small className="muted">
-            Adds a Windows scheduled task that wakes the computer a few minutes after the window
-            opens, only when it&apos;s plugged in. It goes back to sleep by itself when the work is
-            done. A computer that is shut down rather than asleep can&apos;t be woken.
-          </small>
-          {draft.wake && timerWarning && <div className="chat-error">{timerWarning}</div>}
-          {draft.wake && !dirty && view.settings.wake && !view.wake_task_registered && (
-            <div className="chat-error">
-              The wake-up task isn&apos;t registered. Save again to retry.
             </div>
           )}
-        </>
-      )}
+        </div>
 
-      <div className="row">
-        <button className="primary" disabled={busy || !dirty} onClick={() => void save()}>
-          Save
-        </button>
-        {view.settings.enabled && (
-          <button disabled={busy || status?.running} onClick={() => void runNow()}>
-            Process now
-          </button>
+        {draft.enabled && (
+          <div className="mem-suboptions">
+            <div className="mem-setting-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={draft.pathway}
+                  disabled={busy}
+                  onChange={(e) => set({ pathway: e.target.checked })}
+                />
+                <span>Include Adaptive Pathway overnight</span>
+              </label>
+            </div>
+
+            <div className="mem-setting-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={draft.idle_micro ?? true}
+                  disabled={busy}
+                  onChange={(e) => set({ idle_micro: e.target.checked })}
+                />
+                <span>Also run small batches when idle during the day</span>
+              </label>
+              <small className="muted">
+                When plugged in and idle for 7 minutes, processes up to two passages and one chat so
+                memory keeps up even if nights are missed.
+              </small>
+            </div>
+
+            <div className="mem-setting-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={draft.wake}
+                  disabled={busy}
+                  onChange={(e) => set({ wake: e.target.checked })}
+                />
+                <span>Wake this computer from sleep to run</span>
+              </label>
+              <small className="muted">
+                Registers a Windows wake timer when plugged in and sleeps again once done.
+              </small>
+              {draft.wake && timerWarning && <div className="chat-error">{timerWarning}</div>}
+              {draft.wake && !dirty && view.settings.wake && !view.wake_task_registered && (
+                <div className="chat-error">
+                  Wake-up task isn&apos;t registered yet. Save again to retry.
+                </div>
+              )}
+            </div>
+          </div>
         )}
       </div>
-      {note && <p className="muted">{note}</p>}
+
+      <div className="mem-card-actions">
+        <button className="primary" disabled={busy || !dirty} onClick={() => void save()}>
+          Save schedule
+        </button>
+        {note && <small className="muted">{note}</small>}
+      </div>
       {error && <div className="chat-error">{error}</div>}
 
-      {status && (
-        <small className="muted" style={{ display: 'block' }}>
-          {status.running
-            ? 'Working now.'
-            : status.last_started
-              ? `Last run ${describeWhen(status.last_started)}${report ? `: ${describeReport(report)}` : '.'}`
-              : 'Hasn’t run yet.'}
-        </small>
+      <button
+        type="button"
+        className="disclosure-toggle"
+        aria-expanded={showDevTools}
+        onClick={() => setShowDevTools((v) => !v)}
+      >
+        {showDevTools ? '▾' : '▸'} Developer tools
+      </button>
+      {showDevTools && (
+        <div className="mem-danger-row" style={{ borderTop: 'none', paddingTop: 0 }}>
+          <div>
+            <div>Screened paragraphs export</div>
+            <small className="muted">
+              Save recent decision-model judgements as JSONL for offline evaluation
+              (docs/MEMORY_OVERNIGHT.md).
+            </small>
+          </div>
+          <button onClick={() => void saveLog()}>Export JSONL…</button>
+        </div>
       )}
-      {backlog && (
-        <small className="muted" style={{ display: 'block' }}>
-          Waiting: {backlog.screened} document{backlog.screened === 1 ? '' : 's'} for tonight,{' '}
-          {backlog.candidates_waiting} passage{backlog.candidates_waiting === 1 ? '' : 's'} to
-          recur, {backlog.pending_extraction} to learn from
-          {backlog.unscreened > 0
-            ? `, ${backlog.unscreened} for the decision model (dropped after three days)`
-            : ''}
-          .
-        </small>
-      )}
-
-      <div className="row">
-        <button className="link" onClick={() => void saveLog()}>
-          Save screened paragraphs for labelling…
-        </button>
-      </div>
-      <small className="muted">
-        For testing decision-model questions: the newest paragraphs memory judged, with each
-        question&apos;s score. See docs/MEMORY_OVERNIGHT.md.
-      </small>
-    </>
+    </div>
   );
 }

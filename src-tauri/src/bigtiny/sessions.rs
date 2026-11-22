@@ -529,24 +529,44 @@ pub async fn transcript(app: &AppHandle, session_id: String) -> Result<Vec<Value
         .collect())
 }
 
-pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<SessionInfo, String> {
-    let client = ensure_client(app)?;
-    // History and metadata are independent reads.
-    let (rows, meta) = tokio::join!(
-        fetch_history(&client, &session_id),
-        metadata(&client, &session_id)
-    );
-    let rows = rows?;
+fn row_memory_recall(row: &Value) -> Option<Value> {
+    if let Some(trace) = row
+        .get("memory_trace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(parsed) = serde_json::from_str::<Value>(trace) {
+            if parsed.is_object() {
+                return Some(parsed);
+            }
+        }
+    }
+    row.get("memory_block")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|block| {
+            json!({
+                "status": "injected",
+                "combined_block": block,
+            })
+        })
+}
+
+fn build_replay(session_id: &str, rows: &[Value]) -> Vec<Value> {
     let mut replay: Vec<Value> = Vec::with_capacity(rows.len() * 2);
     let mut push = |event: &str, payload: Value| {
         replay.push(json!({ "event": event, "payload": payload }));
     };
+    let mut pending_memory_recall: Option<Value> = None;
 
-    for row in &rows {
+    for row in rows {
         let role = row.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let text = extract_text(row);
         match role {
             "user" => {
+                pending_memory_recall = row_memory_recall(row);
                 let turn = crate::bigtiny::turn_text::parse(&text);
                 if turn.regenerate {
                     // Not a new question: the answer before it was replaced by
@@ -568,6 +588,12 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                 );
             }
             "assistant" => {
+                if let Some(recall) = pending_memory_recall.take() {
+                    push(
+                        "chat://memory-recall",
+                        json!({ "session_id": session_id, "recall": recall }),
+                    );
+                }
                 if let Some(reasoning) = row
                     .get("reasoning")
                     .and_then(|r| r.as_str())
@@ -619,6 +645,18 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
             _ => {} // system rows are internal (persona/budget), never rendered
         }
     }
+    replay
+}
+
+pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<SessionInfo, String> {
+    let client = ensure_client(app)?;
+    // History and metadata are independent reads.
+    let (rows, meta) = tokio::join!(
+        fetch_history(&client, &session_id),
+        metadata(&client, &session_id)
+    );
+    let rows = rows?;
+    let replay = build_replay(&session_id, &rows);
 
     // The chat's own card and model, so the resumed chat shows (and sends
     // on) what it was pinned to rather than today's default.
@@ -1108,5 +1146,63 @@ mod tests {
         let rows = vec![row("m0", "user"), row("m1", "assistant")];
         assert!(truncate_target(&rows, 0).is_err());
         assert!(truncate_target(&rows, -3).is_err());
+    }
+
+    #[test]
+    fn build_replay_emits_memory_recall_from_trace_or_legacy_block() {
+        let rows = vec![
+            json!({
+                "id": "u1",
+                "role": "user",
+                "content": "Hi",
+                "memory_trace": "{\"status\":\"injected\",\"duration_ms\":42,\"pathway\":{\"status\":\"injected\",\"text\":\"prefers Rust\"}}"
+            }),
+            json!({
+                "id": "a1",
+                "role": "assistant",
+                "content": "Hello"
+            }),
+            json!({
+                "id": "u2",
+                "role": "user",
+                "content": "Next?",
+                "memory_block": "[Working assumptions about you]\n- Likes ArXiv"
+            }),
+            json!({
+                "id": "a2",
+                "role": "assistant",
+                "content": "Sure"
+            }),
+            // User turn without an assistant reply must NOT emit a dangling recall event.
+            json!({
+                "id": "u3",
+                "role": "user",
+                "content": "Errored?",
+                "memory_trace": "{\"status\":\"empty\"}"
+            }),
+        ];
+        let replay = build_replay("s1", &rows);
+        let events: Vec<&str> = replay
+            .iter()
+            .filter_map(|e| e.get("event").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "chat://user-message",
+                "chat://memory-recall",
+                "chat://message-delta",
+                "chat://user-message",
+                "chat://memory-recall",
+                "chat://message-delta",
+                "chat://user-message",
+            ]
+        );
+        assert_eq!(replay[1]["payload"]["recall"]["duration_ms"], 42);
+        assert_eq!(replay[4]["payload"]["recall"]["status"], "injected");
+        assert!(replay[4]["payload"]["recall"]["combined_block"]
+            .as_str()
+            .unwrap()
+            .contains("Likes ArXiv"));
     }
 }

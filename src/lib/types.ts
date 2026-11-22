@@ -133,7 +133,13 @@ export interface OvernightSettings {
   pathway: boolean;
   /** Wake the computer at the window's start (a Windows scheduled task). */
   wake: boolean;
+  /** Also run small bounded memory batches during daytime idle periods. */
+  idle_micro?: boolean;
 }
+
+/** Which model the memory engines learn with (`config::providers::learning`). */
+export type LearningModelSetting =
+  { kind: 'auto' } | { kind: 'chat' } | { kind: 'provider'; provider_id: string; model: string };
 
 /** What the engine's last overnight pass did (`OvernightReport`). */
 export interface OvernightReport {
@@ -149,7 +155,7 @@ export interface OvernightReport {
   extraction_failed: number;
   propositions_written: number;
   finished: boolean;
-  trigger?: 'window' | 'catch_up' | 'run_now';
+  trigger?: 'window' | 'catch_up' | 'run_now' | 'idle_micro';
   ended_at?: string;
 }
 
@@ -839,6 +845,7 @@ export interface PathwayBelief {
   id: string;
   text: string;
   layer: 'identity' | 'context' | 'conversation';
+  kind?: 'preference' | 'stance' | 'context' | 'trait';
   confidence: number;
   tested: boolean;
   domain: string | null;
@@ -854,6 +861,9 @@ export interface PathwayBelief {
     `background::reembed_stale_beliefs` in `adaptive-pathway_rust`). */
 export interface PathwayStats {
   total: number;
+  tested?: number;
+  contradicted?: number;
+  avg_confidence?: number;
   by_layer: Record<string, number>;
   embedding_migration: {
     /** Beliefs still tagged with a stale embedding model, awaiting the
@@ -868,6 +878,13 @@ export interface PathwayStats {
     /** This app's sessions with messages past their learn watermark. */
     unlearned_sessions: number;
   };
+  /** Single-session inferred observations awaiting cross-session synthesis. */
+  staged?: {
+    pending: number;
+    sessions: number;
+  };
+  /** Engagement rates for active behavioral directives (Phase 4). */
+  signals?: Record<string, { engaged: number; total: number }>;
 }
 
 /** Connection status of the in-process `"memorabilia"` MCP server — whether
@@ -984,6 +1001,27 @@ export interface ToolCallEvent {
   session_id: string;
   phase: 'tool_call' | 'tool_call_update';
   update: ToolCallUpdate;
+}
+
+export interface MemoryRecallSubsystem {
+  status: 'injected' | 'seeded' | 'empty' | 'timed_out' | 'paused' | 'disabled' | string;
+  text?: string | null;
+  item_count?: number;
+}
+
+export interface MemoryRecallTrace {
+  status: 'injected' | 'unchanged' | 'empty' | 'timed_out' | 'paused' | string;
+  duration_ms?: number;
+  pathway?: MemoryRecallSubsystem;
+  memorabilia?: MemoryRecallSubsystem;
+  counterpoint?: string | null;
+  preflight?: string | null;
+  combined_block?: string | null;
+}
+
+export interface MemoryRecallEvent {
+  session_id: string;
+  recall: MemoryRecallTrace;
 }
 
 export interface SessionTitleEvent {

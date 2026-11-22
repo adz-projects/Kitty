@@ -1,23 +1,27 @@
 import { useState } from 'react';
 import { ToolCallCard } from './ToolCallCard';
-import type { ToolCall } from '@/stores/chatStore';
+import { MemoryRecallCard } from './MemoryRecallCard';
+import type { MemoryRecallTrace, ToolCall } from '@/stores/chatStore';
 
-/** One collapsible container for a turn's reasoning trace and tool calls
-    (Round-3 item 23, replaces the separate ReasoningPanel + loose ToolCallCard
-    list). Reasoning and tool calls have no shared timestamp in the streaming
-    assembly, so this groups rather than truly interleaves them: reasoning
-    narrative first, then every tool call in order. Collapsed by default,
-    including while reasoning streams — it only opens when the user explicitly
-    clicks it (`pinned`), which then sticks for the rest of the turn. */
+/** One collapsible container for a turn's reasoning trace, memory recall
+    inspector, and tool calls (Round-3 item 23, replaces the separate
+    ReasoningPanel + loose ToolCallCard list). Reasoning and tool calls have no
+    shared timestamp in the streaming assembly, so this groups rather than
+    truly interleaves them: reasoning narrative first, then memory recall and
+    every tool call in order. Collapsed by default, including while reasoning
+    streams — it only opens when the user explicitly clicks it (`pinned`),
+    which then sticks for the rest of the turn. */
 export function ThinkingBox({
   reasoning,
   toolCalls,
+  memoryRecall,
   streaming,
   hasAnswer,
   draft,
 }: {
   reasoning: string;
   toolCalls: ToolCall[];
+  memoryRecall?: MemoryRecallTrace;
   streaming: boolean;
   hasAnswer: boolean;
   /** An answer written before every specialist report was in — kept for the
@@ -46,8 +50,9 @@ export function ThinkingBox({
               <div className="reasoning-text">{draft}</div>
             </div>
           )}
-          {toolCalls.length > 0 && (
+          {(memoryRecall || toolCalls.length > 0) && (
             <div className="reasoning-tools">
+              {memoryRecall && <MemoryRecallCard recall={memoryRecall} />}
               {toolCalls.map((tc) => (
                 <ToolCallCard key={tc.id} call={tc} />
               ))}

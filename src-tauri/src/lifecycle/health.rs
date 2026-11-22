@@ -102,6 +102,7 @@ pub fn spawn_health_loop(app: AppHandle) {
                             super::decider::apply_decider(&app2).await;
                             super::app_events::apply_approval_policy(&app2).await;
                             super::overnight::apply_overnight(&app2).await;
+                            super::overnight::apply_learning_model(&app2).await;
                         });
                     }
                 }

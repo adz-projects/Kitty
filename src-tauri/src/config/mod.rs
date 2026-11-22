@@ -370,6 +370,10 @@ pub struct Config {
     /// Overnight learning (`lifecycle::overnight`).
     #[serde(default)]
     pub overnight: OvernightSettings,
+    /// Which model the memory engines learn with
+    /// (`config::providers::learning`). Both platforms.
+    #[serde(default)]
+    pub memory_learning_model: crate::config::providers::LearningModelSetting,
     /// BigTiny context-window/compaction budget settings, relayed as
     /// `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn (same mechanism and
     /// rationale as `summarizer` above). `#[serde(default)]` covers loading
@@ -523,6 +527,7 @@ impl Default for Config {
             critique: CritiqueSettings::default(),
             decider: DeciderSettings::default(),
             overnight: OvernightSettings::default(),
+            memory_learning_model: Default::default(),
             token_management: TokenManagementSettings::default(),
             memory: MemorySettings::default(),
         }
@@ -1010,6 +1015,10 @@ pub struct OvernightSettings {
     pub pathway: bool,
     /// Wake the computer at the window's start (a scheduled task).
     pub wake: bool,
+    /// Also run small bounded memory batches during daytime idle periods
+    /// (mains power, nothing else loading the machine).
+    #[serde(default = "default_true")]
+    pub idle_micro: bool,
 }
 
 impl Default for OvernightSettings {
@@ -1020,6 +1029,7 @@ impl Default for OvernightSettings {
             end: "05:00".into(),
             pathway: true,
             wake: false,
+            idle_micro: true,
         }
     }
 }

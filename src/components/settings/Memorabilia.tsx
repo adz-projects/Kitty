@@ -5,16 +5,14 @@ import { MemorabiliaBrowser } from './MemorabiliaBrowser';
 import { MemorabiliaHealth } from './MemorabiliaHealth';
 import { EraseMemory } from './EraseMemory';
 import { OvernightLearning } from './OvernightLearning';
+import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { useMemoryStatus } from '@/hooks/useMemoryStatus';
 import { useRouteStore } from '@/stores/routeStore';
 
-/** Settings for the memorabilia (declarative factual-memory) engine — the
-    substantive-memory counterpart to Adaptive Pathway's behavioral memory.
-    It distills durable factual claims from the documents a chat brings in
-    (pasted text, attached files, scraped pages — `agent::memorabilia_harvest`),
-    tracks their confidence from the supporting evidence, and surfaces a
-    small, relevant slice back per turn. Shares Adaptive Pathway's learning
-    model, and like it, runs only once that model is downloaded. */
+/** Settings for Memorabilia (factual memory): extracts durable claims from
+    shared documents, attached files, and scraped pages, and lets you inspect,
+    filter, schedule, or forget stored facts. */
 export function Memorabilia() {
   const memory = useMemoryStatus();
   const modelMissing = memory !== null && !memory.model_installed;
@@ -24,6 +22,12 @@ export function Memorabilia() {
   const [error, setError] = useState('');
   const [mcpStatus, setMcpStatus] = useState<MemorabiliaMcpStatus | null>(null);
   const [mcpStatusError, setMcpStatusError] = useState('');
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [showMaintenance, setShowMaintenance] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [repairMsg, setRepairMsg] = useState('');
+
+  const bumpRefresh = () => setRefreshKey((k) => k + 1);
 
   const loadMcpStatus = () =>
     void ipc
@@ -42,16 +46,9 @@ export function Memorabilia() {
 
   useEffect(() => {
     void load();
-    // Mount-only by design (same reasoning as AdaptivePathway): `load` is a
-    // fresh closure each render and captures nothing that changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Flips the config flag; the Rust command restarts BigTiny (which is what
-      actually starts/stops the in-process engine — it's linked into that
-      process, there's nothing separate to spawn) and self-heals the MCP
-      registration, so the frontend just flips the flag and re-reads status
-      once it settles. */
   const setEnabledCombined = async (next: boolean) => {
     setBusy(true);
     setError('');
@@ -59,8 +56,8 @@ export function Memorabilia() {
       setEnabled(next);
       await ipc.setMemorabiliaEnabled(next);
       loadMcpStatus();
+      bumpRefresh();
     } catch (e) {
-      // Revert the optimistic flip — the config flag never changed.
       setEnabled(!next);
       setError(String(e));
     } finally {
@@ -68,72 +65,121 @@ export function Memorabilia() {
     }
   };
 
+  const repair = async () => {
+    const ok = await confirmDialog({
+      title: 'Check and repair the fact database?',
+      message: DB_REPAIR_CONFIRM,
+      confirmLabel: 'Check & repair',
+    });
+    if (!ok) return;
+    setRepairing(true);
+    setRepairMsg('');
+    try {
+      setRepairMsg(await runDbRepair(ipc.recoverMemorabiliaDb));
+      bumpRefresh();
+    } catch (e) {
+      setRepairMsg(String(e));
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   return (
-    <section className="settings-section">
+    <section className="settings-section memory-settings">
       <h1>Memorabilia</h1>
       <p className="muted">
-        Remembers durable facts from what you share in chats — pasted text, attached files and pages
-        it reads — and brings the relevant ones back when they matter. Everything it holds is
-        something you can see and correct below.
+        Extracts corroborated facts from pasted text, attached files, and scraped pages so relevant
+        knowledge returns automatically when needed.
       </p>
       {error && <div className="chat-error">{error}</div>}
 
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={enabled && !modelMissing}
-          disabled={busy || modelMissing}
-          onChange={(e) => void setEnabledCombined(e.target.checked)}
-        />
-        <span>Enable Memorabilia</span>
-      </label>
-      <small className="muted">
+      <div className="mem-card">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={enabled && !modelMissing}
+            disabled={busy || modelMissing}
+            onChange={(e) => void setEnabledCombined(e.target.checked)}
+          />
+          <span>Enable Memorabilia</span>
+        </label>
+
         {modelMissing ? (
-          <>
-            Download the memory model to enable it —{' '}
+          <small className="muted">
+            Download the shared embedding model to enable —{' '}
             <button
               className="link"
               onClick={() => goto('settings', { section: 'adaptive_pathway' })}
             >
-              set it up in Adaptive Pathway
+              set it up in Adaptive Pathway →
             </button>
-            .
-          </>
+          </small>
+        ) : enabled ? (
+          <div className="mem-status-strip">
+            {mcpStatusError ? (
+              <span className="mem-pill mem-pill-danger">Tools check failed: {mcpStatusError}</span>
+            ) : mcpStatus == null ? (
+              <span className="mem-pill">Registering tools…</span>
+            ) : mcpStatus.status === 'connected' ? (
+              <span className="mem-pill mem-pill-ok">
+                Tools ready ({mcpStatus.tool_count}: search, read item)
+              </span>
+            ) : (
+              <span className="mem-pill mem-pill-warn">
+                Tools {mcpStatus.status}
+                {mcpStatus.error_message ? ` (${mcpStatus.error_message})` : ''}
+              </span>
+            )}
+            <span className="mem-pill">Shares Adaptive Pathway embedding model</span>
+          </div>
         ) : (
-          'Takes effect straight away. Uses the same learning model as Adaptive Pathway.'
+          <small className="muted">Takes effect immediately when enabled.</small>
         )}
-      </small>
+      </div>
 
-      {enabled && (
-        <small className="muted" style={{ display: 'block', marginTop: 8 }}>
-          {mcpStatusError ? (
-            <>Couldn&apos;t check tool registration: {mcpStatusError}</>
-          ) : mcpStatus == null ? (
-            <>Tools not registered yet — they&apos;ll appear shortly.</>
-          ) : mcpStatus.status === 'connected' ? (
-            <>
-              Connected: <strong>{mcpStatus.tool_count}</strong> tool
-              {mcpStatus.tool_count === 1 ? '' : 's'} available to the model (search, read item).
-            </>
-          ) : (
-            <>
-              MCP server <strong>{mcpStatus.status}</strong> — tools not reaching the model.
-              {mcpStatus.error_message ? ` ${mcpStatus.error_message}` : ''}
-            </>
-          )}
-        </small>
-      )}
-
-      {/* Shown whether or not Memorabilia is on: it also decides when
-          Adaptive Pathway learns. */}
       {!modelMissing && <OvernightLearning />}
 
       {enabled && !modelMissing && (
         <>
-          <h2>What it remembers</h2>
-          <MemorabiliaBrowser />
-          <MemorabiliaHealth />
-          <EraseMemory what="facts" phrase="erase facts" erase={ipc.eraseAllFacts} />
+          <MemorabiliaHealth refreshKey={refreshKey} />
+          <MemorabiliaBrowser refreshKey={refreshKey} onMutated={bumpRefresh} />
+
+          <div className="mem-card">
+            <button
+              type="button"
+              className="disclosure-toggle"
+              aria-expanded={showMaintenance}
+              onClick={() => setShowMaintenance((v) => !v)}
+            >
+              {showMaintenance ? '▾' : '▸'} Maintenance &amp; reset
+            </button>
+            {showMaintenance && (
+              <div className="provider-advanced-body">
+                <div className="mem-danger-row" style={{ borderTop: 'none', paddingTop: 0 }}>
+                  <div>
+                    <div>Repair database</div>
+                    <small className="muted">
+                      Checks SQLite integrity and rebuilds from readable rows if corrupt.
+                    </small>
+                    {repairMsg && (
+                      <div>
+                        <small className="muted">{repairMsg}</small>
+                      </div>
+                    )}
+                  </div>
+                  <button onClick={() => void repair()} disabled={repairing}>
+                    {repairing ? 'Checking…' : 'Check & repair'}
+                  </button>
+                </div>
+                <EraseMemory
+                  what="facts"
+                  phrase="erase facts"
+                  erase={ipc.eraseAllFacts}
+                  onErased={bumpRefresh}
+                />
+              </div>
+            )}
+          </div>
         </>
       )}
     </section>

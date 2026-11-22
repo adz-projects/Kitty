@@ -1,184 +1,172 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
-import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
 import { STALL_HOURS, describeAge, isStalled } from './memoryHealth';
-import type { PathwayBelief, PathwayStats } from '@/lib/types';
-import { confirmDialog } from '@/components/shared/ConfirmDialog';
+import type { PathwayStats } from '@/lib/types';
 
-const SUPPORT_BUCKETS: [string, (n: number) => boolean][] = [
-  ['Mentioned once', (n) => n === 1],
-  ['Mentioned a few times (2–4)', (n) => n >= 2 && n <= 4],
-  ['Mentioned often (5+)', (n) => n >= 5],
-];
+const LAYER_ORDER = ['identity', 'context', 'conversation'] as const;
 
-/** Friendly names for the belief layers in `stats.by_layer` — a plain
-    `Record<string, number>` on the wire, so this falls back to the raw key
-    for anything not in the known set rather than dropping it silently. */
-const LAYER_LABEL: Record<string, string> = {
-  identity: 'about you',
-  context: 'about your current situation',
-  conversation: 'from this conversation',
+const LAYER_SHORT: Record<string, string> = {
+  identity: 'identity',
+  context: 'context',
+  conversation: 'chat',
 };
 
-/** Belief-health view for the pathway (behavioral-memory) engine, rolled
-    into Adaptive Pathway as a section (release-fixes item 23) rather than
-    its own nav tab — a stats readout on its own didn't need a full page,
-    and its old copy ("by-layer breakdown", "contradicted count") assumed
-    more familiarity with the engine's internals than a settings page
-    should. Sourced from `GET /api/pathway/stats` + `GET /api/pathway/beliefs`;
-    no live edit surface here — that's the belief table above. */
-export function GraphHealth() {
+const SIGNAL_LABEL: Record<string, string> = {
+  challenge: 'Challenge',
+  tension: 'Tension',
+  fresh_angle: 'Fresh angle',
+  worth_testing: 'Assumptions tested',
+};
+
+/** Overview metrics and signal telemetry for Adaptive Pathway, rendered as a
+    scannable card above the belief browser. */
+export function GraphHealth({ refreshKey = 0 }: { refreshKey?: number }) {
   const [stats, setStats] = useState<PathwayStats | null>(null);
-  const [beliefs, setBeliefs] = useState<PathwayBelief[]>([]);
+  const [fallbackTested, setFallbackTested] = useState<number | null>(null);
+  const [fallbackAvgConf, setFallbackAvgConf] = useState<number | null>(null);
+  const [fallbackContradicted, setFallbackContradicted] = useState<number>(0);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [repairing, setRepairing] = useState(false);
-  const [repairMsg, setRepairMsg] = useState('');
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const [s, b] = await Promise.all([ipc.getPathwayStats(), ipc.getPathwayBeliefs()]);
+      const s = await ipc.getPathwayStats();
       setStats(s);
-      setBeliefs(b.beliefs);
+      // Fallback for older daemons before aggregate fields were added to /stats.
+      if (typeof s.tested !== 'number' || typeof s.avg_confidence !== 'number') {
+        const b = await ipc.getPathwayBeliefs();
+        const tested = b.beliefs.filter((x) => x.tested).length;
+        const avg = b.beliefs.length
+          ? b.beliefs.reduce((sum, x) => sum + x.confidence, 0) / b.beliefs.length
+          : 0;
+        const contradicted = b.beliefs.filter((x) => x.contradict_count > 0).length;
+        setFallbackTested(tested);
+        setFallbackAvgConf(avg);
+        setFallbackContradicted(contradicted);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => void load(), []);
+  useEffect(() => {
+    void load();
+  }, [load, refreshKey]);
 
-  const repair = async () => {
-    const ok = await confirmDialog({
-      title: 'Check and repair the belief database?',
-      message: DB_REPAIR_CONFIRM,
-      confirmLabel: 'Check & repair',
-    });
-    if (!ok) {
-      return;
-    }
-    setRepairing(true);
-    setRepairMsg('');
-    try {
-      setRepairMsg(await runDbRepair(ipc.recoverPathwayDb));
-      await load();
-    } catch (e) {
-      setRepairMsg(String(e));
-    } finally {
-      setRepairing(false);
-    }
-  };
+  const testedCount = stats?.tested ?? fallbackTested ?? 0;
+  const avgConfidence = stats?.avg_confidence ?? fallbackAvgConf ?? 0;
+  const contradictedCount = stats?.contradicted ?? fallbackContradicted;
 
-  const tested = beliefs.filter((b) => b.tested).length;
-  const contradicted = beliefs.filter((b) => b.contradict_count > 0).length;
-  const avgConfidence = beliefs.length
-    ? beliefs.reduce((sum, b) => sum + b.confidence, 0) / beliefs.length
-    : 0;
+  const layerSummary = stats
+    ? LAYER_ORDER.filter((l) => (stats.by_layer[l] ?? 0) > 0)
+        .map((l) => `${stats.by_layer[l]} ${LAYER_SHORT[l] ?? l}`)
+        .join(' · ')
+    : '';
+
+  const signalEntries = Object.entries(stats?.signals ?? {}).filter(([, v]) => v.total > 0);
+  const staged = stats?.staged;
 
   return (
-    <>
-      <h2>Health</h2>
-      <p className="muted">
-        A quick look at what Kitty has learned. Nothing here needs your attention.
-      </p>
-      {loading && <p className="muted">Loading…</p>}
+    <div className="mem-card">
+      <div className="mem-card-head">
+        <h2>Overview</h2>
+        <button onClick={() => void load()} disabled={loading}>
+          {loading ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+
       {error && <div className="chat-error">{error}</div>}
+      {!stats && loading && <p className="muted">Loading…</p>}
 
       {stats && (
-        <div className="field">
-          <div>
-            Kitty has learned <strong>{stats.total}</strong> thing{stats.total === 1 ? '' : 's'}{' '}
-            about you
-            {Object.keys(stats.by_layer).length > 0 && (
-              <>
-                {' '}
-                &mdash;{' '}
-                {Object.entries(stats.by_layer)
-                  .map(([layer, count]) => `${count} ${LAYER_LABEL[layer] ?? layer}`)
-                  .join(', ')}
-              </>
-            )}
-            .
+        <>
+          <div className="mem-stats-grid">
+            <div className="mem-stat">
+              <span className="mem-stat-label">Stored beliefs</span>
+              <span className="mem-stat-value">{stats.total}</span>
+              <span className="mem-stat-sub">{layerSummary || 'None yet'}</span>
+            </div>
+
+            <div className="mem-stat">
+              <span className="mem-stat-label">Confirmed</span>
+              <span className="mem-stat-value">{testedCount}</span>
+              <span className="mem-stat-sub">
+                {stats.total > 0
+                  ? `${Math.round(avgConfidence * 100)}% avg confidence`
+                  : 'Waiting for signal'}
+              </span>
+            </div>
+
+            <div className="mem-stat">
+              <span className="mem-stat-label">Pending synthesis</span>
+              <span className="mem-stat-value">{staged ? staged.pending : 0}</span>
+              <span className="mem-stat-sub">
+                {staged && staged.pending > 0
+                  ? `Across ${staged.sessions} chat${staged.sessions === 1 ? '' : 's'}`
+                  : stats.learning && stats.learning.unlearned_sessions > 0
+                    ? `${stats.learning.unlearned_sessions} chat${
+                        stats.learning.unlearned_sessions === 1 ? '' : 's'
+                      } queued`
+                    : 'Up to date'}
+              </span>
+            </div>
+
+            <div className="mem-stat">
+              <span className="mem-stat-label">Last learned</span>
+              <span className="mem-stat-value" style={{ fontSize: 'var(--fs-md)', paddingTop: 4 }}>
+                {stats.learning ? describeAge(stats.learning.last_learn_at) : '—'}
+              </span>
+              <span className="mem-stat-sub">
+                {contradictedCount > 0
+                  ? `${contradictedCount} active conflict${contradictedCount === 1 ? '' : 's'}`
+                  : 'No conflicts'}
+              </span>
+            </div>
           </div>
-          {stats.learning && (
-            <div className="muted">
-              Last learned from a conversation {describeAge(stats.learning.last_learn_at)}
-              {stats.learning.unlearned_sessions > 0 &&
-                ` · ${stats.learning.unlearned_sessions} conversation${
-                  stats.learning.unlearned_sessions === 1 ? '' : 's'
-                } still to read`}
-              .
+
+          {signalEntries.length > 0 && (
+            <div className="mem-signal-block">
+              <div className="mem-signal-heading">
+                Directive uptake in recent replies (approximate)
+              </div>
+              <div className="mem-status-strip">
+                {signalEntries.map(([kind, counts]) => {
+                  const pct = Math.round((counts.engaged / counts.total) * 100);
+                  return (
+                    <span
+                      key={kind}
+                      className={`mem-pill ${pct >= 50 ? 'mem-pill-ok' : ''}`}
+                      title={`About ${counts.engaged} of ${counts.total} replies took it up: a word-matching estimate, not a judgement`}
+                    >
+                      {SIGNAL_LABEL[kind] ?? kind}: {counts.engaged}/{counts.total} ({pct}%)
+                    </span>
+                  );
+                })}
+              </div>
             </div>
           )}
+
           {stats.learning &&
             isStalled(stats.learning.unlearned_sessions, stats.learning.last_learn_at) && (
               <div className="memory-stall" role="status">
-                Learning seems to have stopped: conversations are waiting, but nothing has been
-                learned for over {STALL_HOURS} hours.
+                Learning seems to have paused: {stats.learning.unlearned_sessions} chat
+                {stats.learning.unlearned_sessions === 1 ? '' : 's'} waiting, with nothing learned
+                for over {STALL_HOURS} hours.
               </div>
             )}
+
           {stats.embedding_migration.pending > 0 && (
-            <div className="muted">
-              Double-checking {stats.embedding_migration.pending} belief
-              {stats.embedding_migration.pending === 1 ? '' : 's'} after an update — happens
-              automatically in the background, no action needed.
-            </div>
+            <small className="muted">
+              Re-indexing {stats.embedding_migration.pending} belief
+              {stats.embedding_migration.pending === 1 ? '' : 's'} in the background.
+            </small>
           )}
-        </div>
-      )}
-
-      {beliefs.length > 0 && (
-        <>
-          <h3>How sure Kitty is</h3>
-          <div className="field">
-            <div>
-              <strong>{tested}</strong> confirmed, <strong>{beliefs.length - tested}</strong> not
-              yet confirmed
-              <div className="muted">
-                Unconfirmed beliefs count less until you or the conversation confirms them.
-              </div>
-            </div>
-            <div>
-              <strong>{(avgConfidence * 100).toFixed(0)}%</strong> average confidence
-            </div>
-            {contradicted > 0 && (
-              <div>
-                <strong>{contradicted}</strong> conflict with something learned since
-                <div className="muted">
-                  Not resolved automatically — down-weighted until you settle it.
-                </div>
-              </div>
-            )}
-          </div>
-
-          <h3>How often each was mentioned</h3>
-          <div className="field">
-            {SUPPORT_BUCKETS.map(([label, test]) => (
-              <div key={label}>
-                <strong>{beliefs.filter((b) => test(b.support_count)).length}</strong> {label}
-              </div>
-            ))}
-          </div>
         </>
       )}
-
-      <h3>Maintenance</h3>
-      <p className="muted">
-        If Kitty stops learning, the memory database may have been corrupted (for example by a crash
-        mid-write). This checks it and, only if needed, rebuilds it — keeping every record it can
-        still read and backing up the old file first.
-      </p>
-      <div className="field">
-        <button onClick={() => void repair()} disabled={repairing}>
-          {repairing ? 'Checking…' : 'Check & repair database'}
-        </button>
-        {repairMsg && <div className="muted">{repairMsg}</div>}
-      </div>
-
-      <button onClick={() => void load()}>Refresh</button>
-    </>
+    </div>
   );
 }

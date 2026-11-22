@@ -328,6 +328,7 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     // Overnight learning: the engine's window, and the wake-up task (which an
     // upgrade's uninstall removes).
     overnight::apply_overnight(app).await;
+    overnight::apply_learning_model(app).await;
     if let Err(e) = overnight::sync_wake_task(app).await {
         tracing::warn!("overnight: wake-up task not in step with Settings: {e}");
     }

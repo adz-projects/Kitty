@@ -100,10 +100,14 @@ export const MessageItem = memo(function MessageItem({
 
   return (
     <div className="msg msg-assistant" onClick={onTap}>
-      {(message.reasoning || message.draftText || otherToolCalls.length > 0) && (
+      {(message.reasoning ||
+        message.draftText ||
+        message.memoryRecall ||
+        otherToolCalls.length > 0) && (
         <ThinkingBox
           reasoning={message.reasoning}
           toolCalls={otherToolCalls}
+          memoryRecall={message.memoryRecall}
           streaming={message.streaming}
           hasAnswer={message.text.length > 0}
           draft={message.draftText}

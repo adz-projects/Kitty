@@ -23,6 +23,7 @@ import {
   onSessionTitle,
   onSubagentStatus,
   onToolCall,
+  onMemoryRecall,
   onUserMessage,
   onSuperseded,
   pickSavePath,
@@ -2218,6 +2219,41 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       };
       replayHandlers.set('chat://superseded', handleSuperseded);
       void onSuperseded(handleSuperseded);
+
+      const handleMemoryRecall: Parameters<typeof onMemoryRecall>[0] = (e) => {
+        if (!forActive(e.session_id)) return;
+        flushDeltas();
+        set((s) => {
+          let msgs = s.messages.slice();
+          let last = msgs[msgs.length - 1];
+          if (!(
+            last &&
+            last.role === 'assistant' &&
+            (last.open || isStragglerAssistantMessage(last, s.busy))
+          )) {
+            msgs = closeOpen(msgs);
+            last = {
+              id: newId(),
+              role: 'assistant',
+              text: '',
+              reasoning: '',
+              toolCalls: [],
+              streaming: !s.replaying,
+              open: true,
+            };
+            msgs.push(last);
+          } else {
+            last = { ...last };
+            msgs[msgs.length - 1] = last;
+          }
+          last.memoryRecall = e.recall;
+          return { messages: msgs };
+        });
+      };
+      replayHandlers.set('chat://memory-recall', handleMemoryRecall);
+      if (typeof onMemoryRecall === 'function') {
+        void onMemoryRecall(handleMemoryRecall);
+      }
 
       const handleToolCall: Parameters<typeof onToolCall>[0] = (e) => {
         if (!forActive(e.session_id)) return;

@@ -100,6 +100,42 @@ pub async fn set_overnight(
     Ok(settings)
 }
 
+/// The memory learning model (`config::providers::learning`).
+#[tauri::command]
+pub fn get_memory_learning_model(
+    app: AppHandle,
+) -> Result<crate::config::providers::LearningModelSetting, String> {
+    Ok(app
+        .state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .memory_learning_model
+        .clone())
+}
+
+/// Save the memory learning model, sync its card (a provider choice is a row
+/// of its own), then relay the choice to the engine.
+#[tauri::command]
+pub async fn set_memory_learning_model(
+    app: AppHandle,
+    choice: crate::config::providers::LearningModelSetting,
+) -> Result<crate::config::providers::LearningModelSetting, String> {
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        crate::config::providers::learning::validate(&cfg, &choice)?;
+        cfg.memory_learning_model = choice.clone();
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
+        tracing::warn!("learning model saved, but the engine did not take its card yet: {e}");
+        return Err("Saved. The engine will pick it up once it is running again.".into());
+    }
+    crate::lifecycle::overnight::apply_learning_model(&app).await;
+    Ok(choice)
+}
+
 /// *Process now*: the engine runs the pass at its next sweep tick, without
 /// waiting for the window or for the user to step away.
 #[tauri::command]

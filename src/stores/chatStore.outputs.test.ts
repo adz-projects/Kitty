@@ -38,6 +38,7 @@ vi.mock('@/lib/ipc', () => {
     'onSessionTitle',
     'onSubagentStatus',
     'onToolCall',
+    'onMemoryRecall',
     'onUserMessage',
     'onSuperseded',
   ];

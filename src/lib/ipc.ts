@@ -47,6 +47,7 @@ import type {
   ModelInfo,
   ProviderAccountView,
   DebateSeat,
+  LearningModelSetting,
   OpenRouterCredits,
   PathInfo,
   StagedAttachment,
@@ -59,6 +60,7 @@ import type {
   ChatNoticeEvent,
   EngineInfo,
   MemoryStatus,
+  MemoryRecallEvent,
   UserMessageEvent,
   PendingApproval,
   RestartOutcome,
@@ -437,6 +439,11 @@ export const ipc = {
   /** The providers themselves, each with its ranked model list. */
   listProviderAccounts: () => invoke<ProviderAccountView[]>('list_provider_accounts'),
   getDebatePanel: () => invoke<DebateSeat[]>('get_debate_panel'),
+  /** The model the memory engines learn with. */
+  getMemoryLearningModel: () => invoke<LearningModelSetting>('get_memory_learning_model'),
+  /** Save it, sync its card and relay it to the engine; returns it as saved. */
+  setMemoryLearningModel: (choice: LearningModelSetting) =>
+    invoke<LearningModelSetting>('set_memory_learning_model', { choice }),
   /** Saves the panel and syncs its seats to the engine; returns it as saved. */
   setDebatePanel: (seats: DebateSeat[]) => invoke<DebateSeat[]>('set_debate_panel', { seats }),
   /** Describe and rank a provider form's model list against the catalog. */
@@ -777,6 +784,8 @@ export const onReasoningDelta = (cb: (e: TextDeltaEvent) => void) =>
   listen<TextDeltaEvent>('chat://reasoning-delta', (e) => cb(e.payload));
 export const onToolCall = (cb: (e: ToolCallEvent) => void) =>
   listen<ToolCallEvent>('chat://tool-call', (e) => cb(e.payload));
+export const onMemoryRecall = (cb: (e: MemoryRecallEvent) => void) =>
+  listen<MemoryRecallEvent>('chat://memory-recall', (e) => cb(e.payload));
 export const onSessionTitle = (cb: (e: SessionTitleEvent) => void) =>
   listen<SessionTitleEvent>('chat://session-title', (e) => cb(e.payload));
 export const onComplete = (cb: (e: CompleteEvent) => void) =>

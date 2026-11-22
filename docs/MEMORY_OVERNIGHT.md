@@ -177,6 +177,13 @@ work and runs while Kitty is closed:
   machine is idle again.
 - **Stopping**: the pass checks the clock between items and stops at the
   window's end mid-batch; everything left waits for the next night.
+- **Daytime passes** (`idle_micro`, on by default): after 7 minutes idle on
+  mains power, a short pass runs outside the window, at most every 30 minutes:
+  two extractions, one pathway session, no analogy pass. It stops between items
+  when the user comes back.
+- **Not while the machine is busy**: daytime passes (micro and catch-up) wait
+  while something else loads the CPU (50% or more) or, on Windows, the GPU's 3D
+  engines (40% or more): a build, render, download or game left running.
 - With `enabled` off (or for an app that sends no settings), the same pass
   runs about once an hour instead — the selection pipeline is the same, only
   the timing differs. The recurrence step compares every waiting candidate
@@ -232,6 +239,13 @@ work and runs while Kitty is closed:
    rejects leaves the previous configuration in place, with the reason in
    Settings → Advanced's error log. Remove the key to go back to the default
    set.
+
+## Settings → Adaptive Pathway → Memory learning model
+
+Which model both engines learn with: the helper model (else the chat's own
+model), the chat's own model, or any model a provider lists (synced to the
+engine as a card of its own, `learning-model`, never offered to chats). Both
+platforms; relayed per app to `/api/apps/me/learning-model`.
 
 ## Settings → Memorabilia → Overnight learning
 

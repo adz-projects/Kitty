@@ -1,30 +1,38 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { PathwayBelief } from '@/lib/types';
+
+type LayerFilter = 'all' | PathwayBelief['layer'] | 'conflicts';
 
 const LAYER_LABEL: Record<PathwayBelief['layer'], string> = {
   identity: 'Identity',
   context: 'Context',
-  conversation: 'Conversation',
+  conversation: 'Chat',
 };
 
-/** Lists every belief the pathway (behavioral-memory) engine currently
-    holds about the user — the "correct me" surface the original design
-    called for and that never got built while the engine only shipped a
-    tool-hint UI. Confidence/tested/layer/support are exactly what
-    `GET /api/pathway/beliefs` returns (`plugins/bigtiny_rust/src/routes/
-    pathway.rs::list_beliefs`) — no provenance field exists on the wire, so
-    none is shown rather than fabricated. Delete routes through the same
-    `forget` semantics the model's own `forget` MCP tool uses (permanent
-    suppression + tombstone, not a bare row delete, so a deleted belief
-    can't silently be relearned on the next extraction pass). */
-export function BeliefBrowser() {
+const KIND_LABEL: Record<NonNullable<PathwayBelief['kind']>, string> = {
+  preference: 'Preference',
+  stance: 'Stance',
+  context: 'Context',
+  trait: 'Trait',
+};
+
+/** Searchable card-list browser for everything Adaptive Pathway holds,
+    allowing users to filter by layer/conflicts and forget entries cleanly. */
+export function BeliefBrowser({
+  refreshKey = 0,
+  onMutated,
+}: {
+  refreshKey?: number;
+  onMutated?: () => void;
+}) {
   const [beliefs, setBeliefs] = useState<PathwayBelief[] | null>(null);
   const [error, setError] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
+  const [layerFilter, setLayerFilter] = useState<LayerFilter>('all');
 
-  const load = () =>
+  const load = useCallback(() => {
     void ipc
       .getPathwayBeliefs()
       .then((r) => {
@@ -32,16 +40,18 @@ export function BeliefBrowser() {
         setError('');
       })
       .catch((e) => setError(String(e)));
+  }, []);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load, refreshKey]);
 
   const remove = async (id: string) => {
     setDeletingId(id);
     try {
       await ipc.deletePathwayBelief(id);
       setBeliefs((prev) => (prev ? prev.filter((b) => b.id !== id) : prev));
+      onMutated?.();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -49,63 +59,111 @@ export function BeliefBrowser() {
     }
   };
 
-  if (error) return <p className="chat-error">{error}</p>;
-  if (beliefs == null) return <p className="muted">Loading…</p>;
-  if (beliefs.length === 0) return <p className="muted">Nothing learned yet.</p>;
-
   const q = filter.trim().toLowerCase();
-  const visible = q ? beliefs.filter((b) => b.text.toLowerCase().includes(q)) : beliefs;
+  const conflictCount = beliefs?.filter((b) => b.contradict_count > 0).length ?? 0;
+  const visible = (beliefs ?? []).filter((b) => {
+    if (layerFilter === 'conflicts' && b.contradict_count <= 0) return false;
+    if (layerFilter !== 'all' && layerFilter !== 'conflicts' && b.layer !== layerFilter) {
+      return false;
+    }
+    if (!q) return true;
+    return (
+      b.text.toLowerCase().includes(q) ||
+      (b.domain?.toLowerCase().includes(q) ?? false) ||
+      (b.kind?.toLowerCase().includes(q) ?? false)
+    );
+  });
+
+  const filters: { id: LayerFilter; label: string }[] = [
+    { id: 'all', label: 'All' },
+    { id: 'identity', label: 'Identity' },
+    { id: 'context', label: 'Context' },
+    { id: 'conversation', label: 'Chat' },
+    ...(conflictCount > 0
+      ? [{ id: 'conflicts' as const, label: `Conflicts (${conflictCount})` }]
+      : []),
+  ];
 
   return (
-    <div className="belief-browser">
-      <input
-        className="belief-browser-filter"
-        placeholder="Filter…"
-        value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-      />
-      <table className="settings-table belief-table">
-        <thead>
-          <tr>
-            <th>Belief</th>
-            <th>Layer</th>
-            <th>Confidence</th>
-            <th>Status</th>
-            <th>Support</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {visible.map((b) => (
-            <tr key={b.id}>
-              <td>{b.text}</td>
-              <td>{LAYER_LABEL[b.layer]}</td>
-              <td>{Math.round(b.confidence * 100)}%</td>
-              <td>
-                {b.tested ? 'Tested' : 'Untested'}
-                {b.domain && <div className="muted">{b.domain}</div>}
-                {b.pinned && <div className="muted">Pinned</div>}
-                {b.contradict_count > 0 && (
-                  <div className="belief-contradicted">Contradicted ×{b.contradict_count}</div>
-                )}
-              </td>
-              <td>
-                Seen {b.support_count}× across {b.distinct_sessions} session
-                {b.distinct_sessions === 1 ? '' : 's'}
-              </td>
-              <td>
+    <div className="mem-card">
+      <div className="mem-card-head">
+        <h2>What it remembers</h2>
+        {beliefs && beliefs.length > 0 && (
+          <small className="muted">
+            Showing {visible.length} of {beliefs.length}
+          </small>
+        )}
+      </div>
+
+      {error && <p className="chat-error">{error}</p>}
+      {beliefs == null && !error && <p className="muted">Loading…</p>}
+      {beliefs && beliefs.length === 0 && <p className="muted">Nothing learned yet.</p>}
+
+      {beliefs && beliefs.length > 0 && (
+        <>
+          <div className="mem-toolbar">
+            <input
+              className="mem-filter-input"
+              placeholder="Search beliefs or domains…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+            <div className="mem-chip-group" role="group" aria-label="Filter by layer">
+              {filters.map((f) => (
                 <button
-                  disabled={deletingId === b.id}
-                  onClick={() => void remove(b.id)}
-                  title="This wasn't right — forget it"
+                  key={f.id}
+                  type="button"
+                  className={`mem-chip ${layerFilter === f.id ? 'active' : ''}`}
+                  onClick={() => setLayerFilter(f.id)}
                 >
-                  {deletingId === b.id ? 'Removing…' : 'Forget'}
+                  {f.label}
                 </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              ))}
+            </div>
+          </div>
+
+          {visible.length === 0 ? (
+            <p className="muted">No matching beliefs.</p>
+          ) : (
+            <div className="mem-list">
+              {visible.map((b) => (
+                <div className="mem-item" key={b.id}>
+                  <div className="mem-item-body">
+                    <div className="mem-item-text">{b.text}</div>
+                    <div className="mem-item-meta">
+                      <span className="mem-pill mem-pill-accent">{LAYER_LABEL[b.layer]}</span>
+                      {b.kind && <span className="mem-pill">{KIND_LABEL[b.kind] ?? b.kind}</span>}
+                      <span className={`mem-pill ${b.tested ? 'mem-pill-ok' : ''}`}>
+                        {Math.round(b.confidence * 100)}% · {b.tested ? 'Confirmed' : 'Unconfirmed'}
+                      </span>
+                      {b.domain && <span className="mem-pill">{b.domain}</span>}
+                      {b.pinned && <span className="mem-pill mem-pill-accent">Pinned</span>}
+                      <span className="mem-pill">
+                        {b.support_count}× · {b.distinct_sessions} chat
+                        {b.distinct_sessions === 1 ? '' : 's'}
+                      </span>
+                      {b.contradict_count > 0 && (
+                        <span className="mem-pill mem-pill-danger">
+                          Conflict ×{b.contradict_count}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="mem-item-action">
+                    <button
+                      disabled={deletingId === b.id}
+                      onClick={() => void remove(b.id)}
+                      title="This wasn't right — forget it permanently"
+                    >
+                      {deletingId === b.id ? 'Removing…' : 'Forget'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

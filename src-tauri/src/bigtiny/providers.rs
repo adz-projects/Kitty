@@ -76,6 +76,7 @@ async fn sync_providers(app: &AppHandle, only: Option<&str>) -> Result<(), Strin
             .cards()
             .into_iter()
             .chain(cfg.seat_cards())
+            .chain(cfg.learning_card())
             .filter(|p| p.is_usable())
             .filter(|p| only.map_or(true, |id| p.id == id))
             .collect::<Vec<_>>();
@@ -218,7 +219,9 @@ pub(crate) fn provider_body(
         base_url,
         config,
         api_key,
-        fallback_priority: if crate::config::providers::debate::is_seat_id(&profile.id) {
+        fallback_priority: if crate::config::providers::debate::is_seat_id(&profile.id)
+            || profile.id == crate::config::providers::LEARNING_CARD_ID
+        {
             crate::config::providers::debate::SEAT_FALLBACK_PRIORITY
         } else {
             1

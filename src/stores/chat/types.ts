@@ -1,4 +1,7 @@
 // Plain data types shared across the chat store and its helper modules.
+import type { MemoryRecallSubsystem, MemoryRecallTrace } from '@/lib/types';
+
+export type { MemoryRecallSubsystem, MemoryRecallTrace };
 
 export interface ToolCall {
   id: string;
@@ -23,6 +26,9 @@ export interface Message {
   text: string;
   reasoning: string;
   toolCalls: ToolCall[];
+  /** Turn-start memory recall diagnostics (Memorabilia, Adaptive Pathway,
+      Counterpoint, Preflight), rendered inside `ThinkingBox` like a tool card. */
+  memoryRecall?: MemoryRecallTrace;
   /** An answer the model wrote before all its specialist reports were in.
       Moved out of `text` when the daemon collects those reports for it (see
       `isAutoSpecialistCollection`), so the bubble holds only the real answer

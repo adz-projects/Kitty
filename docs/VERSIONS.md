@@ -167,6 +167,18 @@ Daemon **2.8.1** (Kitty 1.1.2). Additive; API version stays 2:
 | Back-to-back plain assistant messages are joined when a chat's history is built | Chats with deep research notes and reports stay valid for every provider |
 | A reply cut off at the output cap is continued in one message | (engine fix) |
 
+Daemon **2.9.0** (Kitty 1.2.0). Additive; API version stays 2:
+
+| Surface | Used for |
+|---|---|
+| `GET/PUT/DELETE /api/apps/me/learning-model` `{kind: auto \| chat \| provider, provider_id?, model?}` | Settings → Adaptive Pathway → Memory learning model; a provider choice is the `learning-model` card |
+| `/api/apps/me/overnight` `idle_micro` (default on) | Short daytime passes when idle on mains power; daytime passes wait while CPU (50%+) or GPU (40%+) is busy |
+| `memory_recall` turn event; `messages.memory_trace` (migration 035) | The Memory Inspector card on each turn, live and on resume |
+| `/api/pathway/stats` adds `tested`, `contradicted`, `avg_confidence`, `staged {pending, sessions}`, `signals {kind: {engaged, total}}` | Adaptive Pathway health tiles and the (approximate) directive uptake pills |
+| Stored memory blocks are re-emitted in place on later turns; only changed sections (pathway, memorabilia, counter-view) are added | Memory stays in the conversation and the prompt prefix stays cached |
+| Pathway: one-offs staged 30 days and promoted on cross-chat corroboration or synthesis; contrary option for a relevant stance or preference every turn, fresh angle every third | (engine behaviour) |
+| Memorabilia: claim vectors searched in SQL with their own mean and floor; keyword search re-ranks only, except rare names and codes; wrong-width vector index rebuilt and re-embedded | (engine behaviour) |
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it

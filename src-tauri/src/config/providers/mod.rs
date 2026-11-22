@@ -15,6 +15,7 @@
 mod connection;
 pub mod debate;
 pub mod endpoint;
+pub mod learning;
 mod keyring;
 mod network;
 pub mod setups;
@@ -29,6 +30,7 @@ pub use keyring::{
 pub use keyring::V1_ENCRYPTION_KEY_ACCOUNT;
 pub use network::{is_hosted_endpoint, network_tier_for, NetworkTier};
 pub use debate::DebateSeat;
+pub use learning::{LearningModelSetting, LEARNING_CARD_ID};
 pub use setups::{migrate_to_setups, repoint_setups, Setup};
 
 use std::collections::BTreeMap;

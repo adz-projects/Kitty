@@ -106,9 +106,14 @@ binaries still match their source (CI runs it). Full detail in
   against, never a profile to conform to (see `docs/VERSIONS.md`'s
   recall-framing contract). Beliefs have a kind (preference, stance, context,
   trait) and typed links; open tensions are shown rather than hidden, the top
-  stance can draw a `[Worth challenging]` counterpoint (grounded by
-  Memorabilia when it holds a disputing claim), and a surfaced assumption is
-  judged by the next extraction pass. The block is stored on the user message
+  stance or preference that bears on the turn draws a `[Worth challenging]`
+  contrary option every time (a stance's grounded by Memorabilia when it holds
+  a disputing claim) and a `[Fresh angle]` at most every third turn, and a
+  surfaced assumption is judged by the next extraction pass. A chat's beliefs
+  move to long-term memory when stated, corrected, tested, seen twice, linked
+  to a known belief or confident; one-offs are staged for 30 days and promoted
+  when another chat shows the same thing (or cross-session synthesis finds a
+  pattern). Settings → Adaptive Pathway picks the memory learning model. The block is stored on the user message
   and re-emitted in place, so the prompt prefix stays cached
   (`BigTinyV2/prompt_determinism.md`). Its `record`/`forget` tools reach the model through
   the engine's in-process MCP registry. Settings: belief browser, Graph

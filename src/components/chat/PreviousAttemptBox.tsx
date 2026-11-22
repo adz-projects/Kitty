@@ -20,10 +20,11 @@ export function PreviousAttemptBox({ message }: { message: Message }) {
       </button>
       {open && (
         <div className="reasoning-body">
-          {(message.reasoning || message.toolCalls.length > 0) && (
+          {(message.reasoning || message.memoryRecall || message.toolCalls.length > 0) && (
             <ThinkingBox
               reasoning={message.reasoning}
               toolCalls={message.toolCalls}
+              memoryRecall={message.memoryRecall}
               streaming={false}
               hasAnswer={message.text.length > 0}
             />

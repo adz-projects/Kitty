@@ -254,6 +254,8 @@ pub fn run() {
             commands::list_available_tools,
             commands::list_specialist_runs,
             commands::get_debate_panel,
+            commands::get_memory_learning_model,
+            commands::set_memory_learning_model,
             commands::set_debate_panel,
             commands::list_scheduled_tasks,
             commands::create_scheduled_task,

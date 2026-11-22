@@ -2830,6 +2830,246 @@ button.output-card-name:hover {
   color: var(--danger);
 }
 
+/* Memory settings panels (Adaptive Pathway & Memorabilia): card-based layout
+   using existing theme tokens for cleaner scanning without dense tables. */
+.settings-section.memory-settings {
+  max-width: 720px;
+  gap: 16px;
+}
+.mem-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mem-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.mem-card-head h2 {
+  margin: 0;
+  font-size: var(--fs-lg);
+}
+.mem-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mem-status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.mem-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+.mem-pill-ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border-color: transparent;
+}
+.mem-pill-warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: transparent;
+}
+.mem-pill-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: transparent;
+}
+.mem-pill-accent {
+  color: var(--accent);
+  border-color: var(--border);
+}
+.mem-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 10px;
+}
+.mem-stat {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mem-stat-label {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+.mem-stat-value {
+  font-size: var(--fs-2xl);
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.25;
+}
+.mem-stat-sub {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+.mem-signal-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mem-signal-heading {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.mem-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.mem-filter-input {
+  flex: 1 1 200px;
+  min-width: 160px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: var(--fs-md);
+}
+.mem-chip-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.mem-chip {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.mem-chip:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.mem-chip.active {
+  background: var(--accent-fill);
+  color: var(--accent-text);
+  border-color: var(--accent-fill);
+}
+.mem-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 440px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+.mem-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border);
+}
+.mem-item:last-child {
+  border-bottom: none;
+}
+.mem-item-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mem-item-text {
+  font-size: var(--fs-md);
+  line-height: 1.45;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.mem-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.mem-item-action {
+  flex-shrink: 0;
+}
+.mem-setting-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mem-setting-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.mem-setting-row:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+.mem-suboptions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-left: 22px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+}
+.mem-time-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+.mem-time-row input[type='time'] {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+}
+.mem-danger-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
 /* Per-provider param sliders (Round-2 item 28): range fills the row, value badge
    stays inline; never wraps into the Save button. */
 .param-slider .row {

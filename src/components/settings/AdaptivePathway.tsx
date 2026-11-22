@@ -2,33 +2,30 @@ import { useEffect, useState } from 'react';
 import { ipc, onAdaptivePathwayEmbeddingStatus, onModelProgress } from '@/lib/ipc';
 import type { AdaptivePathwayMcpStatus, DownloadProgress, EmbeddingModelStatus } from '@/lib/types';
 import { defaultFor } from '@/lib/curated_models';
-
-/** Fixed id so the progress subscription can be registered before the
-    download starts (unlike a user-initiated one, which gets a fresh id). */
-const EMBEDDING_DOWNLOAD_ID = 'adaptive-pathway-embedding-model';
 import { BeliefBrowser } from './BeliefBrowser';
 import { GraphHealth } from './GraphHealth';
 import { EraseMemory } from './EraseMemory';
+import { LearningModel } from './LearningModel';
+import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { useMemoryStatus } from '@/hooks/useMemoryStatus';
 import { useRouteStore } from '@/stores/routeStore';
 import { isAndroid } from '@/lib/platform';
 
-/** How far along the shared learning model's download is. Memory runs only
-    once it is on disk (decision #1): without it the engines are off, not
-    running on a weaker fallback. */
+/** Fixed id so the progress subscription can be registered before the
+    download starts (unlike a user-initiated one, which gets a fresh id). */
+const EMBEDDING_DOWNLOAD_ID = 'adaptive-pathway-embedding-model';
+
 const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
   unknown: '',
-  present: 'ready',
-  downloading: 'downloading…',
-  missing: 'not downloaded yet',
+  present: 'Model ready',
+  downloading: 'Downloading model…',
+  missing: 'Model not downloaded',
 };
 
-/** Settings for the pathway (behavioral-memory) engine — learns what the
-    user cares about and how they like to be talked to, from ordinary
-    conversation, and surfaces it back as a per-turn recall block. Runs
-    inside the engine (`plugins/adaptive-pathway_rust`); the switch applies
-    at once (`lifecycle::memory`), and only once the learning model is
-    downloaded. */
+/** Settings for Adaptive Pathway (behavioral memory): learns enduring habits,
+    epistemic preferences, and stances from conversation while keeping every
+    assumption visible and correctable. */
 export function AdaptivePathway() {
   const memory = useMemoryStatus();
   const modelMissing = memory !== null && !memory.model_installed;
@@ -46,6 +43,12 @@ export function AdaptivePathway() {
   const [error, setError] = useState('');
   const [mcpStatus, setMcpStatus] = useState<AdaptivePathwayMcpStatus | null>(null);
   const [mcpStatusError, setMcpStatusError] = useState('');
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [showMaintenance, setShowMaintenance] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [repairMsg, setRepairMsg] = useState('');
+
+  const bumpRefresh = () => setRefreshKey((k) => k + 1);
 
   const loadMcpStatus = () =>
     void ipc
@@ -67,9 +70,6 @@ export function AdaptivePathway() {
     void load();
     const unEmbedding = onAdaptivePathwayEmbeddingStatus((p) => setEmbeddingStatus(p.status));
     return () => void unEmbedding.then((fn) => fn());
-    // Mount-only by design: `load` is a fresh closure every render, so
-    // depending on it would re-run this on each one — re-reading config and
-    // re-registering the listener. Nothing it captures changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -81,10 +81,6 @@ export function AdaptivePathway() {
     return () => void un.then((fn) => fn());
   }, []);
 
-  /** Settings' own "set up the learning model" action — the same download the
-      wizard offers, reachable after setup too (the user skipped it, or
-      deleted the file later). A fixed download id lets the subscription above
-      be registered before the download starts. */
   const installEmbeddingModel = async () => {
     setInstallBusy(true);
     setInstallError('');
@@ -98,7 +94,7 @@ export function AdaptivePathway() {
         EMBEDDING_DOWNLOAD_ID,
         model.gated ? token.trim() || undefined : undefined
       );
-      setToken(''); // done with it — drop it from memory
+      setToken('');
     } catch (e) {
       setInstallError(String(e));
     } finally {
@@ -106,11 +102,6 @@ export function AdaptivePathway() {
     }
   };
 
-  /** Flips the config flag; the Rust command restarts BigTiny (which is
-      what actually starts/stops the in-process engine — it's linked into
-      that process, there's nothing separate to spawn) and self-heals the
-      MCP registration, so the frontend just flips the flag and re-reads
-      status once it settles. */
   const setEnabledCombined = async (next: boolean) => {
     setBusy(true);
     setError('');
@@ -118,10 +109,8 @@ export function AdaptivePathway() {
       setEnabled(next);
       await ipc.setAdaptivePathwayEnabled(next);
       loadMcpStatus();
+      bumpRefresh();
     } catch (e) {
-      // Revert the optimistic flip — the config flag never changed, so the
-      // checkbox must not claim otherwise (same pattern as
-      // AdaptivePathwayToggle's paused toggle).
       setEnabled(!next);
       setError(String(e));
     } finally {
@@ -129,61 +118,99 @@ export function AdaptivePathway() {
     }
   };
 
+  const repair = async () => {
+    const ok = await confirmDialog({
+      title: 'Check and repair the belief database?',
+      message: DB_REPAIR_CONFIRM,
+      confirmLabel: 'Check & repair',
+    });
+    if (!ok) return;
+    setRepairing(true);
+    setRepairMsg('');
+    try {
+      setRepairMsg(await runDbRepair(ipc.recoverPathwayDb));
+      bumpRefresh();
+    } catch (e) {
+      setRepairMsg(String(e));
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   return (
-    <section className="settings-section">
+    <section className="settings-section memory-settings">
       <h1>Adaptive Pathway</h1>
       <p className="muted">
-        Learns what you care about and how you like to be talked to from ordinary conversation, and
-        quietly adapts — never as a fact stated about you, always something you can correct.
+        Learns enduring habits, source preferences, and viewpoints from your chats while letting you
+        inspect or forget any belief.
       </p>
       {error && <div className="chat-error">{error}</div>}
 
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={enabled && !modelMissing}
-          disabled={busy || modelMissing}
-          onChange={(e) => void setEnabledCombined(e.target.checked)}
-        />
-        <span>Enable Adaptive Pathway</span>
-      </label>
-      <small className="muted">
-        {modelMissing
-          ? 'Download the memory model below to enable it.'
-          : 'Takes effect straight away.'}
-      </small>
+      <div className="mem-card">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={enabled && !modelMissing}
+            disabled={busy || modelMissing}
+            onChange={(e) => void setEnabledCombined(e.target.checked)}
+          />
+          <span>Enable Adaptive Pathway</span>
+        </label>
 
-      {enabled && (
-        <small className="muted" style={{ display: 'block', marginTop: 8 }}>
-          {mcpStatusError ? (
-            <>Couldn&apos;t check tool registration: {mcpStatusError}</>
-          ) : mcpStatus == null ? (
-            <>Tools not registered yet — they&apos;ll appear shortly.</>
-          ) : mcpStatus.status === 'connected' ? (
-            <>
-              Connected: <strong>{mcpStatus.tool_count}</strong> tool
-              {mcpStatus.tool_count === 1 ? '' : 's'} available to the model (record, forget).
-            </>
-          ) : (
-            <>
-              MCP server <strong>{mcpStatus.status}</strong> — tools not reaching the model.
-              {mcpStatus.error_message ? ` ${mcpStatus.error_message}` : ''}
-            </>
-          )}
-        </small>
-      )}
+        {enabled && (
+          <div className="mem-status-strip">
+            {mcpStatusError ? (
+              <span className="mem-pill mem-pill-danger">Tools check failed: {mcpStatusError}</span>
+            ) : mcpStatus == null ? (
+              <span className="mem-pill">Registering tools…</span>
+            ) : mcpStatus.status === 'connected' ? (
+              <span className="mem-pill mem-pill-ok">
+                Tools ready ({mcpStatus.tool_count}: record, forget)
+              </span>
+            ) : (
+              <span className="mem-pill mem-pill-warn">
+                Tools {mcpStatus.status}
+                {mcpStatus.error_message ? ` (${mcpStatus.error_message})` : ''}
+              </span>
+            )}
+
+            {embeddingStatus !== 'unknown' && embeddingStatus !== 'missing' && (
+              <span className="mem-pill mem-pill-ok">
+                {EMBEDDING_STATUS_LABEL[embeddingStatus]}
+              </span>
+            )}
+
+            {!modelMissing && !isAndroid() && (
+              <button className="link" onClick={() => goto('settings', { section: 'memorabilia' })}>
+                Schedule & overnight settings →
+              </button>
+            )}
+          </div>
+        )}
+
+        {!enabled && (
+          <small className="muted">
+            {modelMissing
+              ? 'Download the shared embedding model below to enable.'
+              : 'Takes effect immediately when enabled.'}
+          </small>
+        )}
+      </div>
+
+      {enabled && !modelMissing && <LearningModel />}
 
       {(modelMissing || embeddingStatus === 'missing') && (
-        <div className="dep-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span className="muted">
-              Memory needs the learning model ({embeddingModel}), which isn&apos;t downloaded yet.
-              Chat works fine without it; memory stays off until it&apos;s here.
-            </span>
+        <div className="mem-card">
+          <div className="mem-card-head">
+            <h2>Learning model required</h2>
             <button disabled={installBusy} onClick={() => void installEmbeddingModel()}>
               {installBusy ? 'Setting up…' : 'Set up learning model'}
             </button>
           </div>
+          <p className="muted" style={{ margin: 0 }}>
+            Both Adaptive Pathway and Memorabilia share {embeddingModel || 'the embedding model'}.
+            Chat works without it; memory activates once downloaded.
+          </p>
           {defaultFor('embedding')?.gated && (
             <div className="gated-token">
               <label className="muted" htmlFor="hf-token-embedding">
@@ -195,8 +222,7 @@ export function AdaptivePathway() {
                 >
                   model page
                 </a>{' '}
-                and paste a HuggingFace access token (read scope). Used only for this download,
-                never stored.
+                and paste a read-only HuggingFace token (used only for this download).
               </label>
               <input
                 id="hf-token-embedding"
@@ -240,28 +266,48 @@ export function AdaptivePathway() {
           )}
         </div>
       )}
-      {enabled && embeddingStatus !== 'unknown' && embeddingStatus !== 'missing' && (
-        <small className="muted" style={{ display: 'block' }}>
-          Learning model {EMBEDDING_STATUS_LABEL[embeddingStatus]}.
-        </small>
-      )}
-
-      {enabled && !modelMissing && !isAndroid() && (
-        <small className="muted" style={{ display: 'block' }}>
-          When it learns from your chats (as they happen, or overnight) is set in{' '}
-          <button className="link" onClick={() => goto('settings', { section: 'memorabilia' })}>
-            Memorabilia → Overnight learning
-          </button>
-          .
-        </small>
-      )}
 
       {enabled && !modelMissing && (
         <>
-          <h2>What it remembers</h2>
-          <BeliefBrowser />
-          <GraphHealth />
-          <EraseMemory what="beliefs" phrase="erase beliefs" erase={ipc.eraseAllBeliefs} />
+          <GraphHealth refreshKey={refreshKey} />
+          <BeliefBrowser refreshKey={refreshKey} onMutated={bumpRefresh} />
+
+          <div className="mem-card">
+            <button
+              type="button"
+              className="disclosure-toggle"
+              aria-expanded={showMaintenance}
+              onClick={() => setShowMaintenance((v) => !v)}
+            >
+              {showMaintenance ? '▾' : '▸'} Maintenance &amp; reset
+            </button>
+            {showMaintenance && (
+              <div className="provider-advanced-body">
+                <div className="mem-danger-row" style={{ borderTop: 'none', paddingTop: 0 }}>
+                  <div>
+                    <div>Repair database</div>
+                    <small className="muted">
+                      Checks SQLite integrity and rebuilds from readable rows if corrupt.
+                    </small>
+                    {repairMsg && (
+                      <div>
+                        <small className="muted">{repairMsg}</small>
+                      </div>
+                    )}
+                  </div>
+                  <button onClick={() => void repair()} disabled={repairing}>
+                    {repairing ? 'Checking…' : 'Check & repair'}
+                  </button>
+                </div>
+                <EraseMemory
+                  what="beliefs"
+                  phrase="erase beliefs"
+                  erase={ipc.eraseAllBeliefs}
+                  onErased={bumpRefresh}
+                />
+              </div>
+            )}
+          </div>
         </>
       )}
     </section>
