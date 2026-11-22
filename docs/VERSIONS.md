@@ -157,6 +157,16 @@ playbook from `plugins/kitty-critique` (shared with Bacon, no dependencies).
 - **Author context**: optional, Settings → Specialists → Writing critique
   (`config.critique.author_context`). Behavioural memory is not involved.
 
+Daemon **2.8.1** (Kitty 1.1.2). Additive; API version stays 2:
+
+| Surface | Used for |
+|---|---|
+| `research_progress` and `GET /api/research/{id}` carry `activity`: the step and its start, `last_activity_ms`, `stall_after_secs`, and the planners/researchers at work with their latest tool call | The progress card's worker rows, Watch links, "last activity" and stall warning |
+| A researcher's findings are recorded as it reports; one progress event per report (`step.done` / `step.of`) | Counts that move during a wave |
+| A note in the chat after each wave and the critique; events mark them `wave_done` / `critique_done` | The card reloads the chat once per milestone |
+| Back-to-back plain assistant messages are joined when a chat's history is built | Chats with deep research notes and reports stay valid for every provider |
+| A reply cut off at the output cap is continued in one message | (engine fix) |
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
