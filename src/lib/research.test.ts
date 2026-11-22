@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   clampTurns,
   coverageFraction,
+  formatDuration,
+  isStalled,
+  milestoneKey,
   parseResearchCommand,
   phaseLabel,
   planFromArgs,
@@ -99,5 +102,50 @@ describe('progress', () => {
       })
     ).toBe(0.5);
     expect(coverageFraction({ id: 'r', status: 'done' })).toBe(0);
+  });
+});
+
+describe('liveness', () => {
+  const now = 1_000_000;
+  const live = {
+    id: 'r',
+    status: 'researching' as const,
+    activity: { last_activity_ms: now - 30_000, stall_after_secs: 420 },
+  };
+
+  it('formats durations', () => {
+    expect(formatDuration(12_400)).toBe('12s');
+    expect(formatDuration(185_000)).toBe('3m 05s');
+    expect(formatDuration(3_720_000)).toBe('1h 02m');
+    expect(formatDuration(-5)).toBe('0s');
+  });
+
+  it('calls a run stuck only after its threshold of silence', () => {
+    expect(isStalled(live, now)).toBe(false);
+    expect(isStalled(live, now + 400_000)).toBe(true);
+    expect(isStalled({ ...live, status: 'done' }, now + 400_000)).toBe(false);
+    expect(isStalled({ ...live, status: 'planning' }, now + 400_000)).toBe(false);
+    expect(isStalled({ id: 'r', status: 'researching' }, now)).toBe(false);
+  });
+
+  it('marks milestones once each', () => {
+    expect(
+      milestoneKey({ id: 'r', status: 'researching', step: { step: 'wave_done', wave: 2 } })
+    ).toBe('r:wave:2');
+    expect(milestoneKey({ id: 'r', status: 'writing', step: { step: 'critique_done' } })).toBe(
+      'r:critique'
+    );
+    expect(milestoneKey({ id: 'r', status: 'researching', step: { step: 'planning' } })).toBeNull();
+  });
+
+  it('counts researchers reporting in', () => {
+    expect(
+      phaseLabel({
+        id: 'r',
+        status: 'researching',
+        waves: 3,
+        step: { step: 'researching', wave: 2, done: 4, of: 6 },
+      })
+    ).toBe('Wave 2 of 3: researching (4 of 6 reported)');
   });
 });

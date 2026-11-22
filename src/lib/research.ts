@@ -136,9 +136,38 @@ export interface ResearchDetail {
     status: 'running' | 'succeeded' | 'failed' | 'skipped';
     summary?: string | null;
   }[];
-  step?: { step?: string; wave?: number; tasks?: number; gaps?: number };
+  step?: {
+    step?: string;
+    wave?: number;
+    tasks?: number;
+    gaps?: number;
+    /** Researchers that have reported so far this wave, of `of`. */
+    done?: number;
+    of?: number;
+  };
+  /** What the run is doing right now (live runs only). */
+  activity?: ResearchActivity;
   output_path?: string | null;
   error?: string | null;
+}
+
+/** One planner or researcher at work. */
+export interface ResearchWorker {
+  session_id: string;
+  label: string;
+  /** What it last did, e.g. "searching: …" or "reading sos.ca.gov". */
+  doing?: string | null;
+  started_ms: number;
+  last_ms: number;
+}
+
+export interface ResearchActivity {
+  step_started_ms?: number | null;
+  /** The last moment anything happened in the run. */
+  last_activity_ms?: number | null;
+  /** Silence longer than this means the run may be stuck. */
+  stall_after_secs?: number;
+  workers?: ResearchWorker[];
 }
 
 export type ResearchStatus =
@@ -161,12 +190,17 @@ export function phaseLabel(d: ResearchDetail): string {
       return 'Waiting for the plan to be approved';
     case 'researching': {
       const wave = d.step?.wave ?? Math.min(waves, (d.turns_used ?? 0) + 1);
+      const s = d.step?.step;
+      const progress =
+        s === 'researching' && d.step?.of ? ` (${d.step.done ?? 0} of ${d.step.of} reported)` : '';
       const doing =
-        d.step?.step === 'planning'
+        s === 'planning'
           ? 'planning'
-          : d.step?.step === 'researching'
-            ? 'researching'
-            : '';
+          : s === 'researching'
+            ? `researching${progress}`
+            : s === 'wave_done'
+              ? 'done'
+              : '';
       return `Wave ${wave} of ${waves}${doing ? `: ${doing}` : ''}`;
     }
     case 'critiquing':
@@ -180,6 +214,33 @@ export function phaseLabel(d: ResearchDetail): string {
     case 'cancelled':
       return d.error ?? 'Stopped';
   }
+}
+
+/** "12s", "3m 05s", "1h 02m": a duration for the card. */
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+/** Whether a live run has been silent for longer than it should be. */
+export function isStalled(d: ResearchDetail, now: number): boolean {
+  const last = d.activity?.last_activity_ms;
+  const after = d.activity?.stall_after_secs;
+  if (!isLive(d.status) || d.status === 'planning' || !last || !after) return false;
+  return now - last > after * 1000;
+}
+
+/** A key for the milestone a progress update marks (a wave finished, the
+    critique finished), or `null`. The engine posts a note in the chat at
+    each, so the chat reloads once per key. */
+export function milestoneKey(d: ResearchDetail): string | null {
+  const s = d.step?.step;
+  if (s === 'wave_done') return `${d.id}:wave:${d.step?.wave ?? 0}`;
+  if (s === 'critique_done') return `${d.id}:critique`;
+  return null;
 }
 
 /** Coverage as a fraction of cells with at least one finding. */

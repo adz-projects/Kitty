@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { ipc, onResearchProgress } from '@/lib/ipc';
-import { isLive, type ResearchDetail, type ResearchStatus } from '@/lib/research';
+import { isLive, milestoneKey, type ResearchDetail, type ResearchStatus } from '@/lib/research';
 
 /** Merge an update into the run list, keyed by run id. Pure. */
 export function upsertRun(list: ResearchDetail[], run: ResearchDetail): ResearchDetail[] {
@@ -58,9 +58,11 @@ export const useResearchStore = create<ResearchState>((set, get) => ({
       const runs = await ipc.listResearch(sessionId);
       // Finished runs were already reloaded, or never needed it.
       const done = runs.filter((r) => !isLive(r.status)).map((r) => r.id);
+      // Opening the chat already shows every note posted so far.
+      const seen = runs.map(milestoneKey).filter((k): k is string => k !== null);
       set((s) => ({
         runs: runs.reduce(upsertRun, s.runs),
-        reloaded: Array.from(new Set([...s.reloaded, ...done])),
+        reloaded: Array.from(new Set([...s.reloaded, ...done, ...seen])),
       }));
     } catch (e) {
       console.warn('listResearch failed', e);

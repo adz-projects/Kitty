@@ -83,12 +83,14 @@ pub fn task_prompt(
     boundaries: &str,
     brief: &str,
 ) -> String {
+    // The objective comes first: a delegate's session is named after the
+    // start of its prompt, and that name is what the progress card shows.
     format!(
-        "Part of a larger research effort on: {brief}\n\n\
-         Objective: {objective}\n\
+        "Objective: {objective}\n\
          Bring back: {output_format}\n\
          Guidance: {guidance}\n\
          Boundaries: {boundaries}\n\n\
+         This is part of a larger research effort on: {brief}\n\n\
          Report only what your sources support. Each finding must be one self-contained claim \
          with the evidence quoted or closely paraphrased and the URL you read it at. If a claim \
          is someone's assertion rather than an established fact (a complaint's allegation, a \

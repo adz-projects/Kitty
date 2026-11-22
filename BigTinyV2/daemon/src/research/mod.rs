@@ -12,9 +12,11 @@
 //! append-only (`migrations/034_research.sql`); what became of an entry is
 //! derived from links on read.
 
+pub mod activity;
 pub mod contract;
 pub mod driver;
 pub mod ledger;
+pub mod notes;
 pub mod ops;
 pub mod projection;
 pub mod prompts;

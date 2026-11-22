@@ -1,5 +1,15 @@
-import { useEffect } from 'react';
-import { coverageFraction, isLive, phaseLabel } from '@/lib/research';
+import { useEffect, useState } from 'react';
+import {
+  coverageFraction,
+  formatDuration,
+  isLive,
+  isStalled,
+  milestoneKey,
+  phaseLabel,
+  type ResearchWorker,
+} from '@/lib/research';
+import { ipc } from '@/lib/ipc';
+import { isAndroid } from '@/lib/platform';
 import { runForSession, useResearchStore } from '@/stores/researchStore';
 import { useChatStore } from '@/stores/chatStore';
 
@@ -10,18 +20,36 @@ const STEP_NAMES: Record<string, string> = {
   write: 'Write-up',
 };
 
-/** A chat's deep research run: where it is, what it has found, how much of
-    the plan's coverage it has reached, and Stop. The engine does the work and
-    reports `research://progress`; this only renders it. When the report lands
-    in the chat, the chat is reloaded once so it appears. */
+/** The current time, ticking once a second while `on`: what makes "last
+    activity 12s ago" count up between the engine's heartbeats. */
+function useNow(on: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!on) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [on]);
+  return now;
+}
+
+/** A chat's deep research run: where it is, what each planner and researcher
+    is doing right now, how long since anything happened, coverage, and Stop.
+    The engine does the work and reports `research://progress` (at every
+    milestone and on a heartbeat); this only renders it. At each milestone the
+    engine posts a note in the chat, and at the end its report: the chat is
+    reloaded once for each so they appear. */
 export function ResearchProgressCard({ sessionId }: { sessionId: string | null }) {
   const init = useResearchStore((s) => s.init);
   const loadForSession = useResearchStore((s) => s.loadForSession);
   const run = useResearchStore((s) => runForSession(s.runs, sessionId));
-  const reloaded = useResearchStore((s) => (run ? s.reloaded.includes(run.id) : true));
+  const reloaded = useResearchStore((s) => s.reloaded);
   const markReloaded = useResearchStore((s) => s.markReloaded);
   const cancel = useResearchStore((s) => s.cancel);
   const reloadCurrent = useChatStore((s) => s.reloadCurrent);
+  const busy = useChatStore((s) => s.busy);
+  const cwd = useChatStore((s) => s.cwd);
+  const live = run ? isLive(run.status) : false;
+  const now = useNow(live);
 
   useEffect(() => {
     void init();
@@ -30,21 +58,38 @@ export function ResearchProgressCard({ sessionId }: { sessionId: string | null }
     if (sessionId) void loadForSession(sessionId);
   }, [sessionId, loadForSession]);
 
-  // The report is appended to the chat by the engine, outside any turn this
-  // window streamed: reload once to show it.
+  // Milestone notes and the report are appended by the engine outside any
+  // turn this window streamed: reload once for each to show it. Never while
+  // this chat is mid-reply; the effect runs again when the reply ends.
+  const pendingKey = !run ? null : run.status === 'done' ? run.id : milestoneKey(run);
   useEffect(() => {
-    if (run && run.status === 'done' && !reloaded) {
-      markReloaded(run.id);
-      void reloadCurrent();
-    }
-  }, [run, reloaded, markReloaded, reloadCurrent]);
+    if (!pendingKey || busy || reloaded.includes(pendingKey)) return;
+    markReloaded(pendingKey);
+    void reloadCurrent();
+  }, [pendingKey, busy, reloaded, markReloaded, reloadCurrent]);
 
   // Planning is shown by the plan card itself; a finished run by its report.
   if (!run || run.status === 'planning' || run.status === 'done') return null;
 
-  const live = isLive(run.status);
   const coverage = coverageFraction(run);
   const steps = (run.steps ?? []).filter((s) => s.phase !== 'plan');
+  const activity = run.activity;
+  const workers = activity?.workers ?? [];
+  const last = activity?.last_activity_ms ?? null;
+  const stalled = isStalled(run, now);
+  const canWatch = !isAndroid();
+
+  const watch = (w: ResearchWorker) =>
+    void ipc
+      .openNewChatWindow({
+        session_id: w.session_id,
+        cwd: cwd ?? '',
+        spectate: true,
+        specialist: w.label,
+      })
+      .catch(() => {
+        // A convenience: the run carries on whether or not it opens.
+      });
 
   return (
     <section className="research-card" aria-label="Deep research progress">
@@ -60,6 +105,44 @@ export function ResearchProgressCard({ sessionId }: { sessionId: string | null }
         )}
       </div>
       <div role="status">{phaseLabel(run)}</div>
+      {live && (
+        <div className={stalled ? 'research-pulse research-stalled' : 'research-pulse muted'}>
+          {stalled
+            ? `No activity for ${formatDuration(now - (last ?? now))}. It may be stuck: Stop it, or give it a little longer.`
+            : [
+                last ? `Last activity ${formatDuration(now - last)} ago` : null,
+                activity?.step_started_ms
+                  ? `this step ${formatDuration(now - activity.step_started_ms)}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+        </div>
+      )}
+      {workers.length > 0 && (
+        <ul className="research-workers">
+          {workers.map((w) => (
+            <li key={w.session_id}>
+              <div className="research-worker-head">
+                <span className="research-worker-label" title={w.label}>
+                  {w.label}
+                </span>
+                <span className="muted">{formatDuration(now - w.started_ms)}</span>
+                {canWatch && (
+                  <button
+                    className="link"
+                    onClick={() => watch(w)}
+                    title="Open this one's chat in a new window and follow it live"
+                  >
+                    Watch
+                  </button>
+                )}
+              </div>
+              {w.doing && <div className="muted research-worker-doing">{w.doing}</div>}
+            </li>
+          ))}
+        </ul>
+      )}
       {(run.coverage?.length ?? 0) > 0 && (
         <div
           className="research-meter"

@@ -256,8 +256,12 @@ engine-managed) and why mixing them is a bug.
   - **Write-up:** written section by section and citation-checked. The
     report lands in the chat and in `outputs/`.
 
-  The card above the composer shows the phase, coverage and Stop. No local
-  compute, and memorabilia is not involved.
+  The card above the composer shows the phase, each planner's and
+  researcher's current action (with Watch, which opens its chat), the time
+  since the last activity (warning when that passes the stall threshold),
+  coverage, and Stop. The engine posts a short note in the chat after each
+  wave and after the critique. No local compute, and memorabilia is not
+  involved.
 - **Scheduled tasks** (`commands/scheduled_tasks.rs` over `/api/schedules`,
   `components/settings/ScheduledTasks.tsx`) — instructions the engine runs
   later, once or on an interval, on a chosen provider card with its system

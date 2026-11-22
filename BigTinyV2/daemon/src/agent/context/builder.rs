@@ -288,6 +288,7 @@ impl ContextBuilder {
         // not the raw rows: the emergency valve below compares this against
         // the cap, and the pre-masking sum could trip the destructive trim
         // when the tail was already under budget.
+        let live_messages = merge_adjacent_assistant_text(live_messages);
         let live_token_sum: i32 = count_messages_tokens(&live_messages);
 
         let head = messages.clone();
@@ -632,6 +633,39 @@ pub fn strip_trailing_thought_seed(messages: &mut Vec<Value>) -> Option<Value> {
 }
 
 /// Convert a DB row to a message Value.
+/// Join back-to-back assistant messages that are plain text (no tool calls)
+/// into one. Ordinary turns never produce them, but work that posts into a
+/// chat outside a turn does (a deep research run's milestone notes and its
+/// report), and some providers reject two assistant messages in a row.
+/// Deterministic, so the prompt prefix stays byte-identical turn over turn.
+fn merge_adjacent_assistant_text(messages: Vec<Value>) -> Vec<Value> {
+    let plain = |m: &Value| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("tool_calls").is_none()
+            && m.get("content").is_some_and(Value::is_string)
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if plain(&m) {
+            if let Some(prev) = out.last_mut().filter(|p| plain(p)) {
+                let joined = format!(
+                    "{}\n\n{}",
+                    prev["content"].as_str().unwrap_or_default(),
+                    m["content"].as_str().unwrap_or_default()
+                );
+                if let Some(obj) = prev.as_object_mut() {
+                    obj.insert("content".into(), Value::String(joined));
+                    // The stored count was for the first message alone.
+                    obj.remove(crate::agent::tokens::TOKEN_HINT_KEY);
+                }
+                continue;
+            }
+        }
+        out.push(m);
+    }
+    out
+}
+
 fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {
     let mut msg = serde_json::Map::new();
     msg.insert("id".to_string(), json!(row.id));
@@ -1353,5 +1387,22 @@ mod tests {
         let already =
             json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZ"}});
         assert_eq!(normalize_image_block(&already), already);
+    }
+
+    #[test]
+    fn back_to_back_plain_assistant_messages_are_joined() {
+        let msgs = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": "Started."}),
+            json!({"role": "assistant", "content": "Wave 1 done.", "_token_hint": 3}),
+            json!({"role": "assistant", "content": "Report."}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c"}]}),
+            json!({"role": "assistant", "content": "After a tool call."}),
+        ];
+        let out = merge_adjacent_assistant_text(msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1]["content"], "Started.\n\nWave 1 done.\n\nReport.");
+        assert!(out[2].get("tool_calls").is_some());
+        assert_eq!(out[3]["content"], "After a tool call.");
     }
 }

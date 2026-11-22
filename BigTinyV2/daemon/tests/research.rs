@@ -353,6 +353,26 @@ async fn a_run_goes_from_brief_to_a_verified_report() {
         .as_deref()
         .unwrap_or_default()
         .contains("## Sources"));
+    // Milestone notes, in order, before the report.
+    let texts: Vec<String> = history
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .filter_map(|m| m.content.clone())
+        .collect();
+    let wave = texts
+        .iter()
+        .position(|t| t.starts_with("**Deep research: wave 1 of 1 done.**"))
+        .expect("a note after the wave");
+    let critique = texts
+        .iter()
+        .position(|t| t.starts_with("**Deep research: critique done.**"))
+        .expect("a note after the critique");
+    assert!(wave < critique && critique < texts.len() - 1, "{texts:?}");
+    assert!(
+        texts[wave].contains("3 tasks (1 tangent), 1 new finding from 1 source"),
+        "{}",
+        texts[wave]
+    );
 
     // Turn 0's role is gone from the chat.
     let meta: Value = serde_json::from_str(

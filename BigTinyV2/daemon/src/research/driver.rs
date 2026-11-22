@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashSet;
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -25,8 +26,9 @@ use crate::models::specialist::Specialist;
 use crate::provider::queue::Priority;
 use crate::research::contract::{waves_for, Contract, OutputFormat, Section};
 use crate::research::ledger::{Body, DeadEnd, Defect, Finding, Ledger, Question, Task, TaskKind};
+use crate::research::notes::{self, DID_NOT_FINISH};
 use crate::research::ops::{self, META_ROLE, META_RUN, META_WAVE, ROLE_PLANNER};
-use crate::research::{projection, prompts, report, server};
+use crate::research::{activity, projection, prompts, report, server};
 use crate::server::events::{SSEEvent, SSEEventType};
 use crate::storage::research::{self as store, RunRow};
 use crate::storage::{messages, sessions, specialists};
@@ -44,6 +46,16 @@ const MAX_EVIDENCE_PER_SECTION: usize = 80;
 const SATURATION_FINDINGS: usize = 2;
 /// Planner session step ceiling.
 const PLANNER_MAX_STEPS: i64 = 30;
+/// How often a running step reports, so a client can tell slow from stuck.
+const HEARTBEAT: Duration = Duration::from_secs(10);
+/// Silence, beyond one delegate's time limit, after which a client should
+/// call a run stuck.
+const STALL_MARGIN_SECS: u64 = 120;
+
+/// The stall threshold reported with every progress event; set from the
+/// orchestrator's delegate time limit when the supervisor starts.
+static STALL_AFTER_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(300 + STALL_MARGIN_SECS);
 
 static WAKE: Lazy<Notify> = Lazy::new(Notify::new);
 static ACTIVE: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
@@ -61,6 +73,10 @@ pub struct Driver {
 
 /// Start the supervisor. Runs for the life of the daemon.
 pub fn spawn_supervisor(driver: Arc<Driver>) {
+    STALL_AFTER_SECS.store(
+        driver.orchestrator.delegate_timeout().as_secs() + STALL_MARGIN_SECS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     tokio::spawn(async move {
         // A run still planning when the daemon starts lost its turn 0 with the
         // old process: nothing can approve it any more.
@@ -156,7 +172,27 @@ impl Driver {
             clear_chat_role(&self.pool, chat).await;
         }
         let id = run.id.clone();
-        if let Err(e) = self.drive_inner(&id).await {
+        // A heartbeat while the run works: between milestones minutes apart,
+        // it is what tells a client the run is alive and what it is doing.
+        let heartbeat = {
+            let me = self.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(HEARTBEAT);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    match store::get_run(&me.pool, &id).await {
+                        Ok(Some(run)) if run.is_live() => me.publish(&run, None).await,
+                        _ => break,
+                    }
+                }
+            })
+        };
+        let outcome = self.drive_inner(&id).await;
+        heartbeat.abort();
+        activity::clear(&id);
+        if let Err(e) = outcome {
             tracing::warn!(run = %id, "research run failed: {e}");
             if store::set_status(&self.pool, &id, store::STATUS_FAILED, Some(&e))
                 .await
@@ -318,6 +354,14 @@ impl Driver {
         store::finish_step(&self.pool, &run.id, wave, "succeeded", Some(&summary))
             .await
             .map_err(|e| e.to_string())?;
+        let note = notes::wave_note(wave, waves_for(run.max_turns), &contract, &after, &new);
+        self.post_note(
+            run,
+            &chat,
+            &note,
+            json!({"step": "wave_done", "wave": wave}),
+        )
+        .await;
         let open_p1 = after.of_kind("question").any(|e| {
             matches!(&e.body, Body::Question(q) if q.priority == 1)
                 && matches!(after.status(e.seq), crate::research::ledger::Status::Open)
@@ -554,12 +598,22 @@ impl Driver {
         }
         let cap = self.orchestrator.completable_fan_out().max(1);
         runs.truncate(cap);
-        let outcomes = self
-            .orchestrator
-            .run_many(runs.iter().map(|(d, _, _)| d.clone()).collect())
-            .await;
+        // Every delegate under one deadline, as `run_many` would, but each
+        // report is written to the ledger the moment it lands: the counts a
+        // client shows move with the work instead of jumping at the end.
+        let deadline = self.orchestrator.batch_deadline();
+        let total = runs.len();
+        let mut pending: futures::stream::FuturesUnordered<_> = runs
+            .into_iter()
+            .map(|(d, i, from_ref)| {
+                let orchestrator = self.orchestrator.clone();
+                async move { (i, from_ref, orchestrator.run_until(d, deadline).await) }
+            })
+            .collect();
         let mut tokens = 0;
-        for ((_, i, from_ref), outcome) in runs.into_iter().zip(outcomes) {
+        let mut done = 0;
+        while let Some((i, from_ref, outcome)) = pending.next().await {
+            done += 1;
             let task = &tasks[i];
             let task_seq = task_seqs.get(i).copied();
             match outcome_answer(outcome) {
@@ -587,12 +641,21 @@ impl Driver {
                         wave,
                         &Body::DeadEnd(DeadEnd {
                             query: task.objective.clone(),
-                            note: format!("The delegate did not finish: {why}"),
+                            note: format!("{DID_NOT_FINISH}: {why}"),
                         }),
                     )
                     .await?;
                 }
             }
+            activity::touch(&run.id);
+            self.publish(
+                run,
+                Some(json!({
+                    "step": "researching", "wave": wave, "tasks": tasks.len(),
+                    "done": done, "of": total,
+                })),
+            )
+            .await;
         }
         Ok(tokens)
     }
@@ -824,6 +887,8 @@ impl Driver {
         // Fill the gaps the critic named, once, in parallel.
         let cap = self.orchestrator.completable_fan_out().max(1);
         gaps.truncate(cap);
+        let gap_count = gaps.len();
+        let mut gap_findings = 0;
         if !gaps.is_empty() && self.still_live(&run.id).await {
             self.publish(
                 run,
@@ -872,6 +937,7 @@ impl Driver {
                     .await?;
                 let after = usable_findings(&ops::load_ledger(&self.pool, &run.id).await?);
                 for f in after.difference(&before) {
+                    gap_findings += 1;
                     let _ = ops::link(&self.pool, &run.id, *f, defect, "addresses", "", turn).await;
                 }
             }
@@ -888,7 +954,26 @@ impl Driver {
         )
         .await
         .map_err(|e| e.to_string())?;
+        let note = notes::critique_note(defects, gap_count, gap_findings, kept.len());
+        self.post_note(run, &chat, &note, json!({"step": "critique_done"}))
+            .await;
         Ok(())
+    }
+
+    /// Post a milestone note in the chat and tell clients, which reload the
+    /// chat to show it. Best-effort: a note that cannot be written never
+    /// stops the run.
+    async fn post_note(&self, run: &RunRow, chat: &str, note: &str, step: Value) {
+        if !self.still_live(&run.id).await {
+            return;
+        }
+        if let Err(e) = append_assistant_message(&self.pool, chat, note).await {
+            tracing::warn!(run = %run.id, "research: could not post a milestone note: {e}");
+            return;
+        }
+        if let Ok(Some(run)) = store::get_run(&self.pool, &run.id).await {
+            self.publish(&run, Some(step)).await;
+        }
     }
 
     /// A healthy, tool-capable provider other than the chat's own, for a
@@ -1228,6 +1313,9 @@ impl Driver {
 
     /// Publish the run's state on the app stream and the chat's.
     pub async fn publish(&self, run: &RunRow, step: Option<Value>) {
+        if let Some(step) = &step {
+            activity::set_step(&run.id, step.clone());
+        }
         let ev = progress_event(&self.pool, run, step).await;
         self.agent.app_events().publish(&run.app_id, ev.clone());
         if let Some(chat) = run.session_id.as_deref() {
@@ -1241,6 +1329,8 @@ pub async fn progress_event(pool: &SqlitePool, run: &RunRow, step: Option<Value>
     let detail = run_detail(pool, run).await;
     let mut detail = detail;
     if let (Some(obj), Some(step)) = (detail.as_object_mut(), step) {
+        // The event's own step wins over the remembered one (same value, but
+        // never a stale read).
         obj.insert("step".into(), step);
     }
     SSEEvent {
@@ -1285,7 +1375,7 @@ pub async fn run_detail(pool: &SqlitePool, run: &RunRow) -> Value {
             })
             .count()
     };
-    json!({
+    let mut detail = json!({
         "id": run.id,
         "session_id": run.session_id,
         "status": run.status,
@@ -1306,7 +1396,24 @@ pub async fn run_detail(pool: &SqlitePool, run: &RunRow) -> Value {
         "error": run.error,
         "created_at": run.created_at,
         "finished_at": run.finished_at,
-    })
+    });
+    // What it is doing right now, while it is doing anything.
+    if run.is_live() {
+        let live = activity::snapshot(
+            pool,
+            &run.id,
+            run.session_id.as_deref(),
+            STALL_AFTER_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .await;
+        if let Some(obj) = detail.as_object_mut() {
+            if let Some(step) = live.get("step").filter(|s| !s.is_null()) {
+                obj.insert("step".into(), step.clone());
+            }
+            obj.insert("activity".into(), live);
+        }
+    }
+    detail
 }
 
 // ---------------------------------------------------------------- helpers

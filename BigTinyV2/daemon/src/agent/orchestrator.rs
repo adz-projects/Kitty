@@ -855,6 +855,29 @@ impl Orchestrator {
     /// could not be parsed should cost the caller that row, not the other nine:
     /// a caller handed an error learns nothing about the nine that worked, and
     /// re-running to find out is the expense the fan-out existed to avoid.
+    /// One delegate under an absolute deadline shared with its siblings: for
+    /// a caller that drives a fan-out itself, handling each result as it
+    /// lands rather than waiting for the slowest (deep research records each
+    /// researcher's findings the moment it reports). Pair with
+    /// [`Orchestrator::batch_deadline`].
+    pub async fn run_until(
+        &self,
+        spec: DelegateRun,
+        deadline: tokio::time::Instant,
+    ) -> Result<Result<DelegateOutcome, String>, SpawnRefusal> {
+        self.run_by(spec, deadline).await
+    }
+
+    /// The deadline [`Orchestrator::run_many`] gives a batch started now.
+    pub fn batch_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.batch_timeout()
+    }
+
+    /// How long one delegate may run.
+    pub fn delegate_timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+
     pub async fn run_many(
         &self,
         specs: Vec<DelegateRun>,

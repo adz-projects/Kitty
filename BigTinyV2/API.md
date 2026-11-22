@@ -241,6 +241,31 @@ stream:
   `coverage` per cell, `steps` with their sessions, the current `step`, and
   `tokens_used`.
 
+While a step runs, the daemon also publishes every 10 s, and after each
+researcher reports, with an `activity` object in the detail:
+
+- `step` and `step_started_ms`.
+- `last_activity_ms`: the latest message saved by any session working for
+  the run.
+- `stall_after_secs`: one delegate's time limit plus two minutes. Silence
+  longer than that means the run may be stuck.
+- `workers`: each planner or delegate with a turn in progress
+  (`session_id`, `label`, `doing`, `started_ms`, `last_ms`). `doing` is its
+  latest tool call in words, such as `searching: …` or `reading sos.ca.gov`.
+
+`GET /api/research/{id}` returns the same `activity` for a live run.
+
+A researcher's findings are written to the ledger as soon as it reports, not
+at the end of its wave.
+
+**Milestone notes.** After each wave and after the critique, the daemon
+appends a short assistant message to the chat. It says what the wave did
+(tasks, leads followed, tangents, new findings and sources, tasks that ran out
+of time), the coverage so far, a few new findings and what comes next. The
+`research_progress` event that follows carries `step: "wave_done"` (with
+`wave`) or `"critique_done"`. When the chat's history is built for a model,
+back-to-back assistant messages without tool calls are joined into one.
+
 A run interrupted by a restart resumes at its next step. One still waiting for
 plan approval is cancelled.
 

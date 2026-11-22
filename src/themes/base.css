@@ -1093,6 +1093,44 @@ button:disabled {
 }
 /* What `/debate` expects, shown while the composer holds the command. Sits
    just above the composer so the textarea does not move. */
+/* The slash-command menu above the composer (Composer.tsx). */
+.slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  margin: 0 0 4px;
+  padding: 4px;
+  list-style: none;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  z-index: 5;
+  max-height: 16rem;
+  overflow-y: auto;
+}
+.slash-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.slash-item.active {
+  background: var(--surface-2);
+}
+.slash-name {
+  font-weight: 600;
+}
+.slash-args {
+  font-size: 0.85em;
+}
+.slash-desc {
+  flex-basis: 100%;
+  font-size: 0.85em;
+}
 .composer-hint {
   position: absolute;
   left: 0;
@@ -1617,6 +1655,46 @@ button:disabled {
   display: block;
   height: 100%;
   background: var(--accent);
+}
+.research-pulse {
+  font-size: 0.85em;
+}
+.research-stalled {
+  color: var(--warn);
+}
+.research-workers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.9em;
+}
+.research-worker-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.research-worker-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.research-worker-doing {
+  padding-left: 1em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.research-workers .link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
 }
 .research-steps {
   margin: 0;
