@@ -314,3 +314,77 @@ async fn restore_brings_back_archived_pending_chunks_once() {
     engine.db.archive_chunk(&id, T0_PLUS_30D).await.unwrap();
     assert_eq!(engine.restore_unextracted_batch(T0_PLUS_30D).await, 0);
 }
+
+#[tokio::test]
+async fn anchor_resets_even_after_reinforcement_count_hits_max() {
+    let engine = engine(transient_claim()).await;
+    let content = "frequently used transient knowledge that must stay fresh";
+    let id = chunk_id_of(content);
+    engine.ingest(&doc(content, "alpha.example")).await;
+    engine.drain_extraction(T0).await;
+
+    // Push reinforcement_count right up to the cap (5).
+    let max = engine.config.reinforcement_count_max as i64;
+    engine
+        .db
+        .apply_chunk_counters(&id, 0, max, Some(T0))
+        .await
+        .unwrap();
+    let chunk = engine.db.get_chunk(&id).await.unwrap().unwrap();
+    assert_eq!(chunk.reinforcement_count, max);
+    assert_eq!(chunk.anchor_at, T0);
+
+    // A later use must still reset `anchor_at` to T0_PLUS_30D even though
+    // `reinforcement_count` stays capped at `max`, keeping the chunk active.
+    let shown = engine
+        .recall_turn("frequently used transient knowledge", None)
+        .await
+        .expect("recall injects");
+    engine
+        .record_use(&shown.query_event_id, &shown.item_ids)
+        .await;
+    let out = engine.maintenance_tick(T0_PLUS_30D).await;
+    assert_eq!(out.outbox_reinforced, 0, "counter stays capped at max");
+    assert_eq!(out.chunks_archived, 0, "freshly used chunk must not archive");
+
+    let chunk = engine.db.get_chunk(&id).await.unwrap().unwrap();
+    assert_eq!(chunk.reinforcement_count, max);
+    assert_eq!(chunk.anchor_at, T0_PLUS_30D);
+    assert_eq!(chunk.status, "active");
+}
+
+#[tokio::test]
+async fn light_maintenance_tick_runs_model_free_lifecycle_and_respects_6h_gate() {
+    let engine = engine(transient_claim()).await;
+    let content = "transient item whose cut log should fold during daytime light maintenance";
+    engine.ingest(&doc(content, "alpha.example")).await;
+    engine.drain_extraction(T0).await;
+
+    // Seed a pending recall cut to verify fold_pending runs in light_maintenance_tick.
+    memorabilia::recall::cut_log::log(&engine.db, "test_space", 0.25)
+        .await
+        .unwrap();
+
+    let out1 = engine.light_maintenance_tick(T0).await;
+    assert!(out1.heavy_ran, "first light maintenance tick runs the 6h light-heavy pass");
+    assert!(
+        memorabilia::recall::cut_log::snapshot(&engine.db, "test_space")
+            .await
+            .is_some(),
+        "cut_log folded during light_maintenance_tick"
+    );
+
+    // Within 6h, light-heavy does not re-run.
+    let out2 = engine.light_maintenance_tick("2026-08-01T12:00:00Z").await;
+    assert!(!out2.heavy_ran, "6h gate prevents re-running immediately");
+
+    // At +7h, light-heavy runs again; heavy 24h `last_maintenance_at` remains untouched.
+    let out3 = engine.light_maintenance_tick("2026-08-01T17:00:00Z").await;
+    assert!(out3.heavy_ran, "light-heavy re-runs after 6h");
+    assert!(engine
+        .db
+        .get_setting("last_maintenance_at")
+        .await
+        .unwrap()
+        .is_none());
+}

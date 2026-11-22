@@ -247,9 +247,10 @@ pub fn unsupported_transition(importance: &str) -> &'static str {
 
 /// §6.1 promotion gates (transient → static): all four must hold —
 /// `reinforcement_count ≥` threshold, no open DISPUTED edge,
-/// `source_reliability ≥` floor, and independent corroboration (≥ 2
-/// distinct `source_entity` origins or `controlled_test` provenance).
-/// Frequency alone never promotes.
+/// `source_reliability ≥` floor (or ≥ 3 distinct sources at `≥ 0.35` so
+/// strongly corroborated personal/community notes can promote), and
+/// independent corroboration (≥ 2 distinct `source_entity` origins or
+/// `controlled_test` provenance). Frequency alone never promotes.
 pub fn can_promote(
     reinforcement_count: i64,
     open_dispute: bool,
@@ -258,8 +259,10 @@ pub fn can_promote(
     controlled_test: bool,
     cfg: &Config,
 ) -> bool {
+    let reliable_and_corroborated =
+        source_reliability >= cfg.promotion_min_reliability && (distinct_sources >= 2 || controlled_test);
+    let widely_corroborated = distinct_sources >= 3 && source_reliability >= 0.35;
     reinforcement_count >= cfg.reinforcement_promote_threshold as i64
         && !open_dispute
-        && source_reliability >= cfg.promotion_min_reliability
-        && (distinct_sources >= 2 || controlled_test)
+        && (reliable_and_corroborated || widely_corroborated)
 }

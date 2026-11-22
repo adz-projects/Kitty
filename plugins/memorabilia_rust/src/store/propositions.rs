@@ -278,4 +278,247 @@ impl Db {
         .await?;
         Ok(())
     }
+
+    /// Identifiers of all active propositions, in insertion order.
+    pub async fn list_active_proposition_ids(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT node_id FROM propositions WHERE status = 'active' ORDER BY rowid",
+        )
+        .fetch_all(self.read_pool())
+        .await?)
+    }
+
+    /// Full-text BM25 search over active proposition claims via `propositions_fts`.
+    /// Returns `(node_id, score)` ordered strongest-first (higher is better).
+    /// Soft-fails to an empty vec on invalid/empty FTS queries so recall never fails.
+    pub async fn search_propositions_fts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(match_expr) = build_fts5_match_query(query) else {
+            return Ok(Vec::new());
+        };
+        let rows: Result<Vec<(String, f64)>> = sqlx::query_as(
+            "SELECT p.node_id, -bm25(propositions_fts) AS score
+             FROM propositions_fts
+             JOIN propositions AS p ON p.rowid = propositions_fts.rowid
+             WHERE propositions_fts MATCH ? AND p.status = 'active'
+             ORDER BY bm25(propositions_fts) ASC, p.node_id ASC
+             LIMIT ?",
+        )
+        .bind(&match_expr)
+        .bind(limit as i64)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(Into::into);
+        match rows {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                tracing::debug!("propositions_fts search soft-failed for {match_expr:?}: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Active claims holding a *rare* identifier-like term from `query` (a
+    /// name, model number or code symbol, see [`identifier_terms`]): a term
+    /// at most `max_df` active claims contain. Best BM25 first, at most
+    /// `limit`. These are what embeddings blur and an exact match settles;
+    /// a common word never qualifies. Soft-fails to empty.
+    pub async fn rare_term_propositions(
+        &self,
+        query: &str,
+        max_df: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rare: Vec<String> = Vec::new();
+        for term in identifier_terms(query).into_iter().take(6) {
+            let quoted = format!("\"{term}\"");
+            let df: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM propositions_fts \
+                 JOIN propositions AS p ON p.rowid = propositions_fts.rowid \
+                 WHERE propositions_fts MATCH ? AND p.status = 'active'",
+            )
+            .bind(&quoted)
+            .fetch_one(self.read_pool())
+            .await;
+            match df {
+                Ok(n) if n > 0 && n <= max_df => rare.push(quoted),
+                Ok(_) => {}
+                Err(e) => tracing::debug!("propositions_fts df soft-failed for {quoted}: {e}"),
+            }
+        }
+        if rare.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expr = rare.join(" OR ");
+        let rows: std::result::Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT p.node_id FROM propositions_fts \
+             JOIN propositions AS p ON p.rowid = propositions_fts.rowid \
+             WHERE propositions_fts MATCH ? AND p.status = 'active' \
+             ORDER BY bm25(propositions_fts) ASC, p.node_id ASC LIMIT ?",
+        )
+        .bind(&expr)
+        .bind(limit as i64)
+        .fetch_all(self.read_pool())
+        .await;
+        Ok(rows.unwrap_or_else(|e| {
+            tracing::debug!("propositions_fts rare search soft-failed for {expr:?}: {e}");
+            Vec::new()
+        }))
+    }
+}
+
+/// The identifier-like words of a query, lowercased and de-duplicated: a
+/// word with a digit or underscore (`B550M`, `gemma_3`), an inner capital
+/// (`LiteRT`, `AORUS`), or a capital that does not open a sentence (a proper
+/// name). Ordinary words never qualify, whatever their case.
+pub fn identifier_terms(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut sentence_start = true;
+    for raw in query.split_whitespace() {
+        let ends_sentence = raw.ends_with(['.', '!', '?', ':']);
+        for word in raw.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            let word = word.trim_matches('_');
+            if word.chars().count() < 2 {
+                continue;
+            }
+            let mut chars = word.chars();
+            let first_upper = chars.next().is_some_and(|c| c.is_uppercase());
+            let inner_upper = chars.any(|c| c.is_uppercase());
+            let identifier = word.chars().any(|c| c.is_ascii_digit())
+                || word.contains('_')
+                || inner_upper
+                || (first_upper && !sentence_start);
+            if identifier {
+                let lower = word.to_lowercase();
+                if !out.contains(&lower) {
+                    out.push(lower);
+                }
+            }
+            sentence_start = false;
+        }
+        if ends_sentence {
+            sentence_start = true;
+        }
+    }
+    out
+}
+
+/// Tokenize a free-text user query into safe quoted FTS5 OR terms (alphanumeric
+/// tokens >= 2 chars, capped to 12 tokens to bound SQLite FTS work).
+fn build_fts5_match_query(query: &str) -> Option<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        let trimmed = raw.trim_matches('_');
+        if trimmed.chars().count() < 2 {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        if matches!(
+            lower.as_str(),
+            "the" | "and" | "for" | "with" | "that" | "this" | "from" | "what" | "when" | "where"
+                | "which" | "about" | "into" | "your" | "have" | "does" | "are" | "was" | "were"
+                | "will" | "would" | "could" | "should" | "can" | "not" | "but" | "you"
+        ) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            terms.push(format!("\"{lower}\""));
+            if terms.len() >= 12 {
+                break;
+            }
+        }
+    }
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_prop(id: &str, claim: &str) -> Proposition {
+        Proposition {
+            node_id: id.into(),
+            claim: claim.into(),
+            confidence: 0.8,
+            is_disputed: false,
+            status: "active".into(),
+            importance: "medium".into(),
+            urgency: "low".into(),
+            urgency_expires_at: None,
+            last_assessed_at: None,
+            archived_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            attribution: String::new(),
+            stance: "states".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn propositions_fts_tracks_insert_update_delete_and_handles_punctuation() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.insert_proposition(&test_prop("p1", "Gigabyte B550M AORUS PRO uses AM4 socket"))
+            .await
+            .unwrap();
+        db.insert_proposition(&test_prop("p2", "ArXiv preprints publish daily"))
+            .await
+            .unwrap();
+
+        let hits = db
+            .search_propositions_fts("What socket does B550M AORUS use?! OR \"test\"", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.first().map(|h| h.0.as_str()), Some("p1"));
+
+        // Archived propositions must not appear in FTS recall.
+        db.archive_proposition("p1", "2026-02-01T00:00:00Z").await.unwrap();
+        let after_archive = db.search_propositions_fts("B550M AORUS", 5).await.unwrap();
+        assert!(after_archive.is_empty());
+
+        // Deleting p2 clears it from FTS index too.
+        db.delete_proposition("p2").await.unwrap();
+        let after_del = db.search_propositions_fts("ArXiv preprints", 5).await.unwrap();
+        assert!(after_del.is_empty());
+    }
+
+    #[test]
+    fn identifier_terms_pick_names_and_codes_not_ordinary_words() {
+        assert_eq!(
+            identifier_terms("What socket does the B550M AORUS use? Ask Priya about it."),
+            vec!["b550m", "aorus", "priya"]
+        );
+        assert_eq!(identifier_terms("How do I make good bread"), Vec::<String>::new());
+        assert_eq!(identifier_terms("call gemma_3 via LiteRT"), vec!["gemma_3", "litert"]);
+    }
+
+    #[tokio::test]
+    async fn rare_terms_rescue_only_uncommon_identifiers() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.insert_proposition(&test_prop("p1", "The B550M board takes AM4 chips"))
+            .await
+            .unwrap();
+        for i in 0..5 {
+            db.insert_proposition(&test_prop(&format!("q{i}"), "Priya maintains this cluster"))
+                .await
+                .unwrap();
+        }
+        let hits = db
+            .rare_term_propositions("Is the B550M still sold, Priya?", 3, 5)
+            .await
+            .unwrap();
+        assert_eq!(hits, vec!["p1".to_string()], "Priya is in 5 claims: not rare");
+    }
 }

@@ -364,6 +364,12 @@ async fn migration_002_creates_every_plan_table() {
         "proposition_edges",
         "proposition_relations",
         "propositions",
+        // Added by migration 009 (propositions FTS5 + SQLite shadow tables).
+        "propositions_fts",
+        "propositions_fts_config",
+        "propositions_fts_data",
+        "propositions_fts_docsize",
+        "propositions_fts_idx",
         "reinforcement_outbox",
         // Added by migration 004 (Kitty's unified per-session incognito).
         "screen_log",

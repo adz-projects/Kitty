@@ -215,13 +215,83 @@ impl Db {
     /// a value the static migration files cannot know. Idempotent
     /// (`IF NOT EXISTS`); call once after `open`/`open_in_memory`, before
     /// any [`super::store::vectors::SqliteVectorIndex`] use.
-    pub async fn init_vectors(&self, dim: usize) -> Result<()> {
+    /// Create the `chunks_vec` index at `dim`. An existing index of another
+    /// width (created while the embedding model was unavailable, or for a
+    /// different model) can never take this model's vectors, so it is
+    /// dropped and recreated empty; every chunk then counts as missing its
+    /// vector and the maintenance pass re-embeds it
+    /// (`Engine::reembed_stale`). Returns whether it was rebuilt.
+    pub async fn init_vectors(&self, dim: usize) -> Result<bool> {
+        let rebuilt = match self.vec_dim().await? {
+            Some(existing) if existing != dim => {
+                tracing::warn!(
+                    existing,
+                    dim,
+                    "memorabilia: chunks_vec has the wrong width; rebuilding it empty for re-embedding"
+                );
+                sqlx::query("DROP TABLE chunks_vec").execute(&*self.write().await).await?;
+                true
+            }
+            _ => false,
+        };
         let sql = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(\
              chunk_id TEXT PRIMARY KEY, embedding float[{dim}])"
         );
         sqlx::query(&sql).execute(&*self.write().await).await?;
-        Ok(())
+        Ok(rebuilt)
+    }
+
+    /// The width `chunks_vec` was created with, read from its schema;
+    /// `None` when it does not exist yet.
+    pub async fn vec_dim(&self) -> Result<Option<usize>> {
+        let sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_vec'",
+        )
+        .fetch_optional(self.read_pool())
+        .await?;
+        Ok(sql.as_deref().and_then(parse_vec_dim))
+    }
+
+    /// The `chunks_vec` width of the database file at `path` without opening
+    /// it as an engine (no migrations, no writes); `None` when the file or
+    /// the table does not exist.
+    pub async fn peek_vec_dim(path: &str) -> Option<usize> {
+        if !Path::new(path).exists() {
+            return None;
+        }
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .busy_timeout(Duration::from_millis(2000));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .ok()?;
+        let sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_vec'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+        pool.close().await;
+        sql.as_deref().and_then(parse_vec_dim)
+    }
+
+    /// Active chunks with no row in `chunks_vec` (an index rebuilt empty, or
+    /// a write that failed), oldest first.
+    pub async fn list_active_chunks_missing_vectors(&self, limit: i64) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT c.chunk_id FROM chunks AS c \
+             WHERE c.status = 'active' \
+               AND NOT EXISTS (SELECT 1 FROM chunks_vec AS v WHERE v.chunk_id = c.chunk_id) \
+             ORDER BY c.created_at ASC, c.chunk_id ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.read_pool())
+        .await?)
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -353,6 +423,16 @@ impl Db {
     /// active vectors yet. O(N·dim) over the active pool; recall reads a
     /// cached copy (`Engine::corpus_mean`) rather than calling this per turn.
     pub async fn corpus_mean_vector(&self, model: &str) -> Result<Option<Vec<f32>>> {
+        Ok(self.corpus_mean_vector_with_count(model).await?.map(|(v, _)| v))
+    }
+
+    /// Same as [`Self::corpus_mean_vector`], also returning the number of
+    /// active vectors averaged so callers can tell when a cached mean is stale
+    /// or came from a 1-vector degenerate store.
+    pub async fn corpus_mean_vector_with_count(
+        &self,
+        model: &str,
+    ) -> Result<Option<(Vec<f32>, usize)>> {
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
             "SELECT cv.embedding
              FROM chunks_vec AS cv
@@ -385,7 +465,21 @@ impl Db {
         if n == 0 {
             return Ok(None);
         }
-        Ok(Some(sum.iter().map(|s| (s / n as f64) as f32).collect()))
+        Ok(Some((sum.iter().map(|s| (s / n as f64) as f32).collect(), n)))
+    }
+
+    /// Number of active chunk vectors stored for `model`.
+    pub async fn count_active_chunks_for_model(&self, model: &str) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM chunks_vec AS cv
+             JOIN chunks AS c ON c.chunk_id = cv.chunk_id
+             WHERE c.status = 'active' AND c.embedding_model = ?",
+        )
+        .bind(model)
+        .fetch_one(self.read_pool())
+        .await?;
+        Ok(count.max(0) as usize)
     }
 
     /// Distinct embedding-space tags that currently have active chunks — the
@@ -708,5 +802,36 @@ mod reader_tests {
         assert_eq!(db.get_setting("b").await.unwrap().as_deref(), Some("2"));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The `N` of `embedding float[N]` in a `chunks_vec` CREATE statement.
+fn parse_vec_dim(sql: &str) -> Option<usize> {
+    let start = sql.find("float[")? + "float[".len();
+    let end = start + sql[start..].find(']')?;
+    sql[start..end].trim().parse().ok()
+}
+
+#[cfg(test)]
+mod vec_dim_tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_width() {
+        assert_eq!(
+            parse_vec_dim("CREATE VIRTUAL TABLE chunks_vec USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[768])"),
+            Some(768)
+        );
+        assert_eq!(parse_vec_dim("CREATE TABLE x (a)"), None);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_width_index_is_rebuilt() {
+        let db = Db::open_in_memory().await.unwrap();
+        assert!(!db.init_vectors(4).await.unwrap());
+        assert_eq!(db.vec_dim().await.unwrap(), Some(4));
+        assert!(!db.init_vectors(4).await.unwrap(), "same width: kept");
+        assert!(db.init_vectors(8).await.unwrap(), "other width: rebuilt");
+        assert_eq!(db.vec_dim().await.unwrap(), Some(8));
     }
 }

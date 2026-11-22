@@ -57,6 +57,14 @@ pub const RESTORE_UNEXTRACTED_KEY: &str = "restore_unextracted_v1";
 /// batch costs seconds, but a tick should still stay short).
 const RESTORE_BATCH: i64 = 50;
 
+/// Persisted 6-hour gate for model-free light heavy maintenance (`promote_transient`,
+/// `refresh_corpus_mean`, `cut_log::fold_pending`) so it keeps running even if
+/// overnight passes are missed.
+const LIGHT_HEAVY_INTERVAL_HOURS: i64 = 6;
+
+/// Chunks missing a vector re-embedded per heavy pass (each is a model call).
+const MISSING_VECTOR_BATCH: i64 = 200;
+
 impl Engine {
     /// One maintenance pass at caller time `now` (ISO-8601 UTC, second
     /// precision). Never returns an error — an unparseable `now` or any phase
@@ -68,13 +76,64 @@ impl Engine {
             return outcome;
         };
 
+        self.run_cheap_maintenance(now, &now_naive, &mut outcome).await;
+
+        if self.heavy_pass_due(&now_naive).await {
+            outcome.heavy_ran = true;
+            match self.reembed_stale().await {
+                Ok(n) => outcome.reembedded = n,
+                Err(e) => tracing::warn!("maintenance: reembed_stale failed ({e})"),
+            }
+            outcome.promoted = self.run_light_heavy_maintenance(now, &now_naive).await;
+            if let Err(e) = self.db.set_setting("last_maintenance_at", now).await {
+                tracing::warn!("maintenance: could not persist heavy-pass anchor ({e})");
+            }
+            let _ = self.db.set_setting("last_light_maintenance_at", now).await;
+        }
+
+        outcome
+    }
+
+    /// Model-free maintenance pass suitable for running periodically during the
+    /// day (outside the overnight window): drains the outbox, archives decayed
+    /// chunks, hard-deletes expired rows, and on a 6h cadence promotes
+    /// transient chunks, refreshes `corpus_mean`, and folds `cut_log`.
+    pub async fn light_maintenance_tick(&self, now: &str) -> MaintenanceOutcome {
+        let mut outcome = MaintenanceOutcome::default();
+        let Some(now_naive) = core::parse_utc(now) else {
+            tracing::warn!("light_maintenance_tick: unparseable now ({now}); tick skipped");
+            return outcome;
+        };
+
+        self.run_cheap_maintenance(now, &now_naive, &mut outcome).await;
+
+        if self
+            .interval_due("last_light_maintenance_at", LIGHT_HEAVY_INTERVAL_HOURS, &now_naive)
+            .await
+        {
+            outcome.heavy_ran = true;
+            outcome.promoted = self.run_light_heavy_maintenance(now, &now_naive).await;
+            if let Err(e) = self.db.set_setting("last_light_maintenance_at", now).await {
+                tracing::warn!("maintenance: could not persist light-maintenance anchor ({e})");
+            }
+        }
+
+        outcome
+    }
+
+    async fn run_cheap_maintenance(
+        &self,
+        now: &str,
+        now_naive: &NaiveDateTime,
+        outcome: &mut MaintenanceOutcome,
+    ) {
         // The whole backlog, before decay is judged: a chunk whose
         // reinforcement is still queued must not be archived as unused.
         let (g, r) = self.drain_outbox_fully(now).await;
         outcome.outbox_grounded = g;
         outcome.outbox_reinforced = r;
 
-        match self.resolve_decay(now, &now_naive).await {
+        match self.resolve_decay(now, now_naive).await {
             Ok((archived, p_arch, p_del, disputes)) => {
                 outcome.chunks_archived = archived;
                 outcome.propositions_archived = p_arch;
@@ -84,48 +143,57 @@ impl Engine {
             Err(e) => tracing::warn!("maintenance: decay resolution failed ({e})"),
         }
 
-        match self.hard_delete_expired(&now_naive).await {
+        match self.hard_delete_expired(now_naive).await {
             Ok((c, p)) => {
                 outcome.chunks_hard_deleted = c;
                 outcome.propositions_hard_deleted = p;
             }
             Err(e) => tracing::warn!("maintenance: hard-delete pass failed ({e})"),
         }
+    }
 
-        if self.heavy_pass_due(&now_naive).await {
-            outcome.heavy_ran = true;
-            match self.reembed_stale().await {
-                Ok(n) => outcome.reembedded = n,
-                Err(e) => tracing::warn!("maintenance: reembed_stale failed ({e})"),
+    async fn run_light_heavy_maintenance(&self, now: &str, now_naive: &NaiveDateTime) -> usize {
+        let promoted = match self.promote_transient(now).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("maintenance: promotion failed ({e})");
+                0
             }
-            match self.promote_transient(now).await {
-                Ok(n) => outcome.promoted = n,
-                Err(e) => tracing::warn!("maintenance: promotion failed ({e})"),
-            }
-            // Refresh the centered-cosine gate's corpus mean per active space,
-            // so `recall_min_cosine` tracks the pool as it grows/decays rather
-            // than freezing at the first query's snapshot (soft-fail).
-            match self.db.list_active_embedding_models().await {
-                Ok(models) => {
-                    for tag in models {
-                        if let Err(e) = self.refresh_corpus_mean(&tag).await {
-                            tracing::warn!("maintenance: corpus-mean refresh failed for {tag} ({e})");
-                        }
+        };
+        // Refresh active proposition confidences against current chunk decay
+        // so aged evidence lowers claim confidence smoothly instead of waiting
+        // until hard expiry.
+        match self.db.list_active_proposition_ids().await {
+            Ok(ids) => {
+                for node_id in ids {
+                    if let Err(e) = self.recompute_node_confidence(&node_id, now_naive).await {
+                        tracing::warn!("maintenance: confidence refresh failed for {node_id} ({e})");
                     }
                 }
-                Err(e) => tracing::warn!("maintenance: listing embedding spaces failed ({e})"),
             }
-            // The relevance-floor snapshot moves here, once per heavy pass,
-            // never during recall (`recall::cut_log`).
-            if let Err(e) = crate::recall::cut_log::fold_pending(&self.db, self.config.recall_ewma_alpha).await {
-                tracing::warn!("maintenance: folding recall cuts failed ({e})");
-            }
-            if let Err(e) = self.db.set_setting("last_maintenance_at", now).await {
-                tracing::warn!("maintenance: could not persist heavy-pass anchor ({e})");
-            }
+            Err(e) => tracing::warn!("maintenance: listing active propositions failed ({e})"),
         }
-
-        outcome
+        // Refresh the centered-cosine gate's corpus mean per active space,
+        // so `recall_min_cosine` tracks the pool as it grows/decays rather
+        // than freezing at the first query's snapshot (soft-fail).
+        match self.db.list_active_embedding_models().await {
+            Ok(models) => {
+                for tag in models {
+                    if let Err(e) = self.refresh_corpus_mean(&tag).await {
+                        tracing::warn!("maintenance: corpus-mean refresh failed for {tag} ({e})");
+                    }
+                    if let Err(e) = self.refresh_claim_mean(&tag).await {
+                        tracing::warn!("maintenance: claim-mean refresh failed for {tag} ({e})");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("maintenance: listing embedding spaces failed ({e})"),
+        }
+        // The relevance-floor snapshot moves here, never during recall (`recall::cut_log`).
+        if let Err(e) = crate::recall::cut_log::fold_pending(&self.db, self.config.recall_ewma_alpha).await {
+            tracing::warn!("maintenance: folding recall cuts failed ({e})");
+        }
+        promoted
     }
 
     /// Drain the reinforcement outbox completely, a bounded batch at a time.
@@ -183,11 +251,11 @@ impl Engine {
                 continue; // chunk hard-deleted meanwhile; the row still clears
             };
             let g = if row.grounded { 1 } else { 0 };
-            let do_reinforce = row.reinforced && chunk.reinforcement_count < max;
-            let r = if do_reinforce { 1 } else { 0 };
-            // Reinforcement resets the anchor (not τ), but never for a
-            // deadline chunk whose decay is anchored on T_expire.
-            let anchor = (do_reinforce && chunk.decay_class != "deadline").then_some(now);
+            let r = if row.reinforced && chunk.reinforcement_count < max { 1 } else { 0 };
+            // Reinforcement resets the anchor (not τ) even once `reinforcement_count`
+            // has reached `max`, so frequently-used chunks stay fresh instead of
+            // decaying away — but never for a deadline chunk anchored on T_expire.
+            let anchor = (row.reinforced && chunk.decay_class != "deadline").then_some(now);
             self.db
                 .apply_chunk_counters(&row.chunk_id, g, r, anchor)
                 .await?;
@@ -377,8 +445,17 @@ impl Engine {
     /// True when the persisted 24h heavy-pass gate has elapsed (plan §11).
     /// A never-run engine runs the heavy pass on its first tick.
     async fn heavy_pass_due(&self, now_naive: &NaiveDateTime) -> bool {
-        let interval = self.config.maintenance_heavy_interval_hours as i64 * SECONDS_PER_HOUR;
-        match self.db.get_setting("last_maintenance_at").await {
+        self.interval_due(
+            "last_maintenance_at",
+            self.config.maintenance_heavy_interval_hours as i64,
+            now_naive,
+        )
+        .await
+    }
+
+    async fn interval_due(&self, key: &str, interval_hours: i64, now_naive: &NaiveDateTime) -> bool {
+        let interval = interval_hours * SECONDS_PER_HOUR;
+        match self.db.get_setting(key).await {
             Ok(Some(last)) => match core::parse_utc(&last) {
                 Some(t) => (*now_naive - t).num_seconds() >= interval,
                 None => true,
@@ -422,6 +499,32 @@ impl Engine {
             self.db.update_chunk_embedding_model(&chunk_id, &tag).await?;
             count += 1;
         }
+        // Chunks with no vector at all (the index was rebuilt empty, or an
+        // insert failed): give them one, so vector search can find them
+        // again. A hash vector while the model is down is still better than
+        // none; it is upgraded above once the model is back.
+        for chunk_id in self
+            .db
+            .list_active_chunks_missing_vectors(MISSING_VECTOR_BATCH)
+            .await?
+        {
+            let Some(chunk) = self.db.get_chunk(&chunk_id).await? else {
+                continue;
+            };
+            let (vec, tag) = match self.embedder.embed_fresh(&chunk.content).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("reembed_stale: embed failed for {chunk_id} ({e})");
+                    continue;
+                }
+            };
+            self.vectors
+                .upsert(&chunk_id, &vec, &tag)
+                .await
+                .map_err(crate::error::Error::Internal)?;
+            self.db.update_chunk_embedding_model(&chunk_id, &tag).await?;
+            count += 1;
+        }
         Ok(count)
     }
 
@@ -436,16 +539,19 @@ impl Engine {
             if chunk.decay_class != "transient" {
                 continue;
             }
-            let open_dispute = self
+            let mut open_dispute = self
                 .db
                 .max_open_dispute_strength(&chunk.chunk_id)
                 .await?
                 .is_some();
             // Corroboration: the best distinct-source count over the
-            // propositions this chunk supports.
+            // propositions this chunk supports, and check claim-level disputes too.
             let mut distinct_sources = 0i64;
             for node in self.db.list_nodes_supported_by_chunk(&chunk.chunk_id).await? {
                 distinct_sources = distinct_sources.max(self.db.count_active_sources(&node).await?);
+                if !open_dispute && self.db.max_open_claim_dispute(&node).await?.is_some() {
+                    open_dispute = true;
+                }
             }
             if core::can_promote(
                 chunk.reinforcement_count,

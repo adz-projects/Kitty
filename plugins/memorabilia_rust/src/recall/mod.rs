@@ -49,16 +49,144 @@ fn sub(a: &[f32], b: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Sort key for the primary (relevance) ranking: a directly-seeded item's
-/// centered relevance, or `−∞` for a spread-only / hash-space item so it sorts
-/// after every item that has a real relevance score.
-fn rel_key(relevance: Option<f64>) -> f64 {
-    relevance.unwrap_or(f64::NEG_INFINITY)
+/// Composite primary sort key combining centered relevance, Reciprocal Rank
+/// Fusion across retrieval channels (chunks, claims, FTS5), and proposition
+/// confidence. Returns `−∞` when `relevance` is `None` (spread-only /
+/// hash-space items) so directly-scored semantic hits always lead.
+fn composite_relevance_key(relevance: Option<f64>, rrf: f64, confidence: f64) -> f64 {
+    match relevance {
+        Some(rel) => (rel * 0.70 + rrf * 0.30) * (0.85 + 0.15 * confidence.clamp(0.0, 1.0)),
+        None => f64::NEG_INFINITY,
+    }
+}
+
+/// RRF damping constant (standard Cormack et al. k = 60).
+const RRF_K: f64 = 60.0;
+
+/// Max propositions a rare exact term (a name, model number or identifier
+/// in the query) may bring in that neither vector channel found.
+const MAX_FTS_ONLY_SEEDS: usize = 3;
+
+/// A query term counts as rare when at most this many active claims hold it.
+pub(crate) const FTS_RARE_TERM_MAX_DF: i64 = 3;
+
+/// Output of fusing chunk-vector, claim-vector, and FTS5 seed channels.
+struct FusedSeeds {
+    activations: HashMap<String, f64>,
+    relevance: HashMap<String, f64>,
+    rrf: HashMap<String, f64>,
+    /// Each vector channel's own effective cut, logged to its own EWMA.
+    chunk_cut: Option<f64>,
+    claim_cut: Option<f64>,
+}
+
+/// Build deterministic descending node ranking from a seed result for RRF.
+fn ranked_node_list(seeds: &SeedResult) -> Vec<String> {
+    let mut nodes: Vec<(String, f64)> = seeds
+        .activations
+        .iter()
+        .map(|(id, &act)| {
+            let score = seeds.relevance.get(id).copied().unwrap_or(act);
+            (id.clone(), score)
+        })
+        .collect();
+    nodes.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    nodes.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Fuse the chunk and claim vector channels, then let FTS5 re-rank what they
+/// found (Reciprocal Rank Fusion).
+///
+/// Only the vector channels decide what is relevant: an FTS hit adds rank to
+/// a node they already admitted and never admits one by itself, because a
+/// lexical OR match on one shared word is not relevance. The one exception
+/// is `fts_rescues`, claims holding a *rare* exact term from the query (a
+/// name, model number or identifier that embeddings blur), admitted at the
+/// floor so they rank below every semantically scored item.
+fn fuse_seed_channels(
+    chunk_seeds: SeedResult,
+    claim_seeds: SeedResult,
+    fts_hits: &[(String, f64)],
+    fts_rescues: &[String],
+    floor: f64,
+    centered_space: bool,
+) -> FusedSeeds {
+    let chunk_list = ranked_node_list(&chunk_seeds);
+    let claim_list = ranked_node_list(&claim_seeds);
+
+    let mut activations = chunk_seeds.activations;
+    for (node, act) in claim_seeds.activations {
+        activations
+            .entry(node)
+            .and_modify(|prev| *prev = prev.max(act))
+            .or_insert(act);
+    }
+
+    let mut relevance = chunk_seeds.relevance;
+    for (node, rel) in claim_seeds.relevance {
+        relevance
+            .entry(node)
+            .and_modify(|prev| *prev = prev.max(rel))
+            .or_insert(rel);
+    }
+
+    let mut rescued = 0usize;
+    for node in fts_rescues {
+        if rescued >= MAX_FTS_ONLY_SEEDS {
+            break;
+        }
+        if activations.contains_key(node) {
+            continue;
+        }
+        activations.insert(node.clone(), 0.5);
+        if centered_space {
+            relevance.insert(node.clone(), floor);
+        }
+        rescued += 1;
+    }
+
+    // RRF over the admitted set only, normalized to [0, 1] across 3 channels.
+    let mut rrf_raw: HashMap<String, f64> = HashMap::new();
+    for list in [&chunk_list, &claim_list] {
+        for (idx, node) in list.iter().enumerate() {
+            *rrf_raw.entry(node.clone()).or_default() += 1.0 / (RRF_K + (idx + 1) as f64);
+        }
+    }
+    for (idx, (node, _)) in fts_hits.iter().enumerate() {
+        if activations.contains_key(node) {
+            *rrf_raw.entry(node.clone()).or_default() += 1.0 / (RRF_K + (idx + 1) as f64);
+        }
+    }
+    let max_rrf = 3.0 / (RRF_K + 1.0);
+    let rrf: HashMap<String, f64> = rrf_raw
+        .into_iter()
+        .map(|(k, v)| (k, (v / max_rrf).clamp(0.0, 1.0)))
+        .collect();
+
+    FusedSeeds {
+        activations,
+        relevance,
+        rrf,
+        chunk_cut: chunk_seeds.effective_cut,
+        claim_cut: claim_seeds.effective_cut,
+    }
+}
+
+/// The self-tuning floor's key for the claim channel of embedding space
+/// `tag`: claims are short and score on a different scale from chunks, so
+/// they keep an EWMA (and a corpus mean) of their own.
+pub(crate) fn claim_space(tag: &str) -> String {
+    format!("claims::{tag}")
 }
 
 /// Pass-1 seed output: per-node raw-cosine activation (drives spreading) and
 /// per-node centered relevance (the primary ranking key), plus this query's
 /// effective cut (the lowest kept centered score) for the self-tuning EWMA.
+#[derive(Default)]
 struct SeedResult {
     activations: HashMap<String, f64>,
     relevance: HashMap<String, f64>,
@@ -271,7 +399,14 @@ impl Engine {
             if tag != crate::config::HASH_EMBED_MODEL {
                 if let Ok((pv, ptag)) = self.embedder.embed(prev).await {
                     if ptag == tag && pv.len() == qvec.len() {
-                        qvec = blend_query(&qvec, &pv);
+                        let mean = if query.split_whitespace().count() <= SHORT_FOLLOWUP_MAX_WORDS {
+                            None
+                        } else {
+                            self.corpus_mean(&tag).await.unwrap_or(None)
+                        };
+                        if should_blend_previous(query, &qvec, &pv, mean.as_deref()) {
+                            qvec = blend_query(&qvec, &pv);
+                        }
                     }
                 }
             }
@@ -282,7 +417,9 @@ impl Engine {
         // An item line costs well over `INDEX_ITEM_MIN_TOKENS`, so no more
         // than this many can ever fit in the block.
         let max_items = (cap / INDEX_ITEM_MIN_TOKENS).max(1);
-        let items = self.ranked_items_from(qvec, tag, true, max_items).await?;
+        let items = self
+            .ranked_items_from(qvec, tag, Some(query), true, max_items)
+            .await?;
         if items.is_empty() {
             return Ok(None);
         }
@@ -545,7 +682,8 @@ impl Engine {
         max_items: usize,
     ) -> Result<Vec<RankedItem>> {
         let (qvec, tag) = self.embedder.embed(query).await.map_err(crate::error::Error::Embed)?;
-        self.ranked_items_from(qvec, tag, persist_cut, max_items).await
+        self.ranked_items_from(qvec, tag, Some(query), persist_cut, max_items)
+            .await
     }
 
     /// [`Self::ranked_items_persist`] from an already-embedded query.
@@ -555,16 +693,15 @@ impl Engine {
         &self,
         qvec: Vec<f32>,
         tag: String,
+        query: Option<&str>,
         persist_cut: bool,
         max_items: usize,
     ) -> Result<Vec<RankedItem>> {
-        // Pass 1: seed propositions from a vector search over chunks.
+        // Pass 1: hybrid proposition seeding from three channels:
+        // (1) dense vector search over chunks, (2) dense vector search directly
+        // over extracted claim vectors (avoiding long-chunk dilution), and
+        // (3) FTS5 BM25 over proposition claims (exact proper nouns/symbols).
 
-        // Corpus mean for the centered-cosine relevance gate (see
-        // `recall_min_cosine`). Skipped in the lexical-hash fallback space,
-        // where cosine is keyword overlap and mean-centering is meaningless;
-        // soft-fail to `None` (no gate) on any error or a dim mismatch, so
-        // recall never hard fails on the hot path (core principle 9).
         let mean = if tag == crate::config::HASH_EMBED_MODEL {
             None
         } else {
@@ -578,51 +715,102 @@ impl Engine {
         // Cold (no EWMA yet) or hash space → just the hard floor.
         let floor = self.operational_floor(&tag, mean_ref.is_some()).await;
 
-        let mut seeds = self
+        let mut chunk_seeds = self
             .seed_from_chunks(&qvec, &tag, self.config.retrieval_seed_chunks, mean_ref, floor)
             .await?;
-        if seeds.activations.len() < self.config.retrieval_min_seeds && seeds.could_widen {
-            // Widen Pass 1 over the whole active pool once (plan §10.1) — the
-            // brute-force index already pays a full scan per search. Only when
-            // the first pass was cut short by `k` rather than by the floor:
-            // an off-topic query (the common case) used to rescore every
-            // chunk and fetch every vector to reach the same empty result.
+        if chunk_seeds.activations.len() < self.config.retrieval_min_seeds && chunk_seeds.could_widen {
             let wider = (self.db.count_active_chunks().await?).max(1) as usize;
             if wider > self.config.retrieval_seed_chunks {
-                seeds = self.seed_from_chunks(&qvec, &tag, wider, mean_ref, floor).await?;
+                chunk_seeds = self
+                    .seed_from_chunks(&qvec, &tag, wider, mean_ref, floor)
+                    .await?;
             }
         }
-        if seeds.activations.is_empty() {
-            return Ok(Vec::new());
-        }
 
-        // Self-tuning: fold this turn's effective cut into the running estimate
-        // (injection path only). Best-effort — a settings-write failure must
-        // never fail recall (core principle 9).
-        // Logged only: the snapshot the floor reads moves in the heavy
-        // maintenance pass (`cut_log`), so two recalls of the same query see
-        // the same floor.
+        // The claim channel is centered on the claim pool's own mean and
+        // gated by its own self-tuning floor (claims are short and score on a
+        // different scale from chunks).
+        let claim_tag = claim_space(&tag);
+        let claim_mean = if tag == crate::config::HASH_EMBED_MODEL {
+            None
+        } else {
+            self.claim_mean(&tag).await.unwrap_or(None)
+        };
+        let claim_mean = claim_mean.filter(|m| m.len() == qvec.len());
+        let claim_floor = self
+            .operational_floor(&claim_tag, claim_mean.is_some())
+            .await;
+        let claim_seeds = self
+            .seed_from_claims(
+                &qvec,
+                &tag,
+                self.config.retrieval_seed_chunks,
+                claim_mean.as_deref(),
+                claim_floor,
+            )
+            .await?;
+
+        let (fts_hits, fts_rescues) = match query {
+            Some(q) if !q.trim().is_empty() => (
+                self.db.search_propositions_fts(q, 20).await.unwrap_or_default(),
+                self.db
+                    .rare_term_propositions(q, FTS_RARE_TERM_MAX_DF, MAX_FTS_ONLY_SEEDS)
+                    .await
+                    .unwrap_or_default(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+
+        let chunk_found = !chunk_seeds.activations.is_empty();
+        let claim_found = !claim_seeds.activations.is_empty();
+        let seeds = fuse_seed_channels(
+            chunk_seeds,
+            claim_seeds,
+            &fts_hits,
+            &fts_rescues,
+            floor,
+            mean_ref.is_some(),
+        );
+
+        // Each channel logs its own cut; a channel whose elevated floor
+        // rejected everything logs the base floor instead, so empty turns
+        // gently relax an over-tight floor back down.
         if persist_cut {
-            if let Some(cut) = seeds.effective_cut {
-                if let Err(e) = cut_log::log(&self.db, &tag, cut).await {
-                    tracing::debug!("recall: could not log the recall cut for {tag}: {e}");
+            let hard = self.config.recall_min_cosine;
+            let logs = [
+                (&tag, mean_ref.is_some(), chunk_found, floor, seeds.chunk_cut),
+                (&claim_tag, claim_mean.is_some(), claim_found, claim_floor, seeds.claim_cut),
+            ];
+            for (space, centered, found, space_floor, cut) in logs {
+                if !centered {
+                    continue;
+                }
+                let value = if found {
+                    cut
+                } else if space_floor > hard {
+                    Some(hard)
+                } else {
+                    None
+                };
+                if let Some(v) = value {
+                    if let Err(e) = cut_log::log(&self.db, space, v).await {
+                        tracing::debug!("recall: could not log the recall cut for {space}: {e}");
+                    }
                 }
             }
         }
 
+        if seeds.activations.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let relevance = seeds.relevance;
+        let rrf_scores = seeds.rrf;
         let seeded: std::collections::HashSet<String> = seeds.activations.keys().cloned().collect();
 
         // Pass 2: bounded spreading activation over proposition edges.
         let activations = self.spread_activation(seeds.activations).await?;
 
-        // Rank in two steps. First the cheap part for every activated
-        // proposition (one batched read, then Priority and relevance), and
-        // sort on exactly the keys the result is ordered by. Then hydrate
-        // (supersession, disputes, analogy, support) in that order, only
-        // until `max_items` survive: everything after is cut by the caller
-        // anyway. Hydrating every activated item first cost five to eight
-        // queries each before nearly all were thrown away.
         let ids: Vec<String> = activations.keys().cloned().collect();
         let props: HashMap<String, crate::store::propositions::Proposition> = self
             .db
@@ -631,7 +819,7 @@ impl Engine {
             .into_iter()
             .map(|p| (p.node_id.clone(), p))
             .collect();
-        let mut candidates: Vec<(crate::store::propositions::Proposition, f64, Option<f64>)> =
+        let mut candidates: Vec<(crate::store::propositions::Proposition, f64, Option<f64>, f64)> =
             Vec::new();
         for (node_id, activation) in activations {
             let Some(prop) = props.get(&node_id) else {
@@ -640,26 +828,30 @@ impl Engine {
             if prop.status != "active" {
                 continue;
             }
+            let conf_factor = 0.75 + 0.25 * prop.confidence.clamp(0.0, 1.0);
             let boost = core::metaboost(&prop.urgency, &prop.importance, &self.config);
-            let priority = core::priority(activation, boost, self.config.metaboost_cap);
-            candidates.push((prop.clone(), priority, relevance.get(&node_id).copied()));
+            let priority = core::priority(activation, boost, self.config.metaboost_cap) * conf_factor;
+            let rrf = rrf_scores.get(&node_id).copied().unwrap_or(0.0);
+            candidates.push((prop.clone(), priority, relevance.get(&node_id).copied(), rrf));
         }
-        // Primary: centered relevance (a directly-seeded on-topic item leads;
-        // spread-only / hash-space items — `relevance = None` — fall to the
-        // back, ordered among themselves by Priority then id). This is what
-        // makes MetaBoost a tiebreak rather than a lever that lifts off-topic
-        // items (fix: relevance-primary ranking).
-        candidates.sort_by(|(pa, prio_a, rel_a), (pb, prio_b, rel_b)| {
-            rel_key(*rel_b)
-                .partial_cmp(&rel_key(*rel_a))
+        // Primary: relevance + RRF fusion modulated mildly by claim confidence
+        // (for directly-seeded centered items). Uncentered / spread-only items
+        // (`relevance = None`) fall after directly-scored items and sort by
+        // confidence-weighted Priority, then RRF, then id.
+        candidates.sort_by(|(pa, prio_a, rel_a, rrf_a), (pb, prio_b, rel_b, rrf_b)| {
+            let key_a = composite_relevance_key(*rel_a, *rrf_a, pa.confidence);
+            let key_b = composite_relevance_key(*rel_b, *rrf_b, pb.confidence);
+            key_b
+                .partial_cmp(&key_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| prio_b.partial_cmp(prio_a).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| rrf_b.partial_cmp(rrf_a).unwrap_or(std::cmp::Ordering::Equal))
                 .then_with(|| pa.node_id.cmp(&pb.node_id))
         });
 
         let mut items: Vec<RankedItem> = Vec::new();
         let mut analogies = 0usize;
-        for (prop, priority, rel) in candidates {
+        for (prop, priority, rel, _rrf) in candidates {
             let node_id = prop.node_id.clone();
             // Past the cut, only analogies are still wanted (the block sets
             // room aside for up to `ANALOGY_SLOTS` of them, wherever they
@@ -730,17 +922,24 @@ impl Engine {
         Ok(items)
     }
 
+    /// Maximum amount the self-tuning EWMA may raise the operational floor
+    /// above the configured `recall_min_cosine`, preventing a one-way ratchet
+    /// from locking out normal queries.
+    const MAX_EWMA_FLOOR_LIFT: f64 = 0.10;
+
     /// The per-turn operational floor: the hard `recall_min_cosine` raised
-    /// toward the running EWMA cut (minus slack) when one exists for this
-    /// space. Returns the hard floor unchanged in the hash space or before any
-    /// EWMA has been recorded. Soft-fails to the hard floor on any read error.
+    /// toward the running EWMA cut (minus slack, capped at `hard + MAX_EWMA_FLOOR_LIFT`)
+    /// when one exists for this space. Returns the hard floor unchanged in the
+    /// hash space or before any EWMA has been recorded. Soft-fails to the hard
+    /// floor on any read error.
     async fn operational_floor(&self, tag: &str, centered: bool) -> f64 {
         let hard = self.config.recall_min_cosine;
         if !centered {
             return hard;
         }
+        let max_floor = hard + Self::MAX_EWMA_FLOOR_LIFT;
         match cut_log::snapshot(&self.db, tag).await {
-            Some(ewma) => hard.max(ewma - self.config.recall_ewma_slack),
+            Some(ewma) => hard.max(ewma - self.config.recall_ewma_slack).min(max_floor),
             None => hard,
         }
     }
@@ -774,11 +973,15 @@ impl Engine {
         mean: Option<&[f32]>,
         floor: f64,
     ) -> Result<SeedResult> {
+        // When mean-centering is active, over-fetch raw-cosine candidates so
+        // anisotropic common-direction crowding doesn't push relevant hits out
+        // of the raw top-k before centering runs.
+        let fetch_k = if mean.is_some() { k.max(64) } else { k };
         // Each hit comes back with its vector, so the centered re-score below
         // does not read the same vectors a second time.
         let hits_with_vectors = self
             .vectors
-            .search_with_vectors(qvec, tag, k)
+            .search_with_vectors(qvec, tag, fetch_k)
             .await
             .map_err(crate::error::Error::Internal)?;
         let mut hit_vectors: HashMap<String, Vec<f32>> = HashMap::new();
@@ -826,12 +1029,22 @@ impl Engine {
             .iter()
             .filter_map(|(_, _, cc)| *cc)
             .fold(f64::INFINITY, f64::min);
-        let could_widen = scored.len() >= k && (!centered_present || weakest_centered >= floor);
-        let (kept, effective_cut) = if centered_present {
+        let could_widen = scored.len() >= fetch_k && (!centered_present || weakest_centered >= floor);
+        let (mut kept, effective_cut) = if centered_present {
             adaptive_cut(scored, floor, self.config.recall_gap_min)
         } else {
             (scored, None)
         };
+        if centered_present {
+            kept.sort_by(|a, b| {
+                let sa = a.2.unwrap_or(a.1);
+                let sb = b.2.unwrap_or(b.1);
+                sb.partial_cmp(&sa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            kept.truncate(k.max(self.config.retrieval_seed_chunks));
+        }
 
         // node_id -> (raw cosines, centered cosines) of its retrieved chunks.
         let mut raw_by_node: HashMap<String, Vec<f64>> = HashMap::new();
@@ -856,25 +1069,169 @@ impl Engine {
         Ok(SeedResult { activations, relevance, effective_cut, could_widen })
     }
 
-    /// The centered-cosine relevance gate's corpus mean (`recall_min_cosine`),
-    /// cached in `app_settings` per embedding space. Returns `None` when the
-    /// space has no active vectors yet. The cache is refreshed by the
-    /// maintenance heavy pass; recall only reads (computing+storing once if the
-    /// cache is cold) so the hot path never scans the whole pool.
-    pub(crate) async fn corpus_mean(&self, tag: &str) -> Result<Option<Vec<f32>>> {
-        let key = format!("corpus_mean::{tag}");
-        if let Some(s) = self.db.get_setting(&key).await? {
-            if let Ok(v) = serde_json::from_str::<Vec<f32>>(&s) {
-                if !v.is_empty() {
-                    return Ok(Some(v));
+    /// Pass-1 claim-level seed channel over `claim_vectors`: matches the query
+    /// directly against short extracted claims, so a concise fact is not
+    /// diluted by the long chunk it came from.
+    ///
+    /// The nearest claims by raw cosine come from SQL (sqlite-vec scores them
+    /// there, so no vector crosses into Rust but the over-fetched few), then
+    /// are re-scored centered on the claim pool's cached mean and cut at the
+    /// claim channel's own floor, exactly like the chunk channel.
+    async fn seed_from_claims(
+        &self,
+        qvec: &[f32],
+        tag: &str,
+        k: usize,
+        mean: Option<&[f32]>,
+        floor: f64,
+    ) -> Result<SeedResult> {
+        let is_hash = tag == crate::config::HASH_EMBED_MODEL;
+        // A semantic space with no mean yet (fewer than two claims) has no
+        // meaningful relevance scale: leave it to the chunk channel.
+        if !is_hash && mean.is_none() {
+            return Ok(SeedResult::default());
+        }
+        let fetch_k = if mean.is_some() { k.max(64) } else { k };
+        let hits = self.db.nearest_claims(qvec, tag, fetch_k).await?;
+        let qc = mean.map(|mu| sub(qvec, mu));
+        let mut scored: Vec<ScoredHit> = Vec::with_capacity(hits.len());
+        for (node_id, raw, v) in hits {
+            if is_hash && raw <= 0.0 {
+                continue;
+            }
+            let cc = match (&qc, mean) {
+                (Some(q_centered), Some(mu)) if v.len() == mu.len() => {
+                    Some(cosine(q_centered, &sub(&v, mu)))
+                }
+                _ => None,
+            };
+            scored.push((node_id, raw, cc));
+        }
+        if scored.is_empty() {
+            return Ok(SeedResult::default());
+        }
+
+        let centered_present = mean.is_some();
+        let (mut kept, effective_cut) = if centered_present {
+            adaptive_cut(scored, floor, self.config.recall_gap_min)
+        } else {
+            (scored, None)
+        };
+        kept.sort_by(|a, b| {
+            let sa = a.2.unwrap_or(a.1);
+            let sb = b.2.unwrap_or(b.1);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        kept.truncate(k.max(1));
+
+        let mut activations = HashMap::new();
+        let mut relevance = HashMap::new();
+        for (node_id, raw, cc) in kept {
+            activations.insert(node_id.clone(), raw.clamp(0.0, 1.0));
+            if let Some(c) = cc {
+                relevance.insert(node_id, c);
+            }
+        }
+        Ok(SeedResult {
+            activations,
+            relevance,
+            effective_cut,
+            could_widen: false,
+        })
+    }
+
+    /// The claim pool's mean in `tag`'s space, cached in `app_settings` and
+    /// refreshed on the same rules as [`Self::corpus_mean`]. `None` under two
+    /// claims.
+    pub(crate) async fn claim_mean(&self, tag: &str) -> Result<Option<Vec<f32>>> {
+        let count = self.db.count_active_claim_vectors(tag).await?;
+        if count < Self::MIN_CORPUS_MEAN_CHUNKS {
+            return Ok(None);
+        }
+        let space = claim_space(tag);
+        let key = format!("corpus_mean::{space}");
+        let count_key = format!("corpus_mean_count::{space}");
+        let cached_count = self
+            .db
+            .get_setting(&count_key)
+            .await?
+            .and_then(|s| s.parse::<usize>().ok());
+        if cached_count.is_some_and(|c| mean_cache_fresh(c, count)) {
+            if let Some(s) = self.db.get_setting(&key).await? {
+                if let Ok(v) = serde_json::from_str::<Vec<f32>>(&s) {
+                    if !v.is_empty() {
+                        return Ok(Some(v));
+                    }
                 }
             }
         }
-        let Some(mean) = self.db.corpus_mean_vector(tag).await? else {
+        self.refresh_claim_mean(tag).await
+    }
+
+    /// Recompute and cache the claim pool's mean (maintenance, or a stale
+    /// cache on the hot path). Clears the cache under two claims.
+    pub(crate) async fn refresh_claim_mean(&self, tag: &str) -> Result<Option<Vec<f32>>> {
+        let space = claim_space(tag);
+        let key = format!("corpus_mean::{space}");
+        let count_key = format!("corpus_mean_count::{space}");
+        match self.db.claim_mean_vector_with_count(tag).await? {
+            Some((mean, n)) if n >= Self::MIN_CORPUS_MEAN_CHUNKS => {
+                if let Ok(s) = serde_json::to_string(&mean) {
+                    self.db.set_setting(&key, &s).await?;
+                    self.db.set_setting(&count_key, &n.to_string()).await?;
+                }
+                Ok(Some(mean))
+            }
+            _ => {
+                let _ = self.db.delete_setting(&key).await;
+                let _ = self.db.delete_setting(&count_key).await;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Minimum number of active vectors needed before mean-centering is
+    /// meaningful (with 1 vector, `v - μ = 0` and centered cosine is always 0).
+    const MIN_CORPUS_MEAN_CHUNKS: usize = 2;
+
+    /// The centered-cosine relevance gate's corpus mean (`recall_min_cosine`),
+    /// cached in `app_settings` per embedding space. Returns `None` when the
+    /// space has fewer than 2 active vectors (preventing 1-vector self-cancelling
+    /// degeneracy). Automatically refreshes when a small pool (`< 50` chunks)
+    /// changes size or a larger pool drifts by `>= 25%`.
+    pub(crate) async fn corpus_mean(&self, tag: &str) -> Result<Option<Vec<f32>>> {
+        let count = self.db.count_active_chunks_for_model(tag).await?;
+        if count < Self::MIN_CORPUS_MEAN_CHUNKS {
+            return Ok(None);
+        }
+        let key = format!("corpus_mean::{tag}");
+        let count_key = format!("corpus_mean_count::{tag}");
+        let cached_count = self
+            .db
+            .get_setting(&count_key)
+            .await?
+            .and_then(|s| s.parse::<usize>().ok());
+        let cache_fresh = cached_count.is_some_and(|c| mean_cache_fresh(c, count));
+        if cache_fresh {
+            if let Some(s) = self.db.get_setting(&key).await? {
+                if let Ok(v) = serde_json::from_str::<Vec<f32>>(&s) {
+                    if !v.is_empty() {
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+        let Some((mean, n)) = self.db.corpus_mean_vector_with_count(tag).await? else {
             return Ok(None);
         };
+        if n < Self::MIN_CORPUS_MEAN_CHUNKS {
+            return Ok(None);
+        }
         if let Ok(s) = serde_json::to_string(&mean) {
             self.db.set_setting(&key, &s).await?;
+            self.db.set_setting(&count_key, &n.to_string()).await?;
         }
         Ok(Some(mean))
     }
@@ -884,9 +1241,17 @@ impl Engine {
     /// instead of freezing at the first query's snapshot.
     pub(crate) async fn refresh_corpus_mean(&self, tag: &str) -> Result<()> {
         let key = format!("corpus_mean::{tag}");
-        if let Some(mean) = self.db.corpus_mean_vector(tag).await? {
-            if let Ok(s) = serde_json::to_string(&mean) {
-                self.db.set_setting(&key, &s).await?;
+        let count_key = format!("corpus_mean_count::{tag}");
+        match self.db.corpus_mean_vector_with_count(tag).await? {
+            Some((mean, n)) if n >= Self::MIN_CORPUS_MEAN_CHUNKS => {
+                if let Ok(s) = serde_json::to_string(&mean) {
+                    self.db.set_setting(&key, &s).await?;
+                    self.db.set_setting(&count_key, &n.to_string()).await?;
+                }
+            }
+            _ => {
+                let _ = self.db.delete_setting(&key).await;
+                let _ = self.db.delete_setting(&count_key).await;
             }
         }
         Ok(())
@@ -1072,6 +1437,44 @@ const ANALOGY_SLOTS: usize = 2;
 /// of `injection_token_cap` tokens never holds more than `cap / this` items.
 const INDEX_ITEM_MIN_TOKENS: usize = 10;
 
+/// Whether a mean cached over `cached` vectors still describes a pool of
+/// `count`: exactly, under 50 (a small pool moves with every item); within
+/// 25% drift above that.
+fn mean_cache_fresh(cached: usize, count: usize) -> bool {
+    if cached < 2 {
+        return false;
+    }
+    if count < 50 {
+        cached == count
+    } else {
+        count.abs_diff(cached) * 4 < cached
+    }
+}
+
+/// Queries up to this many words are treated as follow-ups that always lean on
+/// the previous user message; longer queries only blend when topic-continuous.
+const SHORT_FOLLOWUP_MAX_WORDS: usize = 8;
+
+/// Whether `previous` should be blended into the recall query vector.
+/// Short follow-ups ("what about the second one?") always blend; longer queries
+/// only blend when they remain topically close to the previous message.
+fn should_blend_previous(
+    query: &str,
+    qvec: &[f32],
+    pvec: &[f32],
+    mean: Option<&[f32]>,
+) -> bool {
+    if query.split_whitespace().count() <= SHORT_FOLLOWUP_MAX_WORDS {
+        return true;
+    }
+    match mean {
+        Some(mu) if mu.len() == qvec.len() && mu.len() == pvec.len() => {
+            cosine(&sub(qvec, mu), &sub(pvec, mu)) >= 0.15
+        }
+        _ => cosine(qvec, pvec) >= 0.65,
+    }
+}
+
 /// The follow-up query vector: the current message, leaning a quarter on
 /// the previous one, renormalised.
 fn blend_query(current: &[f32], previous: &[f32]) -> Vec<f32> {
@@ -1144,7 +1547,205 @@ mod tests {
     }
 
     #[test]
-    fn rel_key_sorts_scored_above_unscored() {
-        assert!(rel_key(Some(-0.9)) > rel_key(None), "any real score beats a spread-only item");
+    fn composite_relevance_key_sorts_scored_above_unscored() {
+        assert!(
+            composite_relevance_key(Some(-0.9), 0.0, 0.5)
+                > composite_relevance_key(None, 1.0, 1.0),
+            "any real score beats a spread-only item"
+        );
+    }
+
+    #[test]
+    fn previous_blend_gates_on_length_or_topic_continuity() {
+        let q = [1.0f32, 0.0, 0.0];
+        let p_other = [0.0f32, 1.0, 0.0];
+        let p_same = [0.9f32, 0.43, 0.0];
+        // Short follow-up always blends even if orthogonal.
+        assert!(should_blend_previous("what about the second one?", &q, &p_other, None));
+        // Long query with topic switch does not blend.
+        assert!(!should_blend_previous(
+            "Now let us switch topics completely to baking sourdough bread at home",
+            &q,
+            &p_other,
+            None
+        ));
+        // Long query on the same topic blends.
+        assert!(should_blend_previous(
+            "Can you tell me more details about that same database replication setup",
+            &q,
+            &p_same,
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn corpus_mean_skips_single_chunk_and_refreshes_when_small_pool_grows() {
+        use std::sync::Arc;
+        use crate::store::chunks::Chunk;
+        use crate::store::vectors::SqliteVectorIndex;
+        use crate::store::Db;
+        use crate::traits::MockChat;
+
+        let cfg = crate::config::Config::default();
+        let db = Db::open_in_memory().await.unwrap();
+        db.init_vectors(3).await.unwrap();
+        let vectors = Arc::new(SqliteVectorIndex::new(db.pool().clone()));
+        let engine = Engine::new(
+            cfg,
+            db,
+            Arc::new(MockChat { response: serde_json::json!({}) }),
+            Arc::new(crate::embed::HashEmbedder::new(3)),
+            vectors,
+        );
+
+        use crate::store::documents::Document;
+
+        engine
+            .db
+            .insert_document(&Document {
+                document_hash: "doc1".into(),
+                source_entity: "src".into(),
+                source_type: "Scraped".into(),
+                source_name: "src".into(),
+                captured_at: "2026-08-01T10:00:00Z".into(),
+                intent_factor: 1.0,
+                chunk_count: 3,
+                created_at: "2026-08-01T10:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+
+        let make_chunk = |id: &str| Chunk {
+            chunk_id: id.into(),
+            content: id.into(),
+            content_hash: id.into(),
+            document_hash: "doc1".into(),
+            source_entity: "src".into(),
+            source_reliability: 0.8,
+            provenance_cluster_id: "cl".into(),
+            cluster_citation: "src".into(),
+            status: "active".into(),
+            extraction_status: "done".into(),
+            extraction_error_at: None,
+            embedding_model: "m1".into(),
+            decay_class: "static".into(),
+            anchor_at: "2026-08-01T10:00:00Z".into(),
+            urgency_expires_at: None,
+            reinforcement_count: 0,
+            grounding_count: 0,
+            archived_at: None,
+            created_at: "2026-08-01T10:00:00Z".into(),
+        };
+
+        engine.db.insert_chunk(&make_chunk("c1")).await.unwrap();
+        engine.vectors.upsert("c1", &[1.0, 0.0, 0.0], "m1").await.unwrap();
+        assert!(
+            engine.corpus_mean("m1").await.unwrap().is_none(),
+            "single-chunk pool must not return a degenerate self-cancelling mean"
+        );
+
+        engine.db.insert_chunk(&make_chunk("c2")).await.unwrap();
+        engine.vectors.upsert("c2", &[0.0, 1.0, 0.0], "m1").await.unwrap();
+        let m2 = engine.corpus_mean("m1").await.unwrap().expect("2-chunk pool computes mean");
+        assert!((m2[0] - 0.5).abs() < 1e-5 && (m2[1] - 0.5).abs() < 1e-5);
+
+        engine.db.insert_chunk(&make_chunk("c3")).await.unwrap();
+        engine.vectors.upsert("c3", &[0.0, 0.0, 1.0], "m1").await.unwrap();
+        let m3 = engine.corpus_mean("m1").await.unwrap().expect("small pool refreshes mean");
+        assert!((m3[2] - (1.0 / 3.0)).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn operational_floor_caps_ewma_lift() {
+        use std::sync::Arc;
+        use crate::store::vectors::SqliteVectorIndex;
+        use crate::store::Db;
+        use crate::traits::MockChat;
+
+        let cfg = crate::config::Config::default();
+        let hard = cfg.recall_min_cosine;
+        let db = Db::open_in_memory().await.unwrap();
+        db.init_vectors(cfg.embedding_dim).await.unwrap();
+        let vectors = Arc::new(SqliteVectorIndex::new(db.pool().clone()));
+        let engine = Engine::new(
+            cfg,
+            db,
+            Arc::new(MockChat { response: serde_json::json!({}) }),
+            Arc::new(crate::embed::HashEmbedder::new(8)),
+            vectors,
+        );
+        cut_log::log(&engine.db, "m1", 0.90).await.unwrap();
+        cut_log::fold_pending(&engine.db, 1.0).await.unwrap();
+        let floor = engine.operational_floor("m1", true).await;
+        assert!(
+            (floor - (hard + Engine::MAX_EWMA_FLOOR_LIFT)).abs() < 1e-12,
+            "EWMA lift must be capped at +0.10 above hard floor, got {floor}"
+        );
+    }
+
+    #[test]
+    fn rrf_fusion_reranks_admitted_items_and_rewards_multi_channel_overlap() {
+        let mut chunk_seeds = SeedResult::default();
+        chunk_seeds.activations.insert("p_chunk_only".into(), 0.7);
+        chunk_seeds.activations.insert("p_multi".into(), 0.65);
+        chunk_seeds.relevance.insert("p_chunk_only".into(), 0.40);
+        chunk_seeds.relevance.insert("p_multi".into(), 0.35);
+
+        let mut claim_seeds = SeedResult::default();
+        claim_seeds.activations.insert("p_multi".into(), 0.85);
+        claim_seeds.relevance.insert("p_multi".into(), 0.55);
+
+        let fts_hits = vec![
+            ("p_fts_only".into(), 3.2),
+            ("p_multi".into(), 2.1),
+        ];
+
+        let fused = fuse_seed_channels(chunk_seeds, claim_seeds, &fts_hits, &[], 0.0, true);
+        assert!(
+            !fused.activations.contains_key("p_fts_only"),
+            "a lexical hit the vector channels did not admit stays out"
+        );
+        assert!(
+            fused.rrf["p_multi"] > fused.rrf["p_chunk_only"],
+            "multi-channel overlap receives higher RRF score"
+        );
+        assert!(
+            composite_relevance_key(fused.relevance.get("p_multi").copied(), fused.rrf["p_multi"], 0.9)
+                > composite_relevance_key(fused.relevance.get("p_chunk_only").copied(), fused.rrf["p_chunk_only"], 0.9)
+        );
+        assert!(
+            composite_relevance_key(Some(0.4), 0.5, 0.95)
+                > composite_relevance_key(Some(0.4), 0.5, 0.25),
+            "higher proposition confidence improves composite score at equal relevance"
+        );
+    }
+
+    #[test]
+    fn rare_term_rescue_enters_at_the_floor_below_scored_items() {
+        let mut chunk_seeds = SeedResult::default();
+        chunk_seeds.activations.insert("semantic".into(), 0.7);
+        chunk_seeds.relevance.insert("semantic".into(), 0.30);
+        let fused = fuse_seed_channels(
+            chunk_seeds,
+            SeedResult::default(),
+            &[("rare".into(), 4.0)],
+            &["rare".to_string()],
+            0.12,
+            true,
+        );
+        assert_eq!(fused.relevance["rare"], 0.12, "admitted exactly at the floor");
+        assert!(
+            composite_relevance_key(Some(fused.relevance["semantic"]), fused.rrf["semantic"], 0.5)
+                > composite_relevance_key(Some(fused.relevance["rare"]), fused.rrf["rare"], 0.5)
+        );
+    }
+
+    #[test]
+    fn mean_cache_freshness_rules() {
+        assert!(!mean_cache_fresh(1, 1));
+        assert!(mean_cache_fresh(10, 10));
+        assert!(!mean_cache_fresh(10, 11));
+        assert!(mean_cache_fresh(100, 120));
+        assert!(!mean_cache_fresh(100, 130));
     }
 }

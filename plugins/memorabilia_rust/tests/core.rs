@@ -433,3 +433,15 @@ fn each_promotion_gate_blocks_individually() {
     assert!(gates(5, false, 0.7, 1, true));
     assert!(gates(5, false, 0.7, 3, false));
 }
+
+#[test]
+fn corroborated_personal_and_community_promote_at_three_sources() {
+    let cfg = Config::default();
+    // Personal (0.35) and community (0.55) stay blocked with 2 sources,
+    // but promote once 3 distinct sources corroborate the claim.
+    assert!(!can_promote(5, false, 0.35, 2, false, &cfg));
+    assert!(!can_promote(5, false, 0.55, 2, false, &cfg));
+    assert!(can_promote(5, false, 0.35, 3, false, &cfg));
+    assert!(can_promote(5, false, 0.55, 3, false, &cfg));
+    assert!(!can_promote(5, false, 0.34, 3, false, &cfg));
+}

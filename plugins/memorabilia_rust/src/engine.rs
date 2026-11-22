@@ -104,7 +104,11 @@ impl Engine {
         embedder: Arc<dyn Embedder>,
     ) -> Result<Arc<Self>> {
         let db = Db::open(path).await?;
-        db.init_vectors(config.embedding_dim).await?;
+        if db.init_vectors(config.embedding_dim).await? {
+            // The heavy pass re-embeds what the rebuild emptied; run it on
+            // the first tick rather than up to a day later.
+            let _ = db.delete_setting("last_maintenance_at").await;
+        }
         let vectors = Arc::new(SqliteVectorIndex::for_db(&db));
         let engine = Arc::new(Self::new(config, db, chat, embedder, vectors));
         // One-time cleanup of pre-document-harvest dialogue evidence; a no-op

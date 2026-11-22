@@ -56,6 +56,15 @@ pub trait PassControl: Send + Sync {
     fn keep_going(&self) -> bool;
     /// The current time, ISO-8601 UTC with a literal `Z`.
     fn now(&self) -> String;
+    /// Optional cap on how many chunks may be extracted in this pass (used by
+    /// short daytime idle micro-bursts). `None` drains the full queue.
+    fn max_extractions(&self) -> Option<usize> {
+        None
+    }
+    /// When `true`, skip the expensive analogy-abstraction pass at the end.
+    fn skip_analogies(&self) -> bool {
+        false
+    }
 }
 
 /// A pass control that never stops, at a fixed time (tests, "process now"
@@ -118,18 +127,46 @@ pub(crate) fn cosine_pub(a: &[f32], b: &[f32]) -> f32 {
     cosine(a, b)
 }
 
-fn find(parent: &mut [usize], i: usize) -> usize {
-    let mut r = i;
-    while parent[r] != r {
-        r = parent[r];
+/// Deterministic complete-linkage clustering: a candidate joins an existing
+/// cluster only if it shares `embedding_model` and meets `threshold` cosine
+/// similarity with **every** member already in that cluster (preventing
+/// single-linkage A–B–C chaining of unrelated topics). Returns clusters sorted
+/// deterministically by each cluster's first `candidate_id`.
+fn cluster_complete_linkage(live: &[Live], threshold: f32) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..live.len()).collect();
+    order.sort_by(|&a, &b| live[a].c.candidate_id.cmp(&live[b].c.candidate_id));
+
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    for idx in order {
+        let model = &live[idx].c.embedding_model;
+        let vec = &live[idx].v;
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, members) in clusters.iter().enumerate() {
+            if live[members[0]].c.embedding_model != *model {
+                continue;
+            }
+            let mut min_sim = f32::INFINITY;
+            let mut fits_all = true;
+            for &m in members {
+                let sim = cosine(vec, &live[m].v);
+                if sim < threshold {
+                    fits_all = false;
+                    break;
+                }
+                if sim < min_sim {
+                    min_sim = sim;
+                }
+            }
+            if fits_all && best.is_none_or(|(_, b_sim)| min_sim > b_sim) {
+                best = Some((ci, min_sim));
+            }
+        }
+        match best {
+            Some((ci, _)) => clusters[ci].push(idx),
+            None => clusters.push(vec![idx]),
+        }
     }
-    let mut i = i;
-    while parent[i] != r {
-        let next = parent[i];
-        parent[i] = r;
-        i = next;
-    }
-    r
+    clusters
 }
 
 fn days_before(now: chrono::NaiveDateTime, days: i64) -> String {
@@ -268,11 +305,16 @@ impl Engine {
         let now = ctl.now();
         self.maintenance_tick(&now).await;
         self.restore_unextracted_batch(&now).await;
+        let max_ext = ctl.max_extractions();
         loop {
             if !ctl.keep_going() {
                 return r;
             }
-            let d = self.drain_extraction(&ctl.now()).await;
+            let remaining = max_ext.map(|m| m.saturating_sub(r.extraction_attempted as usize));
+            if remaining == Some(0) {
+                break;
+            }
+            let d = self.drain_extraction_limited(&ctl.now(), remaining).await;
             r.extraction_attempted += d.attempted as u64;
             r.extraction_succeeded += d.succeeded as u64;
             r.extraction_failed += d.failed as u64;
@@ -287,8 +329,11 @@ impl Engine {
         if !ctl.keep_going() {
             return r;
         }
-        let a = self.build_analogies(&|| ctl.keep_going()).await;
-        r.analogy_edges += a.edges as u64;
+        let all_failed = r.extraction_failed > 0 && r.extraction_succeeded == 0;
+        if !ctl.skip_analogies() && !all_failed {
+            let a = self.build_analogies(&|| ctl.keep_going()).await;
+            r.analogy_edges += a.edges as u64;
+        }
         r.finished = true;
         r
     }
@@ -378,27 +423,7 @@ impl Engine {
             })
             .collect();
         let n = live.len();
-        let mut parent: Vec<usize> = (0..n).collect();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if live[i].c.embedding_model == live[j].c.embedding_model
-                    && cosine(&live[i].v, &live[j].v) >= RECURRENCE_SIMILARITY
-                {
-                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                    if a != b {
-                        parent[a] = b;
-                    }
-                }
-            }
-        }
-        let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
-        for i in 0..n {
-            let root = find(&mut parent, i);
-            clusters.entry(root).or_default().push(i);
-        }
-        // Deterministic order: by each cluster's first candidate id.
-        let mut clusters: Vec<Vec<usize>> = clusters.into_values().collect();
-        clusters.sort_by(|a, b| live[a[0]].c.candidate_id.cmp(&live[b[0]].c.candidate_id));
+        let clusters = cluster_complete_linkage(&live, RECURRENCE_SIMILARITY);
 
         // Cluster-size telemetry: the recurrence threshold is raw cosine, and
         // single-linkage can chain unrelated topics into one cluster in a
@@ -884,5 +909,40 @@ mod tests {
         assert!(!r.finished);
         assert_eq!(r.captures_chunked, 0);
         assert_eq!(e.db.list_captures("screened", 10).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn complete_linkage_prevents_bridge_chaining() {
+        let mk = |id: &str, v: Vec<f32>| Live {
+            c: Candidate {
+                candidate_id: id.into(),
+                capture_id: "cap".into(),
+                session_id: Some("s1".into()),
+                turn_id: Some(1),
+                content: id.into(),
+                content_hash: id.into(),
+                embedding_model: "m".into(),
+                embedding: vec![],
+                pinned: false,
+                status: "waiting".into(),
+                created_at: T0.into(),
+                decided_at: None,
+            },
+            v,
+        };
+        // Three unit vectors 30 degrees apart: neighbours are cos(30) = 0.866
+        // >= RECURRENCE_SIMILARITY (0.80), the ends cos(60) = 0.5 below it.
+        // Single-linkage would chain c1-c2-c3; complete-linkage keeps c3 out.
+        let deg30 = std::f32::consts::FRAC_PI_6;
+        let live = vec![
+            mk("c1", vec![1.0, 0.0]),
+            mk("c2", vec![deg30.cos(), deg30.sin()]),
+            mk("c3", vec![(2.0 * deg30).cos(), (2.0 * deg30).sin()]),
+        ];
+        assert!(cosine(&live[0].v, &live[1].v) >= RECURRENCE_SIMILARITY);
+        assert!(cosine(&live[1].v, &live[2].v) >= RECURRENCE_SIMILARITY);
+        assert!(cosine(&live[0].v, &live[2].v) < RECURRENCE_SIMILARITY);
+        let clusters = cluster_complete_linkage(&live, RECURRENCE_SIMILARITY);
+        assert_eq!(clusters.len(), 2, "c1+c2 cluster cleanly; c3 cannot bridge-chain into c1");
     }
 }

@@ -144,15 +144,18 @@ impl Engine {
             .collect();
         let mut claim_vecs: HashMap<String, Vec<f32>> = HashMap::new();
         let mut sources: HashMap<String, HashSet<String>> = HashMap::new();
-        for id in abstracts.keys() {
-            let srcs: HashSet<String> = self
-                .db
-                .list_active_supporting_chunks(id)
-                .await?
-                .into_iter()
-                .map(|c| c.source_entity)
-                .collect();
-            sources.insert(id.clone(), srcs);
+        let source_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT cp.node_id, c.source_entity \
+             FROM chunk_propositions cp \
+             JOIN chunks c ON c.chunk_id = cp.chunk_id \
+             WHERE c.status = 'active'",
+        )
+        .fetch_all(self.db.read_pool())
+        .await?;
+        for (node_id, source_entity) in source_rows {
+            if abstracts.contains_key(&node_id) {
+                sources.entry(node_id).or_default().insert(source_entity);
+            }
         }
         let models: HashSet<&String> = abstracts.values().map(|(_, m, _)| m).collect();
         for model in models {

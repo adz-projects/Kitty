@@ -300,7 +300,16 @@ impl Engine {
     /// timestamp (ISO-8601 second precision) — never the wall clock — so
     /// test state stays deterministic and the scheduler owns time.
     pub async fn drain_extraction(&self, now: &str) -> DrainOutcome {
+        self.drain_extraction_limited(now, None).await
+    }
+
+    /// Bounded variant of [`Self::drain_extraction`] capping the batch at
+    /// `max_chunks` when `Some` (used by short daytime idle micro-bursts).
+    pub async fn drain_extraction_limited(&self, now: &str, max_chunks: Option<usize>) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
+        if max_chunks == Some(0) {
+            return outcome;
+        }
         let now_naive = match core::parse_utc(now) {
             Some(dt) => dt,
             None => {
@@ -309,6 +318,10 @@ impl Engine {
             }
         };
         let cfg = &self.config;
+        let batch_limit = match max_chunks {
+            Some(m) => cfg.extraction.batch_size.min(m as u64),
+            None => cfg.extraction.batch_size,
+        };
 
         // Per-chunk backoff bound: a failed chunk re-enters the ready
         // queue `retry_backoff_s` after its failure (ISO strings compare
@@ -320,7 +333,7 @@ impl Engine {
 
         let batch = match self
             .db
-            .list_ready_pending_chunks(cfg.extraction.batch_size as i64, &ready_before)
+            .list_ready_pending_chunks(batch_limit as i64, &ready_before)
             .await
         {
             Ok(b) => b,
@@ -812,11 +825,21 @@ impl Engine {
     /// Cross-source chunks take priority — cross-source contradiction is
     /// the valuable signal — with same-source remainder filling the rest.
     async fn probe_neighbors(&self, chunk: &Chunk) -> Result<Vec<NeighborView>> {
-        let (vec, tag) = self
-            .embedder
-            .embed(&chunk.content)
-            .await
-            .map_err(Error::Embed)?;
+        let model_tag = self.embedder.model_tag().to_string();
+        let stored = self
+            .db
+            .fetch_vectors(std::slice::from_ref(&chunk.chunk_id))
+            .await?;
+        let (vec, tag) = match stored.get(&chunk.chunk_id) {
+            Some(v) if !v.is_empty() && chunk.embedding_model == model_tag => {
+                (v.clone(), model_tag)
+            }
+            _ => self
+                .embedder
+                .embed(&chunk.content)
+                .await
+                .map_err(Error::Embed)?,
+        };
         let over_fetch = (self.db.count_active_chunks().await?).max(1) as usize;
         let hits = self
             .vectors
