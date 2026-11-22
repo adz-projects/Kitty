@@ -52,16 +52,13 @@ pub fn effective_weight(
         b.confidence * 0.625
     };
 
-    let dm = crate::domains::domain_match(crate::domains::same_domain(
-        query_domain,
-        b.domain.as_deref(),
-    ));
+    let dm = crate::domains::domain_weight(query_domain, b.domain.as_deref());
 
     let days: i64 = b
         .last_confirmed_at
         .map(|t| (now - b.updated_at.max(t)).num_days())
         .unwrap_or_else(|| (now - b.updated_at).num_days());
-    let dec = layers::decay_factor(b.layer, days);
+    let dec = layers::decay_factor_for(b.layer, b.kind, days);
 
     // `contradict_count` deliberately does not enter the weight. Halving a
     // contradicted belief hid exactly the tension recall is meant to show;

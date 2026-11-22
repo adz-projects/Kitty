@@ -11,6 +11,7 @@ pub mod conversation;
 pub mod domains;
 pub mod links;
 pub mod observations;
+pub mod staged;
 pub mod suppressions;
 
 use std::path::Path;

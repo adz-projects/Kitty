@@ -319,6 +319,9 @@ impl Db {
         let all = self.list_beliefs(None).await?;
         let mut best: Option<(f64, crate::store::beliefs::Belief)> = None;
         for b in all {
+            if b.embedding.len() != query.len() {
+                continue;
+            }
             let cos = crate::vector::ops::cosine(&b.embedding, query);
             if cos >= 0.80
                 && best.as_ref().map(|(c, _)| cos > *c).unwrap_or(true) {

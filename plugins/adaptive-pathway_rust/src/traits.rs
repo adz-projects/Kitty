@@ -33,6 +33,12 @@ pub trait StructuredChat: Send + Sync {
 pub trait SessionChat: Send + Sync {
     type Chat: StructuredChat;
     async fn for_session(&self, session_id: &str) -> Self::Chat;
+    /// The chat for a pass about no one session (cross-session synthesis).
+    /// A host must route it to the app's own provider, never a cross-app
+    /// default; the default suits hosts with one provider for everything.
+    async fn for_background(&self) -> Self::Chat {
+        self.for_session("").await
+    }
 }
 
 #[async_trait]

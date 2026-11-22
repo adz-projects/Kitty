@@ -10,6 +10,35 @@ use crate::store::Db;
 /// Cosine for merging beliefs within the same layer during consolidation.
 const CONSOLIDATE_MERGE_COSINE: f64 = 0.86;
 
+/// Cosine at which a staged one-off from another chat counts as the same
+/// observation turning up again (looser than a merge: two chats rarely word
+/// the same thing identically).
+pub const STAGED_CORROBORATION_COSINE: f64 = 0.80;
+
+/// Days a staged one-off waits for corroboration before it expires.
+pub const STAGED_RETENTION_DAYS: i64 = 30;
+
+/// Conversation beliefs below this are dropped rather than staged.
+const DISCARD_BELOW_CONFIDENCE: f64 = 0.10;
+
+/// Confidence at which a single-chat belief is trusted on its own.
+const SELF_EVIDENT_CONFIDENCE: f64 = 0.60;
+
+/// Whether a conversation belief may move into the context layer on its own
+/// evidence: stated, corrected or tested; seen at least twice in the chat;
+/// linked to something already known; already corroborated across chats; or
+/// confident enough. Anything else is a one-off and is staged instead.
+pub fn qualifies_for_context(b: &Belief, linked: bool) -> bool {
+    matches!(
+        b.provenance,
+        Provenance::DirectStatement | Provenance::ControlledTest | Provenance::Correction
+    ) || b.tested
+        || b.support_count >= 2
+        || b.distinct_sessions >= 2
+        || linked
+        || b.confidence >= SELF_EVIDENT_CONFIDENCE
+}
+
 /// Promote a context belief to identity only when ALL four gates hold:
 /// support_count ≥ 3 AND distinct_sessions ≥ 2 AND
 /// (provenance ∈ {direct_statement, controlled_test, correction} OR tested)
@@ -67,11 +96,11 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
     context.extend(db.list_beliefs(Some(Layer::Identity)).await?);
 
     for b in conversation {
-        // discard confidence < 0.25 or single-observation-with-support-1
-        // (keep observations as audit trail -- they're preserved by the
-        // observations table)
-        let weak = b.confidence < 0.25 || (b.provenance == Provenance::SingleObservation && b.support_count <= 1);
-        if weak {
+        // Discard only what is close to worthless (contradicted down to
+        // almost nothing). One-off observations are staged below instead, so
+        // a second chat showing the same thing can still corroborate them.
+        // Observations stay as the audit trail either way.
+        if b.confidence < DISCARD_BELOW_CONFIDENCE {
             db.delete_belief(&b.id).await?;
             changed += 1;
             continue;
@@ -79,6 +108,9 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
         // merge into a context belief at cosine ≥ 0.86.
         let mut merged = false;
         for c in context.iter_mut() {
+            if c.embedding_model != b.embedding_model {
+                continue;
+            }
             let cos = crate::vector::ops::cosine(&c.embedding, &b.embedding);
             if cos >= CONSOLIDATE_MERGE_COSINE {
                 // Reinforcement, not a blind max(): repeated supporting
@@ -149,28 +181,78 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
             }
         }
         if !merged {
-            // promote conversation -> context (it's durable enough to leave
-            // the conversation layer, just not identity yet). Context is
-            // cross-session, so this also clears session_id.
-            db.update_belief(
-                &b.id,
-                &BeliefPatch {
+            let linked = db.has_any_link(&b.id).await?;
+            // A one-off that another chat has already staged something very
+            // like: corroborated across sessions, so it qualifies too.
+            let corroboration = if qualifies_for_context(&b, linked) {
+                None
+            } else {
+                db.find_corroborating_staged(
+                    &b.embedding,
+                    &b.embedding_model,
+                    session_id,
+                    now - chrono::Duration::days(STAGED_RETENTION_DAYS),
+                    STAGED_CORROBORATION_COSINE,
+                )
+                .await?
+            };
+            if qualifies_for_context(&b, linked) || corroboration.is_some() {
+                // Promote conversation -> context. Context is cross-session,
+                // so this also clears session_id.
+                let mut patch = BeliefPatch {
                     layer: Some(Layer::Context),
                     session_id: Some(None),
                     ..Default::default()
-                },
-                now,
-            )
-            .await?;
-            // Append to the local snapshot too -- a later conversation
-            // belief in this same pass must be able to merge into a belief
-            // that only just got promoted, exactly as it could when
-            // `context` was re-fetched fresh from the DB every iteration.
-            let mut promoted = b.clone();
-            promoted.layer = Layer::Context;
-            promoted.session_id = None;
-            context.push(promoted);
-            changed += 1;
+                };
+                let mut promoted = b.clone();
+                if let Some((staged, _)) = &corroboration {
+                    let conf = crate::belief::synthesis::merge_confidence(
+                        b.confidence,
+                        staged.provenance,
+                        false,
+                    );
+                    let sessions = b.distinct_sessions.max(1) + 1;
+                    let support = b.support_count + 1;
+                    patch.confidence = Some(conf);
+                    patch.distinct_sessions = Some(sessions);
+                    patch.support_count = Some(support);
+                    patch.last_confirmed_at = Some(now);
+                    promoted.confidence = conf;
+                    promoted.distinct_sessions = sessions;
+                    promoted.support_count = support;
+                    promoted.last_confirmed_at = Some(now);
+                    db.mark_staged_synthesized(std::slice::from_ref(&staged.id), now)
+                        .await?;
+                }
+                db.update_belief(&b.id, &patch, now).await?;
+                promoted.layer = Layer::Context;
+                promoted.session_id = None;
+                context.push(promoted);
+                changed += 1;
+            } else {
+                // Uncorroborated one-off: staged, not promoted. It becomes a
+                // belief if a later chat shows something similar (above) or
+                // cross-session synthesis finds a pattern in it; otherwise it
+                // expires after `STAGED_RETENTION_DAYS`. Deleting the
+                // conversation belief sets `observations.belief_id = NULL`
+                // (FK ON DELETE SET NULL), keeping the raw audit trail.
+                db.insert_staged_evidence(&crate::store::staged::StagedEvidence {
+                    id: crate::store::audit::uuid_string(),
+                    session_id: session_id.to_string(),
+                    statement: b.text.clone(),
+                    kind: b.kind,
+                    provenance: b.provenance,
+                    domain: b.domain.clone(),
+                    evidence: None,
+                    embedding: b.embedding.clone(),
+                    embedding_model: b.embedding_model.clone(),
+                    created_at: now,
+                    synthesized_at: None,
+                })
+                .await?;
+                db.delete_belief(&b.id).await?;
+                changed += 1;
+            }
         }
     }
 

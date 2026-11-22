@@ -120,7 +120,7 @@ pub struct Relevance {
 /// Component-wise mean of the candidate embeddings — the corpus mean removed
 /// before the centered-cosine relevance gate (`RecallConfig`). `None` when
 /// there are no non-empty embeddings to average.
-fn corpus_mean(candidates: &[Belief]) -> Option<Vec<f32>> {
+pub(crate) fn corpus_mean(candidates: &[Belief]) -> Option<Vec<f32>> {
     let dim = candidates.iter().map(|b| b.embedding.len()).find(|&n| n > 0)?;
     let mut sum = vec![0.0f64; dim];
     let mut n = 0usize;
@@ -141,7 +141,7 @@ fn corpus_mean(candidates: &[Belief]) -> Option<Vec<f32>> {
 
 /// Elementwise `a - b` (the centering step); a shorter `b` leaves the tail of
 /// `a` unchanged.
-fn sub(a: &[f32], b: &[f32]) -> Vec<f32> {
+pub(crate) fn sub(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter()
         .enumerate()
         .map(|(i, &x)| x - b.get(i).copied().unwrap_or(0.0))
@@ -240,12 +240,18 @@ pub fn select_beliefs_relevant_with_cut(
     // floor (so a stale profile belief no longer injects on an unrelated
     // turn). An empty query has no cosine, so the gate is a no-op there —
     // `select_beliefs` stays weight-only.
-    if ops::norm(query) > 1e-12 {
+    let has_query = ops::norm(query) > 1e-12;
+    if has_query {
         let floor = cfg.recall.min_cosine;
         let floor_identity = cfg.recall.min_cosine_identity;
-        let is_identity = |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity;
+        // Identity and the standing profile are judged against the gentler
+        // identity floor: they still have to bear on the turn, only less
+        // closely than a topical belief. Pinned beliefs alone are exempt.
+        let is_identity =
+            |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity || is_standing_profile(b);
+        let is_exempt = |b: &Belief| b.pinned;
         cand.retain(|(_, b, _, _, rel)| {
-            b.pinned
+            is_exempt(b)
                 || if is_identity(b) {
                     *rel >= floor_identity
                 } else {
@@ -256,20 +262,19 @@ pub fn select_beliefs_relevant_with_cut(
         // Per-query gap cut over the general (non-exempt) survivors: keep only
         // the top relevance cluster for this turn, dropping a weak tail that
         // cleared the flat floor but sits well below what the query actually
-        // matched. Pinned and identity beliefs are exempt, exactly like the
-        // floor. The cut point is this turn's EWMA observation.
+        // matched. Pinned, standing-profile, and identity beliefs are exempt.
         let mut general_rels: Vec<f64> = cand
             .iter()
-            .filter(|(_, b, _, _, _)| !b.pinned && !is_identity(b))
+            .filter(|(_, b, _, _, _)| !is_exempt(b) && !is_identity(b))
             .map(|(_, _, _, _, rel)| *rel)
             .collect();
         if let Some(threshold) = gap_threshold(&mut general_rels, cfg.recall.gap_min) {
-            cand.retain(|(_, b, _, _, rel)| b.pinned || is_identity(b) || *rel >= threshold);
+            cand.retain(|(_, b, _, _, rel)| is_exempt(b) || is_identity(b) || *rel >= threshold);
         }
         // Effective cut = lowest general relevance that survived (for the EWMA).
         let lowest = cand
             .iter()
-            .filter(|(_, b, _, _, _)| !b.pinned && !is_identity(b))
+            .filter(|(_, b, _, _, _)| !is_exempt(b) && !is_identity(b))
             .map(|(_, _, _, _, rel)| *rel)
             .fold(f64::INFINITY, f64::min);
         effective_cut = lowest.is_finite().then_some(lowest);
@@ -367,10 +372,16 @@ pub fn select_beliefs_relevant_with_cut(
     // case is largely already prevented upstream -- observations within
     // MERGE_COSINE (0.86) of an existing belief merge into it at write time
     // rather than becoming a second, near-identical row.
+    // Conditioned two-pass DPP: Pass 1 selects up to IDENTITY_RESERVED slots
+    // from Identity + standing epistemic profile beliefs; Pass 2 selects from
+    // the remainder excluding near-duplicates (`cos >= 0.85`) of reserved picks.
+    const PASS2_DEDUP_COSINE: f64 = 0.85;
     let identity_positions: Vec<usize> = alive
         .iter()
         .enumerate()
-        .filter(|(_, (_, b, _, _, _))| b.layer == crate::store::beliefs::Layer::Identity)
+        .filter(|(_, (_, b, _, _, _))| {
+            b.layer == crate::store::beliefs::Layer::Identity || is_standing_profile(b)
+        })
         .map(|(pos, _)| pos)
         .collect();
 
@@ -379,7 +390,25 @@ pub fn select_beliefs_relevant_with_cut(
     } else {
         let reserved = IDENTITY_RESERVED.min(identity_positions.len());
         let mut picked = dpp_sample_restricted(&kernel, &identity_positions, reserved, cfg.dpp.epsilon);
-        let rest: Vec<usize> = (0..alive.len()).filter(|p| !picked.contains(p)).collect();
+        // The general pool: everything not reserved, minus near-duplicates of
+        // the reserved picks, and minus profile beliefs that only cleared the
+        // gentler identity floor -- they may take a reserved slot, never a
+        // topical one.
+        let floor = cfg.recall.min_cosine;
+        let rest: Vec<usize> = (0..alive.len())
+            .filter(|&p| {
+                let (_, b, _, _, rel) = &alive[p];
+                let topical_enough = !has_query
+                    || b.pinned
+                    || !(b.layer == crate::store::beliefs::Layer::Identity || is_standing_profile(b))
+                    || *rel >= floor;
+                !picked.contains(&p)
+                    && topical_enough
+                    && !picked
+                        .iter()
+                        .any(|&q| ops::cosine(&normed[p], &normed[q]) >= PASS2_DEDUP_COSINE)
+            })
+            .collect();
         picked.extend(dpp_sample_restricted(
             &kernel,
             &rest,
@@ -451,26 +480,41 @@ fn dpp_sample_restricted(
         .collect()
 }
 
-/// Truncation order when over the token budget: CheckYourself → WorthTesting
-/// → uncertainty lines → weakest beliefs. Never mid-line. Labels are the
-/// exact section headers `antisycophancy::render_block` emits, matched via
-/// `starts_with` against each `"\n\n"`-joined section. All four now share
-/// the same `header\nbody` shape (`[Check yourself]` used to bake its label
-/// into the body string; `render_block` applies it uniformly instead).
-///
-/// `render_reflection_block` deliberately emits no headers -- a `<think>`
-/// prefill that carries bracketed scaffolding reads as injected boilerplate
-/// rather than the model's own recollection -- so it gets its own
-/// positional equivalent, `cap_reflection_to_token_budget`, whose
-/// drop-from-the-end order is kept in sync with this list.
+/// Domainless durable epistemic/identity beliefs that belong in the standing
+/// profile even when the turn query uses different vocabulary.
+/// Keeps domain-scoped `Identity` beliefs subject to `min_cosine_identity`.
+fn is_standing_profile(b: &Belief) -> bool {
+    if b.domain.is_some() {
+        return false;
+    }
+    if b.layer == crate::store::beliefs::Layer::Identity {
+        return true;
+    }
+    b.layer == crate::store::beliefs::Layer::Context
+        && matches!(
+            b.kind,
+            crate::store::beliefs::BeliefKind::Preference
+                | crate::store::beliefs::BeliefKind::Trait
+        )
+        && b.confidence >= 0.65
+        && b.support_count >= 2
+}
+
+/// Truncation order when over the token budget, after trimming excess
+/// bullets from `[Working assumptions about you]`: drop low-urgency sections
+/// first and protect the contrary prompts (`[Worth challenging]`,
+/// `[In tension]`) longest.
 pub fn truncation_order() -> &'static [&'static str] {
+    // `[Worth challenging]` and `[In tension]` quote the beliefs they are
+    // about, so they still read correctly once the assumptions list is gone.
     &[
         "[Check yourself]",
-        "[Worth testing this turn]",
         "[Where I'm unsure]",
+        "[Worth testing this turn]",
+        "[Fresh angle]",
+        "[Working assumptions about you]",
         "[Worth challenging]",
         "[In tension]",
-        "[Working assumptions about you]",
     ]
 }
 
@@ -488,17 +532,31 @@ fn estimate_tokens(s: &str) -> usize {
     s.chars().count().div_ceil(4)
 }
 
-/// Enforce the recall token budget by dropping whole sections in
-/// `truncation_order()` -- `[Check yourself]` first, then `[Worth testing
-/// this turn]`, then `[Where I'm unsure]`, then `[Working assumptions about you]`
-/// last -- never truncating mid-line. `block` must already be the full
-/// joined text from `antisycophancy::render_block` (sections separated by
-/// `"\n\n"`, footer last).
+/// Minimum bullet lines preserved inside `[Working assumptions about you]`
+/// while trimming to preserve dialectical sections (header + 2 bullets = 3 lines).
+const MIN_ASSUMPTION_LINES: usize = 3;
+
+/// Enforce the recall token budget: first trim trailing bullets from
+/// `[Working assumptions about you]` (keeping at least the header and top 2
+/// bullets) so active antisycophancy sections survive; if still over budget,
+/// drop whole sections in `truncation_order()` without truncating mid-line.
 pub fn cap_to_token_budget(block: String) -> String {
     if estimate_tokens(&block) <= RECALL_MAX_TOKENS {
         return block;
     }
-    let mut sections: Vec<&str> = block.split("\n\n").collect();
+    let mut sections: Vec<String> = block.split("\n\n").map(str::to_string).collect();
+    // Phase 1: trim trailing bullet lines from `[Working assumptions about you]`.
+    if let Some(idx) = sections
+        .iter()
+        .position(|s| s.starts_with("[Working assumptions about you]"))
+    {
+        let mut lines: Vec<String> = sections[idx].lines().map(str::to_string).collect();
+        while lines.len() > MIN_ASSUMPTION_LINES && estimate_tokens(&sections.join("\n\n")) > RECALL_MAX_TOKENS {
+            lines.pop();
+            sections[idx] = lines.join("\n");
+        }
+    }
+    // Phase 2: drop whole sections by priority order.
     for header in truncation_order() {
         if estimate_tokens(&sections.join("\n\n")) <= RECALL_MAX_TOKENS {
             break;
@@ -506,9 +564,7 @@ pub fn cap_to_token_budget(block: String) -> String {
         sections.retain(|s| !s.starts_with(header));
     }
     let mut joined = sections.join("\n\n");
-    // Last resort: even `[Working assumptions about you]` alone (e.g. one very long
-    // belief line) can't be dropped without losing the whole block's point,
-    // so hard-truncate at a char boundary rather than exceeding the budget.
+    // Last resort: hard-truncate at a char boundary rather than exceeding budget.
     if estimate_tokens(&joined) > RECALL_MAX_TOKENS {
         let max_chars = RECALL_MAX_TOKENS * 4;
         if joined.chars().count() > max_chars {
@@ -565,6 +621,14 @@ pub fn render_reflection(selected: &mut [SelectedBelief]) -> String {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.belief.id.cmp(&b.belief.id))
     });
+    reflection_of(selected)
+}
+
+/// The reflection sentence over `selected` as given (already sorted).
+fn reflection_of(selected: &[SelectedBelief]) -> String {
+    if selected.is_empty() {
+        return String::new();
+    }
     let facts: Vec<&str> = selected.iter().map(|s| s.belief.text.as_str()).collect();
     format!(
         "What I think I've picked up about this person so far: {}. \
@@ -602,7 +666,8 @@ pub fn render_reflection_block(
 }
 
 /// [`render_reflection_block`] with `[In tension]` and `[Worth challenging]`
-/// (bare sentences, no headers), in the reverse of `truncation_order()`.
+/// (bare sentences, no headers), ordered so active dialectical signals
+/// (`tension`, `challenge`, `worth_testing`) are protected longest.
 pub fn render_reflection_block_full(
     reflection: &str,
     tension: Option<String>,
@@ -611,11 +676,36 @@ pub fn render_reflection_block_full(
     unsure: Option<String>,
     check: Option<String>,
 ) -> String {
+    render_reflection_block_with_novelty(
+        reflection,
+        tension,
+        challenge,
+        None,
+        worth_testing,
+        unsure,
+        check,
+    )
+}
+
+/// [`render_reflection_block_full`] with an optional first-person `[Fresh angle]`
+/// sentence (no bracketed labels).
+pub fn render_reflection_block_with_novelty(
+    reflection: &str,
+    tension: Option<String>,
+    challenge: Option<String>,
+    fresh_angle: Option<String>,
+    worth_testing: Option<String>,
+    unsure: Option<String>,
+    check: Option<String>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !reflection.is_empty() {
         parts.push(reflection.to_string());
     }
-    for part in [tension, challenge, unsure, worth_testing, check].into_iter().flatten() {
+    for part in [tension, challenge, fresh_angle, worth_testing, unsure, check]
+        .into_iter()
+        .flatten()
+    {
         if !part.is_empty() {
             parts.push(part);
         }
@@ -623,10 +713,45 @@ pub fn render_reflection_block_full(
     parts.join("\n\n")
 }
 
+/// The whole thought-seed block within the token budget. Over budget, the
+/// weakest beliefs leave the reflection first (keeping at least two), so the
+/// dialectical sentences after it survive; only then do trailing paragraphs
+/// go ([`cap_reflection_to_token_budget`]). Trims the beliefs themselves
+/// rather than re-parsing rendered text, so a belief containing ". " or
+/// "; " cannot break it.
+#[allow(clippy::too_many_arguments)]
+pub fn render_reflection_block_capped(
+    selected: &mut [SelectedBelief],
+    tension: Option<String>,
+    challenge: Option<String>,
+    fresh_angle: Option<String>,
+    worth_testing: Option<String>,
+    unsure: Option<String>,
+    check: Option<String>,
+) -> String {
+    render_reflection(selected); // sorts into display order
+    let mut n = selected.len();
+    loop {
+        let block = render_reflection_block_with_novelty(
+            &reflection_of(&selected[..n]),
+            tension.clone(),
+            challenge.clone(),
+            fresh_angle.clone(),
+            worth_testing.clone(),
+            unsure.clone(),
+            check.clone(),
+        );
+        if n <= 2 || estimate_tokens(&block) <= RECALL_MAX_TOKENS {
+            return cap_reflection_to_token_budget(block);
+        }
+        n -= 1;
+    }
+}
+
 /// `cap_to_token_budget`'s equivalent for the header-less thought-seed
-/// block: drops whole trailing paragraphs (which `render_reflection_block`
-/// orders least-important-last) until the budget is met, then hard-truncates
-/// as a last resort exactly like the system-block path.
+/// block: drops whole trailing paragraphs (least important last), never the
+/// reflection, then hard-truncates as a last resort. Trimming beliefs out of
+/// the reflection first is [`render_reflection_block_capped`]'s job.
 pub fn cap_reflection_to_token_budget(block: String) -> String {
     if estimate_tokens(&block) <= RECALL_MAX_TOKENS {
         return block;
@@ -928,5 +1053,118 @@ mod tests {
         let ids: std::collections::HashSet<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
         assert!(ids.contains("id"), "identity kept under its gentler floor");
         assert!(!ids.contains("ctx"), "context dropped under the strict floor");
+    }
+
+    #[test]
+    fn cap_to_token_budget_trims_assumptions_before_dropping_challenge_or_tension() {
+        let mut long_bullets = String::new();
+        for i in 0..15 {
+            if i > 0 {
+                long_bullets.push('\n');
+            }
+            long_bullets.push_str(&format!(
+                "- The user has recurring preference number {i} with a sufficiently descriptive detail sentence."
+            ));
+        }
+        let block = crate::antisycophancy::render_block_full(
+            &long_bullets,
+            Some("Tension between A and B.".into()),
+            Some("Challenge this stance.".into()),
+            Some("Check whether they still want X.".into()),
+            None,
+            None,
+        );
+        let capped = cap_to_token_budget(block);
+        assert!(estimate_tokens(&capped) <= RECALL_MAX_TOKENS);
+        assert!(capped.contains("[In tension]"), "tension must survive bullet trimming: {capped}");
+        assert!(capped.contains("[Worth challenging]"), "challenge must survive bullet trimming: {capped}");
+        assert!(capped.contains("[Working assumptions about you]"));
+    }
+
+    fn standing(emb: Vec<f32>) -> Belief {
+        let mut b = belief("stand", "Wants the recommendation first", 0.75, true, Layer::Context, None, emb);
+        b.kind = crate::store::beliefs::BeliefKind::Preference;
+        b.support_count = 2;
+        b
+    }
+
+    #[test]
+    fn standing_profile_needs_modest_relevance_and_keeps_to_reserved_slots() {
+        let mut cfg = Config::default();
+        cfg.recall.min_cosine = 0.5;
+        let pool = |q: &[f32]| {
+            let cands = [
+                standing(vec![0.6, 0.8, 0.0]),
+                belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), vec![1.0, 0.0, 0.0]),
+                belief("z", "z-axis", 0.7, true, Layer::Context, Some("e"), vec![0.0, 0.0, 1.0]),
+                belief("neg", "neg-y", 0.7, true, Layer::Context, Some("f"), vec![0.0, -1.0, 0.0]),
+            ];
+            select_beliefs_relevant(&cands, q, None, &[], &cfg)
+                .into_iter()
+                .map(|s| s.belief.id)
+                .collect::<std::collections::HashSet<String>>()
+        };
+        // Mildly related (above the identity floor, below the topical one):
+        // shown, through a reserved slot.
+        assert!(pool(&[1.0, 0.0, 0.0]).contains("stand"));
+        // Unrelated to the turn: not shown.
+        assert!(!pool(&[0.0, 0.0, 1.0]).contains("stand"));
+    }
+
+    #[test]
+    fn second_pass_drops_near_duplicates_of_reserved_picks() {
+        let cfg = Config::default();
+        let mut near_dup = belief(
+            "dup",
+            "Leads with the answer",
+            0.7,
+            true,
+            Layer::Context,
+            Some("writing"),
+            vec![0.62, 0.78, 0.0],
+        );
+        near_dup.pinned = true; // past every floor, so only the dedup can drop it
+        let other = belief("z", "z-axis", 0.7, true, Layer::Context, Some("e"), vec![0.0, 0.0, 1.0]);
+        let sel = select_beliefs_relevant(
+            &[standing(vec![0.6, 0.8, 0.0]), near_dup, other],
+            &[0.6, 0.8, 0.0],
+            None,
+            &[],
+            &cfg,
+        );
+        let ids: std::collections::HashSet<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
+        assert!(ids.contains("stand"));
+        assert!(!ids.contains("dup"), "Pass 2 must drop near-duplicates of reserved picks");
+    }
+
+    #[test]
+    fn capped_reflection_trims_beliefs_even_when_their_text_has_sentence_breaks() {
+        let mut selected: Vec<SelectedBelief> = (0..40)
+            .map(|i| SelectedBelief {
+                belief: belief(
+                    &format!("b{i:02}"),
+                    &format!("Belief {i}. It has a sentence break; and a semicolon in a fairly long description"),
+                    0.7,
+                    true,
+                    Layer::Context,
+                    None,
+                    vec![1.0, 0.0],
+                ),
+                effective_weight: 1.0 - i as f64 / 100.0,
+            })
+            .collect();
+        let block = render_reflection_block_capped(
+            &mut selected,
+            Some("Tension sentence.".into()),
+            Some("Challenge sentence.".into()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(estimate_tokens(&block) <= RECALL_MAX_TOKENS);
+        assert!(block.contains("Challenge sentence.") && block.contains("Tension sentence."));
+        assert!(block.contains("Belief 0."), "the strongest belief is kept");
+        assert!(!block.contains("Belief 39."), "the weakest go first");
     }
 }

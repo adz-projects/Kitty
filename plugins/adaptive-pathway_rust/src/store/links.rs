@@ -54,6 +54,18 @@ impl Db {
         Ok(())
     }
 
+    /// Whether `id` is linked to any other belief (either end).
+    pub async fn has_any_link(&self, id: &str) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM belief_links WHERE belief_a = ? OR belief_b = ?",
+        )
+        .bind(id)
+        .bind(id)
+        .fetch_one(self.read_pool())
+        .await?;
+        Ok(n > 0)
+    }
+
     /// Every link among `ids` (both ends in the set), as `(a, b, relation)`.
     pub async fn links_among(&self, ids: &[String]) -> Result<Vec<(String, String, Relation)>> {
         if ids.len() < 2 {

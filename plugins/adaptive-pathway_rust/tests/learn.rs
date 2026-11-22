@@ -432,3 +432,290 @@ async fn extraction_records_kinds_links_tensions_and_test_results() {
     let a = engine.db.get_assumption("a1").await.unwrap().unwrap();
     assert_eq!(a.state, adaptive_pathway::store::assumptions::AssumptionState::Passed);
 }
+
+#[tokio::test]
+async fn consolidation_stages_single_session_inferred_and_synthesizes_across_sessions() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let now = chrono::Utc::now();
+
+    let mut conv_b = adaptive_pathway::store::beliefs::Belief {
+        id: "conv_1".into(),
+        text: "Asked about Gigabyte B550 pricing".into(),
+        embedding: vec![1.0, 0.0, 0.0],
+        confidence: 0.4,
+        provenance: Provenance::InferredPattern,
+        layer: Layer::Conversation,
+        tested: false,
+        domain: Some("hardware".into()),
+        tier: "conversation".into(),
+        support_count: 1,
+        distinct_sessions: 1,
+        contradict_count: 0,
+        pinned: false,
+        last_confirmed_at: Some(now),
+        consolidated_at: None,
+        created_at: now,
+        updated_at: now,
+        session_id: Some("s1".into()),
+        embedding_model: engine.cfg.embedding.ollama_model.clone(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
+    };
+    engine.db.insert_belief(&conv_b).await.unwrap();
+
+    // Explicit DirectStatement in the same session still promotes directly.
+    conv_b.id = "conv_direct".into();
+    conv_b.text = "User prefers structural critique before polish".into();
+    conv_b.provenance = Provenance::DirectStatement;
+    conv_b.embedding = vec![0.0, 1.0, 0.0];
+    engine.db.insert_belief(&conv_b).await.unwrap();
+
+    adaptive_pathway::consolidate::consolidate_session(&engine.db, "s1")
+        .await
+        .unwrap();
+
+    // Direct statement promoted; inferred single-session moved to staged_evidence.
+    assert!(engine
+        .db
+        .get_belief("conv_1")
+        .await
+        .unwrap()
+        .is_none());
+    let direct = engine.db.get_belief("conv_direct").await.unwrap().unwrap();
+    assert_eq!(direct.layer, Layer::Context);
+    let pending = engine.db.list_pending_staged_evidence(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].session_id, "s1");
+
+    // Add two more staged items from a second session so cross-session synthesis runs.
+    for (id, sid, stmt) in [
+        ("st2", "s2", "Reads ArXiv papers on pedagogical AI"),
+        ("st3", "s2", "Asks for preprints instead of journal PDFs"),
+    ] {
+        engine
+            .db
+            .insert_staged_evidence(&adaptive_pathway::store::staged::StagedEvidence {
+                id: id.into(),
+                session_id: sid.into(),
+                statement: stmt.into(),
+                kind: adaptive_pathway::store::beliefs::BeliefKind::Preference,
+                provenance: Provenance::InferredPattern,
+                domain: None,
+                evidence: None,
+                embedding: vec![0.0, 0.0, 1.0],
+                embedding_model: engine.cfg.embedding.ollama_model.clone(),
+                created_at: now,
+                synthesized_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let synth_chat = MockChat {
+        response: json!({
+            "patterns": [
+                {
+                    "statement": "Relies more on ArXiv preprints than journal-published articles.",
+                    "kind": "preference",
+                    "domain": "",
+                    "evidence_ids": [pending[0].id, "st2", "st3"]
+                },
+                {
+                    "statement": "Single-session pattern that must be rejected.",
+                    "kind": "preference",
+                    "domain": "",
+                    "evidence_ids": ["st2", "st3"]
+                }
+            ]
+        }),
+    };
+    let written = learn::synthesize_staged_evidence(&engine, &synth_chat)
+        .await
+        .unwrap();
+    assert_eq!(written, 1, "only the cross-session pattern (>= 2 sessions) is promoted");
+    let ctx = engine.db.list_beliefs(Some(Layer::Context)).await.unwrap();
+    let arxiv = ctx
+        .iter()
+        .find(|b| b.text.contains("ArXiv preprints"))
+        .expect("synthesized trait in Context");
+    assert_eq!(arxiv.distinct_sessions, 2);
+    assert!(engine.db.list_pending_staged_evidence(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn extractor_clamps_uncorroborated_context_observations_to_conversation_for_staging() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let host = host_pool().await;
+    let r1 = insert_message(&host, "s_clamp", "user", "What is a Gigabyte B550 motherboard price?").await;
+    let chat = MockChat {
+        response: json!({
+            "observations": [
+                {
+                    "statement": "Interested in Gigabyte B550 pricing.",
+                    "provenance": "inferred_pattern",
+                    "layer": "context",
+                    "domain": "hardware",
+                    "evidence": "asked about price",
+                    "contradicts": "",
+                    "kind": "context",
+                    "relates_to": []
+                },
+                {
+                    "statement": "Prefers motherboard boxes in white.",
+                    "provenance": "single_observation",
+                    "layer": "context",
+                    "domain": "",
+                    "evidence": "",
+                    "contradicts": "",
+                    "kind": "preference",
+                    "relates_to": []
+                }
+            ],
+            "corrections": [],
+            "test_results": []
+        }),
+    };
+    learn::extract_and_record(
+        &engine,
+        &host,
+        &chat,
+        LearnRequest {
+            session_id: "s_clamp",
+            through_rowid: r1,
+            given_chunk: None,
+        },
+        LearnTrigger::TurnEnd,
+    )
+    .await
+    .unwrap();
+
+    // Neither uncorroborated claim may enter Layer::Context directly.
+    assert!(engine.db.list_beliefs(Some(Layer::Context)).await.unwrap().is_empty());
+    let conv = engine.db.list_beliefs(Some(Layer::Conversation)).await.unwrap();
+    assert_eq!(conv.len(), 2);
+
+    // Consolidation stages both one-offs, waiting for another chat to
+    // corroborate them.
+    adaptive_pathway::consolidate::consolidate_session(&engine.db, "s_clamp")
+        .await
+        .unwrap();
+    assert!(engine.db.list_beliefs(Some(Layer::Context)).await.unwrap().is_empty());
+    assert_eq!(engine.db.list_pending_staged_evidence(10).await.unwrap().len(), 2);
+}
+
+fn conv_belief(id: &str, session: &str, embedding: Vec<f32>, model: &str) -> adaptive_pathway::store::beliefs::Belief {
+    let now = chrono::Utc::now();
+    adaptive_pathway::store::beliefs::Belief {
+        id: id.into(),
+        text: format!("belief {id}"),
+        embedding,
+        confidence: 0.30,
+        provenance: Provenance::InferredPattern,
+        layer: Layer::Conversation,
+        tested: false,
+        domain: None,
+        tier: "conversation".into(),
+        support_count: 1,
+        distinct_sessions: 1,
+        contradict_count: 0,
+        pinned: false,
+        last_confirmed_at: Some(now),
+        consolidated_at: None,
+        created_at: now,
+        updated_at: now,
+        session_id: Some(session.into()),
+        embedding_model: model.into(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Preference,
+    }
+}
+
+#[tokio::test]
+async fn intake_promotes_recurring_and_cross_chat_corroborated_one_offs() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let model = engine.cfg.embedding.ollama_model.clone();
+
+    // Seen twice in one chat: promoted on its own evidence.
+    let mut twice = conv_belief("twice", "s1", vec![1.0, 0.0, 0.0], &model);
+    twice.support_count = 2;
+    engine.db.insert_belief(&twice).await.unwrap();
+    // A one-off: staged.
+    engine
+        .db
+        .insert_belief(&conv_belief("once_a", "s1", vec![0.0, 1.0, 0.0], &model))
+        .await
+        .unwrap();
+    adaptive_pathway::consolidate::consolidate_session(&engine.db, "s1")
+        .await
+        .unwrap();
+    assert_eq!(engine.db.get_belief("twice").await.unwrap().unwrap().layer, Layer::Context);
+    assert!(engine.db.get_belief("once_a").await.unwrap().is_none());
+    assert_eq!(engine.db.list_pending_staged_evidence(10).await.unwrap().len(), 1);
+
+    // The same one-off in a second chat: corroborated, so promoted with two
+    // sessions, and the staged copy is consumed. No model call involved.
+    engine
+        .db
+        .insert_belief(&conv_belief("once_b", "s2", vec![0.05, 0.99, 0.0], &model))
+        .await
+        .unwrap();
+    adaptive_pathway::consolidate::consolidate_session(&engine.db, "s2")
+        .await
+        .unwrap();
+    let b = engine.db.get_belief("once_b").await.unwrap().unwrap();
+    assert_eq!(b.layer, Layer::Context);
+    assert_eq!(b.distinct_sessions, 2);
+    assert!(b.confidence > 0.30);
+    assert!(engine.db.list_pending_staged_evidence(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn synthesis_consumes_only_cited_evidence_and_skips_an_unchanged_set() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let model = engine.cfg.embedding.ollama_model.clone();
+    let now = chrono::Utc::now();
+    for (id, sid) in [("a", "s1"), ("b", "s2"), ("c", "s3")] {
+        engine
+            .db
+            .insert_staged_evidence(&adaptive_pathway::store::staged::StagedEvidence {
+                id: id.into(),
+                session_id: sid.into(),
+                statement: format!("observation {id}"),
+                kind: adaptive_pathway::store::beliefs::BeliefKind::Preference,
+                provenance: Provenance::InferredPattern,
+                domain: None,
+                evidence: None,
+                embedding: vec![0.0, 0.0, 1.0],
+                embedding_model: model.clone(),
+                created_at: now,
+                synthesized_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    let chat = MockChat {
+        response: json!({"patterns": [{
+            "statement": "Cross-chat pattern.",
+            "kind": "preference",
+            "domain": "",
+            "evidence_ids": ["a", "b"]
+        }]}),
+    };
+    assert_eq!(learn::synthesize_staged_evidence(&engine, &chat).await.unwrap(), 1);
+    let left: Vec<String> = engine
+        .db
+        .list_pending_staged_evidence(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(left, vec!["c".to_string()], "uncited evidence stays pending");
+
+    // Nothing staged since: the model is not asked again.
+    let panic_chat = MockChat { response: json!({"patterns": [{
+        "statement": "Must not be written.",
+        "kind": "preference",
+        "domain": "",
+        "evidence_ids": ["c", "a"]
+    }]}) };
+    assert_eq!(learn::synthesize_staged_evidence(&engine, &panic_chat).await.unwrap(), 0);
+}

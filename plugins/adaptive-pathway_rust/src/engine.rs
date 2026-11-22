@@ -24,10 +24,21 @@ struct TurnSignals {
     worth_testing: Option<String>,
     unsure: Option<String>,
     check: Option<String>,
+    /// `[Fresh angle]`: shorter-cadence creative / anti-rut prompt.
+    fresh_angle: Option<String>,
     /// `[In tension]`: an open contradiction touching a selected belief.
     tension: Option<String>,
-    /// `[Worth challenging]` line, and the stance it challenges.
-    challenge: Option<(String, String)>,
+    /// `[Worth challenging]`: the contrary option for the stance or
+    /// preference that bears on the turn.
+    challenge: Option<Challenge>,
+}
+
+/// The stance or preference a turn's contrary and exploratory options are
+/// tied to.
+struct Challenge {
+    line: String,
+    text: String,
+    is_stance: bool,
 }
 
 /// One turn's recall, as [`PathwayEngine::recall_turn`] returns it.
@@ -38,6 +49,20 @@ pub struct TurnRecall {
     /// The stance `[Worth challenging]` targets this turn, if any, so the
     /// host can look for a documented counter-view (Memorabilia) to add.
     pub challenge: Option<String>,
+    /// The directives that made it into `text` (after the token budget),
+    /// for the host's engagement telemetry.
+    pub signals: Vec<FiredSignal>,
+}
+
+/// One directive a turn's block carried.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiredSignal {
+    /// `challenge`, `tension`, `worth_testing` or `fresh_angle`.
+    pub kind: &'static str,
+    /// What it is about: the belief it challenges or explores, or the
+    /// directive's own sentence. A reply that engages with it shares words
+    /// with this.
+    pub about: String,
 }
 
 pub struct PathwayEngine {
@@ -238,18 +263,42 @@ impl PathwayEngine {
         previous_user_message: Option<&str>,
         seeded: bool,
     ) -> Option<TurnRecall> {
-        let (mut selected, candidates) = self
+        let (mut selected, candidates, predicted_query) = self
             .select_for_turn(session_id, user_message, previous_user_message)
             .await?;
-        let signals = self.turn_signals(session_id, user_message, &selected, &candidates).await;
-        let challenge_target = signals.challenge.as_ref().map(|(_, stance)| stance.clone());
-        let challenge_line = signals.challenge.map(|(line, _)| line);
+        let signals = self
+            .turn_signals(session_id, user_message, &selected, &candidates, &predicted_query)
+            .await;
+        // Only a stance is a view that something the user read can dispute
+        // (the Memorabilia counterpoint).
+        let challenge_target = signals
+            .challenge
+            .as_ref()
+            .filter(|c| c.is_stance)
+            .map(|c| c.text.clone());
+        let challenge_about = signals.challenge.as_ref().map(|c| c.text.clone());
+        let challenge_line = signals.challenge.map(|c| c.line);
+        // (kind, the line as rendered, what it is about)
+        let candidates: Vec<(&'static str, String, String)> = [
+            challenge_line
+                .clone()
+                .map(|l| ("challenge", l, challenge_about.clone().unwrap_or_default())),
+            signals.tension.clone().map(|l| ("tension", l.clone(), l)),
+            signals.worth_testing.clone().map(|l| ("worth_testing", l.clone(), l)),
+            signals
+                .fresh_angle
+                .clone()
+                .map(|l| ("fresh_angle", l, challenge_about.clone().unwrap_or_default())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let text = if seeded {
-            let reflection = crate::recall::render_reflection(&mut selected);
-            let block = crate::recall::render_reflection_block_full(
-                &reflection,
+            let block = crate::recall::render_reflection_block_capped(
+                &mut selected,
                 signals.tension,
                 challenge_line,
+                signals.fresh_angle,
                 signals.worth_testing,
                 signals.unsure,
                 signals.check,
@@ -257,13 +306,14 @@ impl PathwayEngine {
             if block.is_empty() {
                 return None;
             }
-            crate::recall::cap_reflection_to_token_budget(block)
+            block
         } else {
             let knows = crate::recall::render_knows(&mut selected);
-            let block = crate::antisycophancy::render_block_full(
+            let block = crate::antisycophancy::render_block_with_novelty(
                 &knows,
                 signals.tension,
                 challenge_line,
+                signals.fresh_angle,
                 signals.worth_testing,
                 signals.unsure,
                 signals.check,
@@ -273,7 +323,13 @@ impl PathwayEngine {
             }
             crate::recall::cap_to_token_budget(block)
         };
-        Some(TurnRecall { text, challenge: challenge_target })
+        // Only what survived the token budget was actually shown.
+        let signals = candidates
+            .into_iter()
+            .filter(|(_, line, _)| !line.is_empty() && text.contains(line.as_str()))
+            .map(|(kind, _, about)| FiredSignal { kind, about })
+            .collect();
+        Some(TurnRecall { text, challenge: challenge_target, signals })
     }
 
     /// Thought-seeded variant of `recall`: the same belief-selection pass
@@ -310,11 +366,12 @@ impl PathwayEngine {
         user_message: &str,
         selected: &[crate::belief::SelectedBelief],
         candidates: &[crate::store::beliefs::Belief],
+        predicted_query: &[f32],
     ) -> TurnSignals {
         // Display order's first belief (weight desc, id asc) -- the same one
         // `select_for_turn` records first in `last_recall_ids`, which
         // `record_turn_end` advances the streak from.
-        let top_belief_id = selected
+        let top_belief = selected
             .iter()
             .min_by(|a, b| {
                 b.effective_weight
@@ -323,10 +380,11 @@ impl PathwayEngine {
                     .then_with(|| a.belief.id.cmp(&b.belief.id))
             })
             .map(|s| s.belief.id.clone());
+        let top_belief_id = top_belief;
         // Four independent lookups, made together.
         let (worth_testing, unsure, check, tension) = tokio::join!(
             self.worth_testing_line(session_id, user_message, selected),
-            self.unsure_line(session_id, selected, candidates),
+            self.unsure_line(session_id, selected, candidates, predicted_query),
             async {
                 match &top_belief_id {
                     Some(id) => self.check_yourself_line(session_id, id).await,
@@ -335,12 +393,20 @@ impl PathwayEngine {
             },
             self.tension_line(selected, candidates),
         );
+        let challenge = challenge_for(selected);
+        // The exploratory option is tied to the same belief as the contrary
+        // one, and steps aside for `[Check yourself]`.
+        let fresh_angle = match (&challenge, &check) {
+            (Some(c), None) => self.fresh_angle_line(session_id, &c.text).await,
+            _ => None,
+        };
         TurnSignals {
             worth_testing,
             unsure,
             check,
+            fresh_angle,
             tension,
-            challenge: challenge_for(selected),
+            challenge,
         }
     }
 
@@ -379,7 +445,7 @@ impl PathwayEngine {
         session_id: &str,
         user_message: &str,
         previous_user_message: Option<&str>,
-    ) -> Option<(Vec<crate::belief::SelectedBelief>, Vec<crate::store::beliefs::Belief>)> {
+    ) -> Option<(Vec<crate::belief::SelectedBelief>, Vec<crate::store::beliefs::Belief>, Vec<f32>)> {
         // Independent reads, so together (the read pool serves them side by
         // side) rather than one after another on the turn's critical path.
         let (paused, candidates, suppressed) = tokio::join!(
@@ -458,13 +524,18 @@ impl PathwayEngine {
 
         // Self-tuning floor: raise the configured `min_cosine` toward the
         // snapshot of where relevance usually cuts in this embedding space
-        // (minus slack). The snapshot only moves in the nightly pass
-        // (`recall::cut_log`), so it cannot shift between two recalls of the
-        // same turn. Semantic query only; cold leaves the hard floor.
+        // (minus slack), capped at +0.10 so a few tight matches cannot ratchet
+        // the floor upward indefinitely.
+        const MAX_EWMA_FLOOR_LIFT: f64 = 0.10;
         let mut turn_cfg = self.cfg.clone();
         if let Some(ewma) = ewma {
-            turn_cfg.recall.min_cosine =
-                self.cfg.recall.min_cosine.max(ewma - self.cfg.recall.ewma_slack);
+            let max_floor = self.cfg.recall.min_cosine + MAX_EWMA_FLOOR_LIFT;
+            turn_cfg.recall.min_cosine = self
+                .cfg
+                .recall
+                .min_cosine
+                .max(ewma - self.cfg.recall.ewma_slack)
+                .min(max_floor);
         }
 
         let (selected, cut) = crate::recall::select_beliefs_relevant_with_cut(
@@ -477,12 +548,8 @@ impl PathwayEngine {
         );
 
         // Log this turn's effective cut for tonight's fold (semantic turns
-        // only). Logging does not change the snapshot recall reads.
-        // Best-effort -- a settings write must never fail recall.
-        // Recorded, in display order (weight desc, id asc: what
-        // `render_knows` prints), so what recall injected can be read from
-        // disk, and `record_turn_end` knows this turn's top belief.
-        // Best-effort.
+        // only). When an elevated EWMA floor dropped everything, log the base
+        // floor so empty turns relax it back down.
         let mut ordered: Vec<&crate::belief::SelectedBelief> = selected.iter().collect();
         ordered.sort_by(|a, b| {
             b.effective_weight
@@ -493,11 +560,19 @@ impl PathwayEngine {
         let ids: Vec<String> = ordered.iter().map(|s| s.belief.id.clone()).collect();
         // The turn's two writes (the cut for tonight's fold, on semantic
         // turns; the recalled ids) in one transaction: one lock, one commit.
+        let relax_to = if semantic
+            && cut.is_none()
+            && turn_cfg.recall.min_cosine > self.cfg.recall.min_cosine
+        {
+            Some(self.cfg.recall.min_cosine)
+        } else {
+            cut.filter(|_| semantic)
+        };
         let logged = self
             .db
             .run_in_transaction(|| async {
-                if let (true, Some(cut)) = (semantic, cut) {
-                    if let Err(e) = crate::recall::cut_log::log(&self.db, &space, cut).await {
+                if let Some(c) = relax_to {
+                    if let Err(e) = crate::recall::cut_log::log(&self.db, &space, c).await {
                         tracing::debug!("pathway: could not log the recall cut: {e}");
                     }
                 }
@@ -510,7 +585,7 @@ impl PathwayEngine {
         if selected.is_empty() {
             None
         } else {
-            Some((selected, candidates))
+            Some((selected, candidates, predicted_query))
         }
     }
 
@@ -671,6 +746,7 @@ impl PathwayEngine {
         session_id: &str,
         selected: &[crate::belief::SelectedBelief],
         candidates: &[crate::store::beliefs::Belief],
+        predicted_query: &[f32],
     ) -> Option<String> {
         let exchange_count = self
             .db
@@ -685,10 +761,29 @@ impl PathwayEngine {
         }
         let selected_ids: std::collections::HashSet<&str> =
             selected.iter().map(|s| s.belief.id.as_str()).collect();
+        let has_query = crate::vector::ops::norm(predicted_query) > 1e-12;
+        let mean = if has_query {
+            crate::recall::corpus_mean(candidates).filter(|m| m.len() == predicted_query.len())
+        } else {
+            None
+        };
+        let qc = mean.as_ref().map(|m| crate::recall::sub(predicted_query, m));
+        let min_rel = self.cfg.recall.min_cosine_identity;
         let mut best: Option<(f64, &str)> = None;
         for b in candidates {
             if selected_ids.contains(b.id.as_str()) {
                 continue;
+            }
+            if has_query {
+                let rel = match (&qc, &mean) {
+                    (Some(qc), Some(m)) if m.len() == b.embedding.len() => {
+                        crate::vector::ops::cosine(qc, &crate::recall::sub(&b.embedding, m))
+                    }
+                    _ => crate::vector::ops::cosine(predicted_query, &b.embedding),
+                };
+                if rel < min_rel {
+                    continue;
+                }
             }
             let score = b.confidence * (1.0 - (b.support_count as f64) / (b.support_count as f64 + 4.0));
             if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
@@ -748,20 +843,31 @@ impl PathwayEngine {
         (shown, streak)
     }
 
+    /// `[Fresh angle]` for `belief` when the chat's cooldown has passed;
+    /// showing it starts the cooldown (the chat's exchange count is the
+    /// clock, advanced once per completed turn).
+    async fn fresh_angle_line(&self, session_id: &str, belief: &str) -> Option<String> {
+        let state = self.db.get_state(session_id).await.ok().flatten();
+        let (exchange_count, last_novelty_turn) = state
+            .map(|s| (s.exchange_count, s.last_novelty_turn))
+            .unwrap_or((0, -100));
+        if exchange_count - last_novelty_turn < crate::antisycophancy::NOVELTY_COOLDOWN_TURNS {
+            return None;
+        }
+        let _ = self.db.set_last_novelty_turn(session_id, exchange_count).await;
+        Some(crate::antisycophancy::fresh_angle_line(belief))
+    }
+
     /// Turn-end bookkeeping the deterministic recall leaves to the host:
     /// advance this chat's `[Check yourself]` streak from the turn's top
     /// recalled belief (`last_recall_ids`, display order), and start the
-    /// cooldown when the turn showed the line. Call once per completed turn,
-    /// after the reply. Best-effort.
+    /// cooldown when the turn showed the line or `[Fresh angle]`. Call once
+    /// per completed turn, after the reply. Best-effort.
     pub async fn record_turn_end(&self, session_id: &str) {
-        let Some(top) = self
-            .db
-            .get_state(session_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.last_recall_ids.into_iter().next())
-        else {
+        let Some(state) = self.db.get_state(session_id).await.ok().flatten() else {
+            return;
+        };
+        let Some(top) = state.last_recall_ids.into_iter().next() else {
             return;
         };
         let now = chrono::Utc::now();
@@ -778,26 +884,56 @@ impl PathwayEngine {
             let _ = self.db.set_setting(&streak_key, &format!("{top}|{streak}")).await;
         }
     }
+
+    /// Record whether the assistant's reply engaged with an active behavioral
+    /// signal (`challenge`, `tension`, `worth_testing`, `fresh_angle`). Best-effort.
+    pub async fn record_signal_engagement(
+        &self,
+        session_id: &str,
+        signal_kind: &str,
+        engaged: bool,
+    ) {
+        let now = chrono::Utc::now();
+        // Its own table only: an audit row per directive per turn grew
+        // `audit_log` without telling anyone anything new.
+        let _ = self
+            .db
+            .record_signal_feedback(session_id, signal_kind, engaged, now)
+            .await;
+    }
 }
 
-/// `[Worth challenging]`: the top selected belief (display order) that is a
-/// `stance` -- a view the user holds. Preferences and context are never
-/// challenged: arguing with how someone likes their answers formatted is
-/// noise; offering the other side of a view they hold is the point.
-/// Returns `(line, stance text)`.
-fn challenge_for(selected: &[crate::belief::SelectedBelief]) -> Option<(String, String)> {
-    let mut stances: Vec<&crate::belief::SelectedBelief> = selected
-        .iter()
-        .filter(|s| s.belief.kind == crate::store::beliefs::BeliefKind::Stance)
-        .collect();
-    stances.sort_by(|a, b| {
-        b.effective_weight
-            .partial_cmp(&a.effective_weight)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.belief.id.cmp(&b.belief.id))
-    });
-    let top = stances.first()?;
-    Some((crate::antisycophancy::challenge_line(&top.belief.text), top.belief.text.clone()))
+/// `[Worth challenging]`: the contrary option for the top selected belief
+/// (display order) that is a stance, else a preference. Selection already
+/// required it to bear on the turn. A stance gets the strongest case against
+/// it; a preference gets one option that goes against the habit. Context and
+/// traits are never challenged: they are facts about the person, not choices.
+fn challenge_for(selected: &[crate::belief::SelectedBelief]) -> Option<Challenge> {
+    use crate::store::beliefs::BeliefKind;
+    let top_of = |kind: BeliefKind| {
+        let mut of_kind: Vec<&crate::belief::SelectedBelief> =
+            selected.iter().filter(|s| s.belief.kind == kind).collect();
+        of_kind.sort_by(|a, b| {
+            b.effective_weight
+                .partial_cmp(&a.effective_weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.belief.id.cmp(&b.belief.id))
+        });
+        of_kind.first().map(|s| s.belief.text.clone())
+    };
+    if let Some(text) = top_of(BeliefKind::Stance) {
+        return Some(Challenge {
+            line: crate::antisycophancy::challenge_line(&text),
+            text,
+            is_stance: true,
+        });
+    }
+    let text = top_of(BeliefKind::Preference)?;
+    Some(Challenge {
+        line: crate::antisycophancy::contrary_preference_line(&text),
+        text,
+        is_stance: false,
+    })
 }
 
 /// Turns the same top belief must lead recall before `[Check yourself]`.
@@ -973,5 +1109,76 @@ mod tests {
         drop(held);
         engine.prune_idle_learn_locks();
         assert_eq!(engine.learn_locks_len(), 0, "s2's lock becomes prunable once released");
+    }
+
+    #[tokio::test]
+    async fn unsure_line_filters_off_topic_beliefs_when_query_present() {
+        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+        let mut on = test_belief("on", "The user writes Rust.");
+        on.embedding = vec![1.0, 0.0, 0.0];
+        on.support_count = 10;
+        engine.db.insert_belief(&on).await.unwrap();
+
+        let mut off = test_belief("off", "The user likes gardening.");
+        off.embedding = vec![0.0, 1.0, 0.0];
+        off.confidence = 0.95;
+        off.support_count = 1;
+        engine.db.insert_belief(&off).await.unwrap();
+
+        let mut third = test_belief("third", "The user reads history.");
+        third.embedding = vec![0.0, 0.0, 1.0];
+        third.support_count = 10;
+        engine.db.insert_belief(&third).await.unwrap();
+
+        let sel = vec![crate::belief::SelectedBelief {
+            belief: on.clone(),
+            effective_weight: 0.7,
+        }];
+        let cands = vec![on, off, third];
+        for _ in 0..12 {
+            engine.db.bump_exchange("s1").await.unwrap();
+        }
+        let line = engine.unsure_line("s1", &sel, &cands, &[1.0, 0.0, 0.0]).await;
+        assert!(
+            line.as_deref().is_none_or(|l| !l.contains("gardening")),
+            "off-topic belief must not surface in [Where I'm unsure]: {line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn contrary_every_relevant_turn_and_fresh_angle_every_third() {
+        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+        let mut b = test_belief("top", "Prefers worked examples over theory.");
+        b.embedding = vec![1.0, 0.0];
+        b.kind = crate::store::beliefs::BeliefKind::Preference;
+        engine.db.insert_belief(&b).await.unwrap();
+
+        let mut fresh = Vec::new();
+        for _ in 0..7 {
+            let block = engine.recall("s_nov", "").await.unwrap();
+            assert!(
+                block.contains("[Worth challenging]") && block.contains("goes against that habit"),
+                "a relevant preference gets a contrary option every turn: {block}"
+            );
+            fresh.push(block.contains("[Fresh angle]"));
+            engine.record_turn_end("s_nov").await;
+            engine.db.bump_exchange("s_nov").await.unwrap();
+        }
+        assert_eq!(fresh, [true, false, false, true, false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn a_stance_gets_the_case_against_and_is_the_counterpoint_target() {
+        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+        let mut b = test_belief("st", "Thinks remote work beats offices.");
+        b.kind = crate::store::beliefs::BeliefKind::Stance;
+        engine.db.insert_belief(&b).await.unwrap();
+        let turn = engine.recall_turn("s_st", "", None, false).await.unwrap();
+        assert!(turn.text.contains("strongest honest counter-argument"));
+        assert_eq!(turn.challenge.as_deref(), Some("Thinks remote work beats offices."));
+        assert!(turn
+            .signals
+            .iter()
+            .any(|s| s.kind == "challenge" && s.about == "Thinks remote work beats offices."));
     }
 }

@@ -60,13 +60,16 @@ pub fn unsure_due(exchange_count: i64) -> bool {
     exchange_count > 0 && exchange_count % 12 == 0
 }
 
+/// Minimum exchanges between `[Fresh angle]` nudges in the same chat.
+pub const NOVELTY_COOLDOWN_TURNS: i64 = 3;
+
 /// `[In tension]`: two things the user has said or shown that pull in
 /// different directions, both put in front of the model instead of one
 /// quietly winning (contradictions used to just halve a belief's weight).
 pub fn tension_line(a: &str, b: &str) -> String {
     format!(
-        "Earlier: \"{a}\". Also: \"{b}\". These pull in different directions; \
-         where it matters here, ask or check which holds rather than assuming either."
+        "Earlier: \"{a}\". Also: \"{b}\". Where this bears on your answer, name the tension \
+         and ask or test which holds rather than quietly assuming either."
     )
 }
 
@@ -76,8 +79,27 @@ pub fn tension_line(a: &str, b: &str) -> String {
 /// shown arguments they already agree with.
 pub fn challenge_line(stance: &str) -> String {
     format!(
-        "They lean toward: \"{stance}\". Where it bears on this, also give the strongest \
-         case against that view, plainly labelled as such, without abandoning their question."
+        "They lean toward: \"{stance}\". Answer their question directly AND present the strongest \
+         honest counter-argument or caveat to that view, plainly labelled."
+    )
+}
+
+/// `[Worth challenging]` for a *preference* bearing on the turn: one option
+/// that goes against their usual way, offered rather than imposed.
+pub fn contrary_preference_line(preference: &str) -> String {
+    format!(
+        "They usually prefer: \"{preference}\". Answer the way they prefer, and also name one \
+         option that goes against that habit, plainly labelled, with when it would serve them better."
+    )
+}
+
+/// `[Fresh angle]`: at most every [`NOVELTY_COOLDOWN_TURNS`], tied to the
+/// stance or preference that bears on the turn: one exploratory option
+/// beside the direct answer.
+pub fn fresh_angle_line(belief: &str) -> String {
+    format!(
+        "Alongside the direct answer, offer one genuinely different angle on \"{belief}\": an option \
+         outside their usual approach, a cross-domain analogy, or a premise worth questioning."
     )
 }
 
@@ -93,13 +115,25 @@ pub fn render_block(
     render_block_full(knows, None, None, worth_testing, unsure, check)
 }
 
-/// [`render_block`] with the two Phase 3 sections, `[In tension]` and
-/// `[Worth challenging]`, placed right after the working assumptions they
-/// qualify.
+/// [`render_block`] with `[In tension]` and `[Worth challenging]` placed
+/// right after the working assumptions they qualify.
 pub fn render_block_full(
     knows: &str,
     tension: Option<String>,
     challenge: Option<String>,
+    worth_testing: Option<String>,
+    unsure: Option<String>,
+    check: Option<String>,
+) -> String {
+    render_block_with_novelty(knows, tension, challenge, None, worth_testing, unsure, check)
+}
+
+/// [`render_block_full`] with an optional `[Fresh angle]` creative nudge.
+pub fn render_block_with_novelty(
+    knows: &str,
+    tension: Option<String>,
+    challenge: Option<String>,
+    fresh_angle: Option<String>,
     worth_testing: Option<String>,
     unsure: Option<String>,
     check: Option<String>,
@@ -113,6 +147,9 @@ pub fn render_block_full(
     }
     if let Some(c) = challenge.filter(|c| !c.is_empty()) {
         parts.push(format!("[Worth challenging]\n{c}"));
+    }
+    if let Some(f) = fresh_angle.filter(|f| !f.is_empty()) {
+        parts.push(format!("[Fresh angle]\n{f}"));
     }
     if let Some(w) = worth_testing {
         if !w.is_empty() {

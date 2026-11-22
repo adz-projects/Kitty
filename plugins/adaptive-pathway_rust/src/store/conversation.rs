@@ -14,6 +14,7 @@ pub struct ConversationState {
     pub exchange_count: i64,
     pub last_learned_rowid: i64,
     pub last_recall_ids: Vec<String>,
+    pub last_novelty_turn: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -25,6 +26,7 @@ pub struct ConversationStateRow {
     pub exchange_count: i64,
     pub last_learned_rowid: i64,
     pub last_recall_ids: String,
+    pub last_novelty_turn: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -33,7 +35,7 @@ impl Db {
     pub async fn get_state(&self, session_id: &str) -> Result<Option<ConversationState>> {
         let row: Option<ConversationStateRow> = sqlx::query_as(
             "SELECT session_id, paused, exchange_count, last_learned_rowid, last_recall_ids, \
-             created_at, updated_at FROM conversation_state WHERE session_id = ?",
+             last_novelty_turn, created_at, updated_at FROM conversation_state WHERE session_id = ?",
         )
         .bind(session_id)
         .fetch_optional(self.read_pool())
@@ -44,6 +46,7 @@ impl Db {
             exchange_count: r.exchange_count,
             last_learned_rowid: r.last_learned_rowid,
             last_recall_ids: serde_json::from_str(&r.last_recall_ids).unwrap_or_default(),
+            last_novelty_turn: r.last_novelty_turn,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }))
@@ -152,6 +155,19 @@ impl Db {
             "UPDATE conversation_state SET last_recall_ids = ?, updated_at = ? WHERE session_id = ?",
         )
         .bind(json)
+        .bind(Utc::now())
+        .bind(session_id)
+        .execute(&*self.write().await)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_last_novelty_turn(&self, session_id: &str, exchange_count: i64) -> Result<()> {
+        self.ensure_state(session_id).await?;
+        sqlx::query(
+            "UPDATE conversation_state SET last_novelty_turn = ?, updated_at = ? WHERE session_id = ?",
+        )
+        .bind(exchange_count)
         .bind(Utc::now())
         .bind(session_id)
         .execute(&*self.write().await)

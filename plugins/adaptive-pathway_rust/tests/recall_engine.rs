@@ -465,11 +465,13 @@ async fn tension_and_challenge_sections_render_for_the_right_beliefs() {
     assert_eq!(turn.challenge.as_deref(), Some("The user thinks remote work beats the office."));
     assert!(!turn.text.contains("strongest case against \"The user prefers"), "preferences are never challenged");
 
-    // Without a stance, no challenge.
+    // Without a stance, a relevant preference gets a contrary option
+    // instead, and is not a counterpoint target (nothing read disputes a habit).
     let engine2 = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
     engine2.db.insert_belief(&pref).await.unwrap();
     let t2 = engine2.recall_turn("s1", "", None, false).await.unwrap();
-    assert!(!t2.text.contains("[Worth challenging]") && t2.challenge.is_none());
+    assert!(t2.text.contains("[Worth challenging]") && t2.text.contains("goes against that habit"));
+    assert!(t2.challenge.is_none());
 }
 
 #[tokio::test]

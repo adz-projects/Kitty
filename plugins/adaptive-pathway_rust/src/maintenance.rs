@@ -140,7 +140,7 @@ async fn reevaluate_stale_beliefs(db: &Db, now: chrono::DateTime<Utc>) -> Result
         // confidence-based untested-pattern gate -- a *tested* belief going
         // stale is a different reason to schedule a retest, not "an
         // inference that was never validated".
-        if db.get_assumption_for_belief(&b.id).await?.is_none() {
+        if db.get_live_assumption_for_belief(&b.id).await?.is_none() {
             db.insert_assumption(&Assumption {
                 id: crate::store::audit::uuid_string(),
                 belief_id: Some(b.id.clone()),
@@ -399,5 +399,37 @@ mod tests {
         run_maintenance(&db).await.unwrap();
 
         assert!(!db.is_text_suppressed("h1", Utc::now()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_belief_with_prior_passed_assumption_is_retested() {
+        let db = Db::open_in_memory().await.unwrap();
+        let old = Utc::now() - chrono::Duration::days(40);
+        let mut stale = mk("stale", true, 0.80, 40, 3, false, Layer::Context);
+        stale.last_confirmed_at = Some(old);
+        stale.updated_at = old;
+        db.insert_belief(&stale).await.unwrap();
+        // Prior Passed assumption from an earlier test cycle.
+        db.insert_assumption(&Assumption {
+            id: "a_old".into(),
+            belief_id: Some("stale".into()),
+            text: stale.text.clone(),
+            confidence: 0.80,
+            state: AssumptionState::Passed,
+            flagged_at_exchange: 0,
+            created_at: old,
+            updated_at: old,
+        })
+        .await
+        .unwrap();
+
+        run_maintenance(&db).await.unwrap();
+
+        let live = db.get_live_assumption_for_belief("stale").await.unwrap();
+        assert!(
+            live.is_some(),
+            "stale belief with a historical Passed row must re-enter as Scheduled"
+        );
+        assert_eq!(live.unwrap().state, AssumptionState::Scheduled);
     }
 }

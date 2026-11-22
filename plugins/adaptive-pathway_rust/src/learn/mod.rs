@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
 use crate::error::{PathwayError, Result};
-use crate::store::beliefs::{Belief, Layer, Provenance};
+use crate::store::beliefs::{Belief, BeliefKind, BeliefPatch, Layer, Provenance};
 use crate::store::{Db, encode_embedding};
 use crate::traits::StructuredChat;
 
@@ -24,15 +24,15 @@ pub fn extraction_schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "statement": {"type": "string", "description": "One behavioral fact about the USER, third person, present tense: 'User prefers ...', 'User is working on ...'. Never about the assistant. Never about code or files."},
+                        "statement": {"type": "string", "description": "One durable fact about the USER that passes all four tests (about the person, durable, transferable, evidenced), third person, present tense. Never a one-off lookup or errand, and never about the topic, code, tools or the assistant."},
                         "provenance": {"type": "string", "enum": [
                             "direct_statement", "controlled_test", "inferred_pattern", "single_observation"
                         ]},
                         "layer": {"type": "string", "enum": ["context", "conversation"]},
-                        "domain": {"type": "string", "description": "Short topic label such as 'coding', 'writing', 'cooking'. Empty string if not topic-specific."},
+                        "domain": {"type": "string", "description": "Short topic label such as 'coding', 'writing', 'research' when it holds only in that area. Empty string only when it plainly holds across every kind of request."},
                         "evidence": {"type": "string", "description": "A short quote from the exchanges that supports this."},
                         "contradicts": {"type": "string", "description": "If this conflicts with a line in KNOWN BELIEFS, that line's exact text. Empty string otherwise."},
-                        "kind": {"type": "string", "enum": ["preference", "stance", "context", "trait"], "description": "preference: how the user likes things done (format, tone, tools). stance: a view the user holds about the world or a contested question. context: what they are working on, their situation. trait: who they are (role, background)."},
+                        "kind": {"type": "string", "enum": ["preference", "stance", "context", "trait"], "description": "preference: how they like things done, explained or sourced. stance: a view on a contested question. context: a project, role or situation lasting weeks or more (never a single lookup or errand). trait: an enduring orientation or background."},
                         "relates_to": {
                             "type": "array",
                             "description": "Lines in KNOWN BELIEFS this one is meaningfully connected to (not mere topic overlap). Empty if none.",
@@ -73,14 +73,9 @@ pub fn extraction_schema() -> Value {
                     },
                     "required": ["assumption", "outcome"]
                 }
-            },
-            "tone": {"type": "string", "description": "The user's tone in these exchanges, one or two words."},
-            "open_topics": {
-                "type": "array",
-                "items": {"type": "string"}
             }
         },
-        "required": ["observations", "corrections", "test_results", "tone", "open_topics"]
+        "required": ["observations", "corrections", "test_results"]
     })
 }
 
@@ -90,14 +85,41 @@ pub fn build_extraction_prompt(known_beliefs: &str, chunk: &str) -> Vec<Value> {
     build_extraction_prompt_with_tests(known_beliefs, &[], chunk)
 }
 
+/// The extractor's instructions: four tests every candidate must pass, then
+/// provenance and kind, then a few made-up examples deliberately spread over
+/// unrelated fields. The examples show the shape of a keep and a drop and
+/// carry nothing of any real user, so a small model that copies one learns
+/// nothing false about the person.
+pub const EXTRACTION_SYSTEM_PROMPT: &str = "You are learning how to work better with the person in this conversation. \
+Extract only what they reveal about themselves that would still help in a different conversation weeks from now.
+
+Keep a candidate only if it passes all four tests:
+1. ABOUT THE PERSON: it describes them (how they think, decide, learn, weigh evidence, communicate, what they value, \
+what they are working toward over weeks or months, or an instruction for how to work with them), not the topic, the task, \
+the tools or the assistant.
+2. DURABLE: it would plausibly still be true in a month. One question or errand shows only that they asked once.
+3. TRANSFERABLE: knowing it would change how you answer an unrelated future request.
+4. EVIDENCED: you can quote the words that show it. If you would have to guess, leave it out.
+
+Provenance: direct_statement when they say it about themselves; inferred_pattern when the conversation shows it more \
+than once; single_observation when it shows once.
+Kind: preference (how they like things done or explained), stance (a view on a contested question), \
+context (a project, role or situation lasting weeks or more), trait (an enduring orientation or background).
+
+Examples of the shape only. They are invented; never copy them:
+- Keep: \"Wants the recommendation first, then the reasoning\" (said \"just tell me what to do first\" about a garden plan).
+- Keep: \"Asks where statistics come from before accepting them\" (asked for the source of two different figures).
+- Keep: \"Is writing a thesis on medieval trade routes\" (context; mentioned chapters and a deadline months out).
+- Drop: \"Asked how long to boil an egg\" (one task; says nothing about how they work).
+- Drop: \"Is comparing two phone models\" (a one-off lookup).
+- Drop: \"The assistant explained recursion\" (about the assistant).
+
+Most exchanges contain nothing that passes all four tests: return an empty observations list then.";
+
 /// [`build_extraction_prompt`] plus the assumptions put to this chat that
 /// no pass has judged yet ("TESTS IN FLIGHT"), for `test_results`.
 pub fn build_extraction_prompt_with_tests(known_beliefs: &str, tests: &[String], chunk: &str) -> Vec<Value> {
-    let system = "You are learning about the person in this conversation. \
-        Extract beliefs ABOUT THE USER -- their preferences, values, habits, \
-        constraints, identity. Never extract facts about the task, the tools, \
-        or the assistant. If the text says nothing about the user, return an \
-        empty observations list.";
+    let system = EXTRACTION_SYSTEM_PROMPT;
     vec![
         json!({"role": "system", "content": system}),
         json!({"role": "user", "content": format!(
@@ -308,9 +330,14 @@ pub async fn extract_and_record<S: StructuredChat>(
         let provenance = Provenance::parse(
             obs.get("provenance").and_then(|p| p.as_str()).unwrap_or("single_observation"),
         );
-        let layer = match obs.get("layer").and_then(|l| l.as_str()) {
-            Some("identity") => Layer::Context, // never written by extractor
-            Some("context") => Layer::Context,
+        let has_links = obs
+            .get("relates_to")
+            .and_then(|r| r.as_array())
+            .is_some_and(|a| !a.is_empty());
+        let layer = match (obs.get("layer").and_then(|l| l.as_str()), provenance, has_links) {
+            (_, Provenance::SingleObservation, _) => Layer::Conversation,
+            (_, Provenance::InferredPattern, false) => Layer::Conversation,
+            (Some("identity" | "context"), _, _) => Layer::Context, // extractor never writes Identity
             _ => Layer::Conversation,
         };
         // Required-with-empty-string-sentinel fields (see extraction_schema's
@@ -604,6 +631,264 @@ pub fn blob(embedding: &[f32]) -> Vec<u8> {
 }
 
 pub mod host;
+
+/// JSON schema for cross-session inductive synthesis of staged evidence.
+pub fn synthesis_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "patterns": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "statement": {
+                            "type": "string",
+                            "description": "One abstract, durable behavioral or epistemic trait induced across multiple staged observations (not a restatement of one single errand or lookup)."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["preference", "stance", "trait", "context"]
+                        },
+                        "domain": {
+                            "type": "string",
+                            "description": "Short topic label if topic-bound, or empty string if cross-cutting."
+                        },
+                        "evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Exact [id] values from STAGED OBSERVATIONS that jointly support this generalized pattern (must span >= 2 distinct sessions)."
+                        }
+                    },
+                    "required": ["statement", "kind", "domain", "evidence_ids"]
+                }
+            }
+        },
+        "required": ["patterns"]
+    })
+}
+
+/// Prompt asking the model to induce cross-session abstract behavioral traits
+/// from multiple single-session staged observations.
+pub fn build_synthesis_prompt(
+    known_beliefs: &str,
+    staged: &[crate::store::staged::StagedEvidence],
+) -> Vec<Value> {
+    let system = "You are synthesizing durable, cross-session traits about the user from \
+        single-session observations. Emit ONLY abstract behavioral, epistemic, or creative \
+        patterns supported by evidence from AT LEAST TWO distinct sessions. Ignore isolated \
+        lookups, transient errands, or one-off questions. Return an empty list if no true \
+        cross-session pattern exists.";
+    let mut lines = Vec::with_capacity(staged.len());
+    for item in staged {
+        let domain = item.domain.as_deref().filter(|d| !d.is_empty()).unwrap_or("general");
+        lines.push(format!(
+            "- [id={}] [session={}] [kind={}] [domain={}] {}",
+            item.id,
+            item.session_id,
+            item.kind.as_str(),
+            domain,
+            item.statement
+        ));
+    }
+    vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": format!(
+            "Already known about this user (do not duplicate):\n{}\n\n\
+             STAGED OBSERVATIONS across sessions:\n{}",
+            if known_beliefs.is_empty() { "(none)" } else { known_beliefs },
+            lines.join("\n")
+        )}),
+    ]
+}
+
+/// Settings key: the newest staged item's `created_at` the last synthesis
+/// attempt saw, so an unchanged pending set is not sent to the model again.
+const SYNTHESIS_SEEN_KEY: &str = "staged_synthesis_seen_through";
+
+/// Inductive synthesis over `staged_evidence`: expires items older than
+/// `STAGED_RETENTION_DAYS`, skips when fewer than 3 pending items span at
+/// least 2 distinct sessions or nothing was staged since the last attempt,
+/// and promotes model-proposed patterns verified here to span >= 2 sessions
+/// into `Layer::Context`. Only the items a written pattern cites are
+/// consumed: the rest stay pending, so evidence from one chat can still
+/// combine with a chat that comes later. Returns the patterns written.
+pub async fn synthesize_staged_evidence<S: StructuredChat>(
+    engine: &crate::engine::PathwayEngine,
+    chat: &S,
+) -> Result<usize> {
+    let db = &engine.db;
+    let now = chrono::Utc::now();
+    let _ = db
+        .expire_old_staged_evidence(
+            now - chrono::Duration::days(crate::consolidate::STAGED_RETENTION_DAYS),
+        )
+        .await?;
+
+    // Nothing new since the last attempt: the model already judged this set.
+    let newest = db.newest_pending_staged_at().await?;
+    let seen = db
+        .get_setting(SYNTHESIS_SEEN_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    if let (Some(n), Some(s)) = (newest, seen) {
+        if n <= s {
+            return Ok(0);
+        }
+    }
+
+    let pending = db.list_pending_staged_evidence(40).await?;
+    if pending.len() < 3 {
+        return Ok(0);
+    }
+    let distinct_sessions: std::collections::HashSet<&str> =
+        pending.iter().map(|s| s.session_id.as_str()).collect();
+    if distinct_sessions.len() < 2 {
+        return Ok(0);
+    }
+
+    let known = render_known_beliefs(db, &[], &engine.cfg.embedding.ollama_model).await?;
+    let prompt = build_synthesis_prompt(&known, &pending);
+    const STRUCTURED_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    let parsed = {
+        let _permit = engine
+            .chat_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|_| PathwayError::Internal("semaphore closed".into()))?;
+        tokio::time::timeout(
+            STRUCTURED_CHAT_TIMEOUT,
+            chat.structured_chat(prompt, &synthesis_schema()),
+        )
+        .await
+        .map_err(|_| PathwayError::Extract("synthesize_staged_evidence timed out".into()))?
+        .map_err(PathwayError::Extract)?
+    };
+
+    let by_id: std::collections::HashMap<&str, &crate::store::staged::StagedEvidence> =
+        pending.iter().map(|s| (s.id.as_str(), s)).collect();
+    let patterns = parsed
+        .get("patterns")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Recorded once the model has answered, so a failed call is retried.
+    if let Some(n) = newest {
+        let _ = db.set_setting(SYNTHESIS_SEEN_KEY, &n.to_rfc3339()).await;
+    }
+
+    let mut written = 0usize;
+    let mut consumed: Vec<String> = Vec::new();
+    for pat in patterns.into_iter().take(5) {
+        let statement = pat
+            .get("statement")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if statement.is_empty() {
+            continue;
+        }
+        let hash = crate::belief::synthesis::text_hash(statement);
+        if db.has_permanent_tombstone(&hash).await? {
+            continue;
+        }
+        let cited_ids: Vec<&str> = pat
+            .get("evidence_ids")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let cited_sessions: std::collections::HashSet<&str> = cited_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).map(|s| s.session_id.as_str()))
+            .collect();
+        if cited_sessions.len() < 2 {
+            continue;
+        }
+
+        let kind = pat
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(BeliefKind::parse)
+            .unwrap_or(BeliefKind::Trait);
+        let domain = pat
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let (embedding, semantic) = engine.embed.embed_with_space(statement).await;
+        // Tag with the space actually used (see `extract_and_record`): a hash
+        // fallback vector must never join the semantic pool under its name.
+        let model = if semantic {
+            engine.cfg.embedding.ollama_model.clone()
+        } else {
+            crate::config::HASH_EMBED_MODEL.to_string()
+        };
+        if let Some(belief_id) = crate::belief::synthesis::route_observation_with(
+            db,
+            statement,
+            &embedding,
+            &model,
+            Provenance::InferredPattern,
+            Layer::Context,
+            domain,
+            Some("cross-session synthesis"),
+            None,
+            None,
+            None,
+            now,
+            kind,
+        )
+        .await?
+        {
+            if let Ok(Some(existing)) = db.get_belief(&belief_id).await {
+                let target_sessions = existing.distinct_sessions.max(cited_sessions.len() as i64);
+                let target_support = existing.support_count.max(cited_ids.len() as i64);
+                let _ = db
+                    .update_belief(
+                        &belief_id,
+                        &BeliefPatch {
+                            distinct_sessions: Some(target_sessions),
+                            support_count: Some(target_support),
+                            ..Default::default()
+                        },
+                        now,
+                    )
+                    .await;
+            }
+            written += 1;
+            consumed.extend(
+                cited_ids
+                    .iter()
+                    .filter(|id| by_id.contains_key(*id))
+                    .map(|id| id.to_string()),
+            );
+        }
+    }
+
+    consumed.sort();
+    consumed.dedup();
+    let _ = db.mark_staged_synthesized(&consumed, now).await?;
+    if written > 0 {
+        let _ = db
+            .audit(
+                "synthesize_staged",
+                Some(&format!(
+                    "evaluated={} consumed={} synthesized={written}",
+                    pending.len(),
+                    consumed.len()
+                )),
+            )
+            .await;
+    }
+    Ok(written)
+}
 
 #[cfg(test)]
 mod tests {

@@ -171,6 +171,12 @@ pub async fn idle_sweep_with<C: SessionChat>(
             tracing::warn!("pathway consolidate failed for session {session_id}: {e}");
         }
     }
+    if learn_batch.is_some() {
+        let synth_chat = chat.for_background().await;
+        if let Err(e) = learn::synthesize_staged_evidence(engine, &synth_chat).await {
+            tracing::warn!("pathway staged synthesis failed: {e}");
+        }
+    }
     // Periodic maintenance (cheap; runs each sweep).
     let _ = crate::maintenance::run_maintenance_with(&engine.db, engine.cfg.recall.ewma_alpha).await;
     // Bound the per-session learn-lock map's growth (see

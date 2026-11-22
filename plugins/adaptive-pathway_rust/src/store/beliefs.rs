@@ -467,6 +467,16 @@ impl Db {
                 .bind(&sid)
                 .execute(&pool)
                 .await?;
+            // A forgotten chat's staged observations and directive telemetry
+            // go with it, or a later synthesis could still learn from it.
+            sqlx::query("DELETE FROM staged_evidence WHERE session_id = ?")
+                .bind(&sid)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM signal_feedback WHERE session_id = ?")
+                .bind(&sid)
+                .execute(&pool)
+                .await?;
             Ok(removed)
         })
         .await

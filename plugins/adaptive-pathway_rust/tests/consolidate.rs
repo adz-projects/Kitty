@@ -38,7 +38,7 @@ async fn consolidating_one_session_never_touches_another_sessions_conversation_b
     let db = Db::open_in_memory().await.unwrap();
 
     // A weak session-A belief that should be discarded by consolidation...
-    let weak_a = conversation_belief("weak-a", "session-a", 0.10, 1);
+    let weak_a = conversation_belief("weak-a", "session-a", 0.05, 1);
     // ...and a strong, promotion-eligible session-B belief that must survive
     // completely untouched by consolidating session A.
     let mut strong_b = conversation_belief("strong-b", "session-b", 0.90, 5);
