@@ -8,6 +8,13 @@ import { UploadIcon } from '@/components/icons/UploadIcon';
 import { CameraIcon } from '@/components/icons/CameraIcon';
 import { isAndroid } from '@/lib/platform';
 import { modelAcceptsImages } from '@/lib/vision_models';
+import {
+  completeSlashCommand,
+  isExactSlashCommand,
+  matchSlashCommands,
+  type SlashCommand,
+} from '@/lib/slashCommands';
+import { useEscapeLayer } from '@/hooks/useEscapeLayer';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
 const PASTE_THRESHOLD = 500;
@@ -63,6 +70,19 @@ export function Composer({
   // placeholder and forgotten on the three `disabled` attributes below.
   const readOnly = concluded || !!spectating;
   const [text, setText] = useState('');
+  // Slash-command suggestions: which one is highlighted, and the text they
+  // were dismissed for (Escape), so they stay closed until it changes.
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
+  const slashSuggestions = slashDismissedFor === text ? [] : matchSlashCommands(text);
+  const slashOpen = slashSuggestions.length > 0 && !readOnly;
+  const slashActive = Math.min(slashIndex, Math.max(0, slashSuggestions.length - 1));
+  useEscapeLayer(slashOpen, () => setSlashDismissedFor(text));
+  const chooseSlash = (command: SlashCommand) => {
+    setText(completeSlashCommand(command));
+    setSlashIndex(0);
+    ref.current?.focus();
+  };
   const ref = useRef<HTMLTextAreaElement>(null);
   const addPastedText = useChatStore((s) => s.addPastedText);
   const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
@@ -218,12 +238,32 @@ ${prefill}`
     }
   };
 
-  const debating = parseDebateCommand(text) !== null;
-  const critiquing = parseCritiqueCommand(text) !== null;
-  const researching = parseResearchCommand(text) !== null;
+  const debating = !slashOpen && parseDebateCommand(text) !== null;
+  const critiquing = !slashOpen && parseCritiqueCommand(text) !== null;
+  const researching = !slashOpen && parseResearchCommand(text) !== null;
 
   return (
     <div className="composer">
+      {slashOpen && (
+        <ul className="slash-menu" role="listbox" aria-label="Commands">
+          {slashSuggestions.map((c, i) => (
+            <li
+              key={c.name}
+              role="option"
+              aria-selected={i === slashActive}
+              className={i === slashActive ? 'slash-item active' : 'slash-item'}
+              // Keep focus in the textarea: a click must not blur it first.
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => setSlashIndex(i)}
+              onClick={() => chooseSlash(c)}
+            >
+              <span className="slash-name">/{c.name}</span>
+              {c.args && <span className="slash-args muted">{c.args}</span>}
+              <span className="slash-desc muted">{c.description}</span>
+            </li>
+          ))}
+        </ul>
+      )}
       {debating && (
         <div className="composer-hint" role="status">
           Debate: say who the personas are, how many rounds, and what the debate should examine.
@@ -286,13 +326,36 @@ ${prefill}`
               ? 'Chat concluded.'
               : DEFAULT_PLACEHOLDER
         }
+        role="combobox"
+        aria-expanded={slashOpen}
+        aria-autocomplete="list"
         onChange={(e) => {
           setText(e.target.value);
+          setSlashIndex(0);
           // Resize is coalesced into a rAF (see scheduleResize) so typing never
           // forces a synchronous reflow on the keystroke path.
           scheduleResize();
         }}
         onKeyDown={(e) => {
+          // The command menu, while open, takes the arrows, Tab and Enter.
+          // Enter completes a partly typed command; on a finished one (an
+          // exact `/compact`) it falls through and acts as usual.
+          if (slashOpen) {
+            const n = slashSuggestions.length;
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+              e.preventDefault();
+              setSlashIndex((slashActive + (e.key === 'ArrowDown' ? 1 : n - 1)) % n);
+              return;
+            }
+            if (
+              e.key === 'Tab' ||
+              (e.key === 'Enter' && !e.shiftKey && !isExactSlashCommand(text))
+            ) {
+              e.preventDefault();
+              chooseSlash(slashSuggestions[slashActive]);
+              return;
+            }
+          }
           // Enter sends on desktop (Shift+Enter for a newline). On Android the
           // on-screen keyboard's Return key should start a new paragraph like
           // any other text field — there's no Shift chord on a touch keyboard —
