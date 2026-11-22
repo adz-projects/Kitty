@@ -992,21 +992,25 @@ fn wrapup_persist_shape(text: &str, turn_tool_calls: &[ToolCall]) -> Value {
 /// empty-vector (weight-only, still-capped) selection rather than a failure.
 const AP_RECALL_EMBED_BUDGET_MS: u64 = 1500;
 
+enum BudgetOutcome<T> {
+    Done(T),
+    TimedOut,
+}
+
 /// Run one memory engine's recall within [`AP_RECALL_EMBED_BUDGET_MS`].
-/// `None` when it ran out of time, which is now logged: a turn that silently
-/// got no memory (recall queued behind a background job on the engine's one
-/// connection) looked exactly like a turn with nothing to recall.
+/// Returns `TimedOut` when it ran out of time, which is logged and surfaced
+/// in the UI Memory Inspector (`MemoryRecall` SSE).
 async fn recall_within_budget<T>(
     engine: &str,
     session_id: &str,
     fut: impl std::future::Future<Output = T>,
-) -> Option<T> {
+) -> BudgetOutcome<T> {
     let started = std::time::Instant::now();
     // A user is waiting on this turn: its embeddings go ahead of background
     // memory work from every app (`embed_priority`).
     let fut = crate::embed_priority::interactive(fut);
     match tokio::time::timeout(Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS), fut).await {
-        Ok(v) => Some(v),
+        Ok(v) => BudgetOutcome::Done(v),
         Err(_) => {
             tracing::warn!(
                 engine,
@@ -1014,7 +1018,7 @@ async fn recall_within_budget<T>(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "memory recall ran out of time; this turn has no {engine} memory"
             );
-            None
+            BudgetOutcome::TimedOut
         }
     }
 }
@@ -1699,6 +1703,10 @@ pub struct AgentLoop {
     /// at turn start and read at turn end to report which items the model
     /// used (`Engine::record_use`): reinforcement follows use, not display.
     memorabilia_shown: Option<(String, Vec<String>)>,
+    /// Which active Adaptive Pathway directives fired on the current turn
+    /// (`challenge`, `tension`, `worth_testing`, `fresh_angle`), read at turn
+    /// end to log whether the assistant reply engaged with them.
+    pathway_fired_signals: Vec<adaptive_pathway::engine::FiredSignal>,
 }
 
 /// One turn's tool gate: the catalog, the ungated tool list it filters, and the
@@ -1745,6 +1753,45 @@ impl TurnGate {
         }
         self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
         Some(st.clone())
+    }
+}
+
+struct PathwayRecallInfo {
+    ap_hints: Option<String>,
+    thought_seed: Option<String>,
+    challenge: Option<String>,
+    signals: Vec<adaptive_pathway::engine::FiredSignal>,
+    status: &'static str,
+}
+
+impl PathwayRecallInfo {
+    fn disabled() -> Self {
+        Self::empty("disabled")
+    }
+
+    /// Nothing injected, for `status`.
+    fn empty(status: &'static str) -> Self {
+        Self {
+            ap_hints: None,
+            thought_seed: None,
+            challenge: None,
+            signals: Vec::new(),
+            status,
+        }
+    }
+}
+
+struct MemorabiliaRecallInfo {
+    recalled: Option<memorabilia::recall::Recalled>,
+    status: &'static str,
+}
+
+impl MemorabiliaRecallInfo {
+    fn disabled() -> Self {
+        Self {
+            recalled: None,
+            status: "disabled",
+        }
     }
 }
 
@@ -1807,6 +1854,7 @@ impl AgentLoop {
             previous_user_cache: tokio::sync::OnceCell::new(),
             gate: None,
             memorabilia_shown: None,
+            pathway_fired_signals: Vec::new(),
         }
     }
 
@@ -2065,15 +2113,19 @@ impl AgentLoop {
         let delegate = is_delegate(&metadata);
         // Cleared before the lookups below borrow `self`.
         self.memorabilia_shown = None;
+        self.pathway_fired_signals.clear();
+        // Strip inlined attachments/file lists so both memory engines embed the
+        // user's actual question (and hit `SharedEmbedCache` with identical text).
+        let recall_query = crate::agent::memorabilia_harvest::strip_turn_attachments(user_message);
         let recall = async {
             match &resolved_provider_id {
-                _ if delegate => (None, None, None),
+                _ if delegate => PathwayRecallInfo::disabled(),
                 Some(pid) => {
                     let model = self.router.resolve_model(pid, model_override);
-                    self.pathway_recall(session_id, user_message, pid, &model)
+                    self.pathway_recall(session_id, &recall_query, pid, &model)
                         .await
                 }
-                None => (None, None, None),
+                None => PathwayRecallInfo::disabled(),
             }
         };
         // The tool gate asks its question alongside recall, so it adds no
@@ -2100,9 +2152,9 @@ impl AgentLoop {
         // signature changes. `None`+`None` is still zero prompt delta.
         let mem = async {
             match &resolved_provider_id {
-                _ if delegate => None,
-                Some(_) => self.memorabilia_recall(session_id, user_message).await,
-                None => None,
+                _ if delegate => MemorabiliaRecallInfo::disabled(),
+                Some(_) => self.memorabilia_recall(session_id, &recall_query).await,
+                None => MemorabiliaRecallInfo::disabled(),
             }
         };
         // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
@@ -2115,7 +2167,7 @@ impl AgentLoop {
             if delegate {
                 None
             } else {
-                self.preflight_recall(session_id, user_message, session.compacted_through_rowid)
+                self.preflight_recall(session_id, &recall_query, session.compacted_through_rowid)
                     .await
             }
         };
@@ -2123,7 +2175,7 @@ impl AgentLoop {
         // with its own budget, they could hold the request back several
         // seconds before it was sent.
         let recall_started = std::time::Instant::now();
-        let ((ap_hints, thought_seed, challenge), gate, mem_recalled, preflight_recalled) =
+        let (pw_info, gate, mem_info, preflight_recalled) =
             tokio::join!(recall, gate, mem, preflight);
         if let Some(gate) = gate {
             active_tools = gate.offered();
@@ -2131,7 +2183,20 @@ impl AgentLoop {
         }
         let active_tools = active_tools;
 
-        let mem_hints = mem_recalled.map(|r| {
+        let pathway_status = pw_info.status;
+        let pathway_trace_text = pw_info.ap_hints.clone().or_else(|| pw_info.thought_seed.clone());
+        self.pathway_fired_signals = pw_info.signals;
+        let ap_hints = pw_info.ap_hints;
+        let thought_seed = pw_info.thought_seed;
+        let challenge = pw_info.challenge;
+
+        let mem_status = mem_info.status;
+        let mem_item_count = mem_info
+            .recalled
+            .as_ref()
+            .map(|r| r.item_ids.len())
+            .unwrap_or(0);
+        let mem_hints = mem_info.recalled.map(|r| {
             self.memorabilia_shown = Some((r.query_event_id, r.item_ids));
             r.text
         });
@@ -2148,14 +2213,38 @@ impl AgentLoop {
                 let left = Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS)
                     .saturating_sub(recall_started.elapsed())
                     .max(Duration::from_millis(250));
-                crate::embed_priority::interactive(
+                match crate::embed_priority::interactive(
                     self.memorabilia_counterpoint(session_id, stance, left),
                 )
                 .await
+                {
+                    Some((text, item_id)) => {
+                        match &mut self.memorabilia_shown {
+                            Some((_, ids)) => {
+                                if !ids.contains(&item_id) {
+                                    ids.push(item_id);
+                                }
+                            }
+                            None => {
+                                // No recall this turn, so no query event to
+                                // hang the use on: a deterministic one for
+                                // this chat and message, so a retried turn
+                                // end cannot reinforce the same item twice.
+                                self.memorabilia_shown = Some((
+                                    counterpoint_event_id(session_id, user_message),
+                                    vec![item_id],
+                                ));
+                            }
+                        }
+                        Some(text)
+                    }
+                    None => None,
+                }
             }
             _ => None,
         };
-        let ap_hints = [ap_hints, mem_hints, counter]
+        let recall_duration_ms = recall_started.elapsed().as_millis() as i64;
+        let ap_hints = [ap_hints, mem_hints.clone(), counter.clone()]
             .into_iter()
             .flatten()
             .reduce(|a, b| format!("{a}\n\n{b}"));
@@ -2204,6 +2293,64 @@ impl AgentLoop {
         let thought_seed_msg =
             crate::agent::context::builder::strip_trailing_thought_seed(&mut messages);
 
+        // Assemble MemoryRecall trace for the UI Memory Inspector (kept separate
+        // from `_memory_block` so prompt-prefix determinism is unchanged).
+        let memory_trace = if !delegate
+            && (pathway_status != "disabled"
+                || mem_status != "disabled"
+                || preflight_recalled.is_some())
+        {
+            let block_injected = messages
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .is_some_and(|m| m.get("_memory_block").is_some());
+            let delta_unchanged = ap_hints.is_some() && !block_injected;
+            let overall_status = if block_injected
+                || thought_seed.is_some()
+                || preflight_recalled.is_some()
+            {
+                "injected"
+            } else if delta_unchanged {
+                "unchanged"
+            } else if pathway_status == "timed_out" || mem_status == "timed_out" {
+                "timed_out"
+            } else if pathway_status == "paused" || mem_status == "paused" {
+                "paused"
+            } else {
+                "empty"
+            };
+            let trace = serde_json::json!({
+                "status": overall_status,
+                "duration_ms": recall_duration_ms,
+                "pathway": {
+                    "status": pathway_status,
+                    "text": pathway_trace_text,
+                },
+                "memorabilia": {
+                    "status": mem_status,
+                    "item_count": mem_item_count,
+                    "text": mem_hints,
+                },
+                "counterpoint": counter,
+                "preflight": preflight_recalled,
+                "combined_block": ap_hints,
+            });
+            if let Ok(trace_str) = serde_json::to_string(&trace) {
+                if let Some(obj) = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                    .and_then(|m| m.as_object_mut())
+                {
+                    obj.insert("_memory_trace".to_string(), serde_json::Value::String(trace_str));
+                }
+            }
+            Some(trace)
+        } else {
+            None
+        };
+
         // Session title derivation (release-fixes item 12) moved to
         // `derive_and_set_title`, fired post-turn from `run_tool_loop` once
         // there's an actual exchange for the summarizer to work from,
@@ -2224,6 +2371,15 @@ impl AgentLoop {
             content: Some("active".into()),
             ..Default::default()
         });
+        if let Some(trace) = memory_trace {
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::MemoryRecall,
+                session_id: Some(session_id.to_string()),
+                duration_ms: Some(recall_duration_ms),
+                memory_recall: Some(trace),
+                ..Default::default()
+            });
+        }
 
         // Main tool-use loop
         self.run_tool_loop(
@@ -4529,8 +4685,15 @@ impl AgentLoop {
             chain: self.summarizer.clone(),
             provider_id: learn_provider_id,
             model: learn_provider_model,
+            learning: learn_app.clone().map(|a| (pool.clone(), a)),
         };
         let learn_session_id = session_id.to_string();
+        let fired_signals = std::mem::take(&mut self.pathway_fired_signals);
+        let turn_reply_text = if fired_signals.is_empty() {
+            String::new()
+        } else {
+            turn_answer_and_lookups(&messages).0
+        };
         // Kept back from the move below so the spawned task can still be
         // registered against the session that owns it.
         let learn_session_id_for_tracking = learn_session_id.clone();
@@ -4538,6 +4701,12 @@ impl AgentLoop {
             let Some(engine) = engine else { return };
             if engine.is_paused(&learn_session_id).await.unwrap_or(false) {
                 return;
+            }
+            for signal in &fired_signals {
+                let engaged = detect_signal_engagement(signal, &turn_reply_text);
+                engine
+                    .record_signal_engagement(&learn_session_id, signal.kind, engaged)
+                    .await;
             }
             // Bump `pathway.db`'s own per-session exchange counter --
             // `PathwayEngine::recall`'s `[Where I'm unsure]` cadence gate
@@ -4679,14 +4848,17 @@ impl AgentLoop {
         user_message: &str,
         provider_id: &str,
         model: &str,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    ) -> PathwayRecallInfo {
         let engine_owned = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.plugins.pathway_for(&app_id).await,
             None => None,
         };
         let Some(engine) = engine_owned.as_ref() else {
-            return (None, None, None);
+            return PathwayRecallInfo::disabled();
         };
+        if engine.is_paused(session_id).await.unwrap_or(false) {
+            return PathwayRecallInfo::empty("paused");
+        }
         let seed_eligible = self.router.supports_assistant_prefill(provider_id)
             && reasoning_models::supports_reasoning(model);
         // The chat's previous user message drives recall's trajectory
@@ -4694,19 +4866,37 @@ impl AgentLoop {
         // a function of what is stored). The current message is not saved
         // yet, so the latest stored user message is the previous one.
         let previous = self.previous_user_message(session_id).await;
-        let turn = recall_within_budget(
+        match recall_within_budget(
             "pathway",
             session_id,
             engine.recall_turn(session_id, user_message, previous.as_deref(), seed_eligible),
         )
         .await
-        .flatten();
-        let challenge = turn.as_ref().and_then(|t| t.challenge.clone());
-        let text = turn.map(|t| t.text);
-        if seed_eligible {
-            (None, text, challenge)
-        } else {
-            (text, None, challenge)
+        {
+            BudgetOutcome::TimedOut => PathwayRecallInfo::empty("timed_out"),
+            BudgetOutcome::Done(None) => PathwayRecallInfo::empty("empty"),
+            BudgetOutcome::Done(Some(turn)) => {
+                let challenge = turn.challenge;
+                let signals = turn.signals;
+                let text = turn.text;
+                if seed_eligible {
+                    PathwayRecallInfo {
+                        ap_hints: None,
+                        thought_seed: Some(text),
+                        challenge,
+                        signals,
+                        status: "seeded",
+                    }
+                } else {
+                    PathwayRecallInfo {
+                        ap_hints: Some(text),
+                        thought_seed: None,
+                        challenge,
+                        signals,
+                        status: "injected",
+                    }
+                }
+            }
         }
     }
 
@@ -4732,7 +4922,8 @@ impl AgentLoop {
         .flatten();
         let (content, format) = row?;
         let text = crate::agent::compaction::stored_content_as_text(content.as_deref()?, format.as_deref());
-        (!text.trim().is_empty()).then_some(text)
+        let cleaned = crate::agent::memorabilia_harvest::strip_turn_attachments(&text);
+        (!cleaned.trim().is_empty()).then_some(cleaned)
     }
 
     /// Memorabilia turn-start hook: a compact summary + index of relevant
@@ -4745,38 +4936,55 @@ impl AgentLoop {
         &self,
         session_id: &str,
         user_message: &str,
-    ) -> Option<memorabilia::recall::Recalled> {
+    ) -> MemorabiliaRecallInfo {
         let engine_owned = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
             None => None,
         };
-        let engine = engine_owned.as_ref()?;
+        let Some(engine) = engine_owned.as_ref() else {
+            return MemorabiliaRecallInfo::disabled();
+        };
         // Unified incognito: the chat-header "pause memory" control pauses
         // both engines. A paused session injects nothing (zero prompt delta).
         if engine.is_paused(session_id).await.unwrap_or(false) {
-            return None;
+            return MemorabiliaRecallInfo {
+                recalled: None,
+                status: "paused",
+            };
         }
         // The previous user message steers a follow-up's query (4.6).
         let previous = self.previous_user_message(session_id).await;
-        let recalled = recall_within_budget(
+        match recall_within_budget(
             "memorabilia",
             session_id,
             engine.recall_turn(user_message, previous.as_deref()),
         )
         .await
-        .flatten()?;
-        Some(recalled)
+        {
+            BudgetOutcome::TimedOut => MemorabiliaRecallInfo {
+                recalled: None,
+                status: "timed_out",
+            },
+            BudgetOutcome::Done(None) => MemorabiliaRecallInfo {
+                recalled: None,
+                status: "empty",
+            },
+            BudgetOutcome::Done(Some(recalled)) => MemorabiliaRecallInfo {
+                recalled: Some(recalled),
+                status: "injected",
+            },
+        }
     }
 
     /// A documented counter-view to `stance` from this app's Memorabilia, as
-    /// a block section, or `None` when it holds none (the model then gives
-    /// the other side from its own knowledge, as `[Worth challenging]` asks).
+    /// `(block_section, item_id)`, or `None` when it holds none (the model
+    /// then gives the other side from its own knowledge, as `[Worth challenging]` asks).
     async fn memorabilia_counterpoint(
         &self,
         session_id: &str,
         stance: &str,
         budget: Duration,
-    ) -> Option<String> {
+    ) -> Option<(String, String)> {
         let engine_owned = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
             None => None,
@@ -4789,11 +4997,115 @@ impl AgentLoop {
         .await
         .ok()
         .flatten()?;
-        Some(format!(
-            "[A documented counter-view]\nOn \"{stance}\", something the user read says otherwise: [{}] {} ({}).",
-            view.item_id, view.claim, view.citation
+        Some((
+            format!(
+                "[A documented counter-view]\nOn \"{stance}\", something the user read says otherwise: [{}] {} ({}).",
+                view.item_id, view.claim, view.citation
+            ),
+            view.item_id,
         ))
     }
+}
+
+/// The reinforcement event id for a counterpoint shown on a turn with no
+/// memorabilia recall: stable for one chat and message (the outbox dedupes on
+/// it), never colliding with a recall's own event id.
+fn counterpoint_event_id(session_id: &str, user_message: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{session_id}\u{0}{user_message}").as_bytes());
+    let hex: String = digest.iter().take(12).map(|b| format!("{b:02x}")).collect();
+    format!("counterpoint-{hex}")
+}
+
+/// Content words of `text` (lowercase, four letters or more, not a common
+/// function word), for the engagement check.
+fn content_words(text: &str) -> std::collections::HashSet<String> {
+    const COMMON: &[&str] = &[
+        "that", "this", "with", "from", "they", "their", "them", "have", "what", "when", "which",
+        "would", "could", "should", "about", "into", "than", "then", "also", "more", "most", "some",
+        "user", "they're", "there", "where", "been", "being", "will", "your", "just", "very", "over",
+        "like", "prefers", "prefer", "usually", "thinks",
+    ];
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|w| w.trim_matches('\'').to_lowercase())
+        .filter(|w| w.chars().count() >= 4 && !COMMON.contains(&w.as_str()))
+        .collect()
+}
+
+/// Approximate check of whether the reply engaged with a fired directive,
+/// for the uptake telemetry in Settings (`signal_feedback`). Two things must
+/// both hold: the reply uses the directive's kind of move (a counter-case, a
+/// tension named, an alternative offered), and it is about the same thing,
+/// sharing at least two content words with what the directive is about. A
+/// stray "however" or question mark no longer counts.
+fn detect_signal_engagement(
+    signal: &adaptive_pathway::engine::FiredSignal,
+    reply: &str,
+) -> bool {
+    let lower = reply.to_lowercase();
+    if lower.trim().is_empty() {
+        return false;
+    }
+    let cues: &[&str] = match signal.kind {
+        "challenge" => &[
+            "counter-argument",
+            "counterargument",
+            "counterpoint",
+            "the case against",
+            "argument against",
+            "on the other hand",
+            "the other side",
+            "push back",
+            "caveat",
+            "alternatively",
+            "an alternative",
+            "a different approach",
+        ],
+        "tension" => &[
+            "tension",
+            "on one hand",
+            "pull in different",
+            "conflict",
+            "which of these",
+            "which holds",
+            "trade-off",
+            "tradeoff",
+        ],
+        "worth_testing" => &[
+            "is that still",
+            "do you still",
+            "are you still",
+            "is that right",
+            "correct me",
+            "i'm assuming",
+            "i am assuming",
+            "check whether",
+        ],
+        "fresh_angle" => &[
+            "another angle",
+            "different angle",
+            "reframe",
+            "analogy",
+            "premise",
+            "from another perspective",
+            "different lens",
+            "step back",
+            "alternatively",
+        ],
+        _ => return false,
+    };
+    if !cues.iter().any(|c| lower.contains(c)) {
+        return false;
+    }
+    let about = content_words(&signal.about);
+    if about.is_empty() {
+        return true;
+    }
+    let said = content_words(reply);
+    about.intersection(&said).count() >= 2.min(about.len())
+}
+
+impl AgentLoop {
 
     /// Pre-flight memory recall hook, mirroring `pathway_recall`'s
     /// cache-aware tail-injection shape. Runs `agent::memory::preflight_recall`
@@ -7062,5 +7374,27 @@ mod specialists_toggle_tests {
             assert_eq!(withhold_specialist_tools(&mut tools, &meta), 0, "{meta}");
             assert_eq!(tools.len(), 2);
         }
+    }
+
+    #[test]
+    fn engagement_needs_the_move_and_the_topic() {
+        let signal = adaptive_pathway::engine::FiredSignal {
+            kind: "challenge",
+            about: "Thinks remote work beats the office.".into(),
+        };
+        assert!(detect_signal_engagement(
+            &signal,
+            "Here is the plan. On the other hand, the case against remote work is that office \
+             collaboration catches problems early."
+        ));
+        // The move without the topic, or the topic without the move.
+        assert!(!detect_signal_engagement(&signal, "On the other hand, the recipe needs salt."));
+        assert!(!detect_signal_engagement(&signal, "Remote work suits you; the office is optional."));
+        // A stray question mark is not engaging a tension.
+        let tension = adaptive_pathway::engine::FiredSignal {
+            kind: "tension",
+            about: "Earlier: \"likes short answers\". Also: \"asks for detail\".".into(),
+        };
+        assert!(!detect_signal_engagement(&tension, "Shall I continue?"));
     }
 }

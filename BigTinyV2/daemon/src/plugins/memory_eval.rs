@@ -19,17 +19,7 @@
 //! A legacy `.tflite` model takes `KITTY_LITERT_LIB` (`libLiteRt.dll`) and
 //! `KITTY_EMBED_TOKENIZER` (`tokenizer.json`) instead of the LiteRT-LM library.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
-
-use adaptive_pathway::embed::SemanticEmbedder;
-
-/// A fixed "now" for extraction bookkeeping, so runs are comparable.
-const NOW: &str = "2026-11-09T12:00:00Z";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
@@ -42,46 +32,61 @@ fn fixture(var: &str, file: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
 }
 
-/// The live embedder plus the space tag production uses for it, or `None`
-/// (with a note) when the model paths aren't set.
-fn live_embedder() -> Option<(Arc<dyn SemanticEmbedder>, String)> {
-    let Some(model) = env("KITTY_EMBED_MODEL") else {
-        eprintln!("memory_eval: set KITTY_EMBED_MODEL (and its runtime, see the module docs); skipping");
-        return None;
-    };
-    let stem = std::path::Path::new(&model)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".into());
-    // Same dispatch as production (`lib.rs`): a `.litertlm` bundle runs
-    // through LiteRT-LM's embedding API, a `.tflite` through raw TFLite.
-    let embedder: Arc<dyn SemanticEmbedder> = if model.to_ascii_lowercase().ends_with(".litertlm") {
-        let Some(lib) = env("KITTY_LITERT_LM_EMBED_LIB") else {
-            eprintln!("memory_eval: a .litertlm model needs KITTY_LITERT_LM_EMBED_LIB; skipping");
+#[cfg(feature = "litert-embed")]
+mod litert_recall {
+    use super::{env, fixture};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+
+    use adaptive_pathway::embed::SemanticEmbedder;
+
+    /// A fixed "now" for extraction bookkeeping, so runs are comparable.
+    const NOW: &str = "2026-11-09T12:00:00Z";
+
+    /// The live embedder plus the space tag production uses for it, or `None`
+    /// (with a note) when the model paths aren't set.
+    fn live_embedder() -> Option<(Arc<dyn SemanticEmbedder>, String)> {
+        let Some(model) = env("KITTY_EMBED_MODEL") else {
+            eprintln!("memory_eval: set KITTY_EMBED_MODEL (and its runtime, see the module docs); skipping");
             return None;
         };
-        Arc::new(crate::litert::LiteRtLmEmbedder::spawn(lib, model))
-    } else {
-        let (Some(lib), Some(tok)) = (env("KITTY_LITERT_LIB"), env("KITTY_EMBED_TOKENIZER")) else {
-            eprintln!("memory_eval: a .tflite model needs KITTY_LITERT_LIB and KITTY_EMBED_TOKENIZER; skipping");
-            return None;
+        let stem = std::path::Path::new(&model)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".into());
+        // Same dispatch as production (`lib.rs`): a `.litertlm` bundle runs
+        // through LiteRT-LM's embedding API, a `.tflite` through raw TFLite.
+        let embedder: Arc<dyn SemanticEmbedder> = if model.to_ascii_lowercase().ends_with(".litertlm") {
+            let Some(lib) = env("KITTY_LITERT_LM_EMBED_LIB") else {
+                eprintln!("memory_eval: a .litertlm model needs KITTY_LITERT_LM_EMBED_LIB; skipping");
+                return None;
+            };
+            Arc::new(crate::litert::LiteRtLmEmbedder::spawn(lib, model))
+        } else {
+            let (Some(lib), Some(tok)) = (env("KITTY_LITERT_LIB"), env("KITTY_EMBED_TOKENIZER")) else {
+                eprintln!("memory_eval: a .tflite model needs KITTY_LITERT_LIB and KITTY_EMBED_TOKENIZER; skipping");
+                return None;
+            };
+            Arc::new(crate::litert::LiteRtEmbedder::spawn(lib, model, tok))
         };
-        Arc::new(crate::litert::LiteRtEmbedder::spawn(lib, model, tok))
-    };
-    Some((embedder, format!("litert:{stem}")))
-}
-
-fn strict() -> bool {
-    env("MEMORY_EVAL_STRICT").as_deref() == Some("1")
-}
-
-fn rate(hit: usize, total: usize) -> String {
-    if total == 0 {
-        "n/a".into()
-    } else {
-        format!("{hit}/{total} ({:.0}%)", 100.0 * hit as f64 / total as f64)
+        Some((embedder, format!("litert:{stem}")))
     }
-}
+
+    fn strict() -> bool {
+        env("MEMORY_EVAL_STRICT").as_deref() == Some("1")
+    }
+
+    fn rate(hit: usize, total: usize) -> String {
+        if total == 0 {
+            "n/a".into()
+        } else {
+            format!("{hit}/{total} ({:.0}%)", 100.0 * hit as f64 / total as f64)
+        }
+    }
 
 // ---------------------------------------------------------------- pathway --
 
@@ -719,4 +724,216 @@ async fn memory_eval_relevance_floor() {
         }
     }
     sweep("memorabilia", &pairs, mx.cases.len());
+}
+} // mod litert_recall
+
+// -------------------------------------------------- end-to-end A/B eval --
+
+#[derive(Debug, Clone, Deserialize)]
+struct BehavioralAbCase {
+    id: String,
+    category: String,
+    prompt: String,
+    memory_block: String,
+    required_signals: Vec<Vec<String>>,
+    #[serde(default)]
+    forbidden_signals: Vec<String>,
+    #[serde(default = "default_weight")]
+    weight: f64,
+}
+
+fn default_weight() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone)]
+struct CaseRubricResult {
+    id: String,
+    category: String,
+    required_hits: usize,
+    required_total: usize,
+    forbidden_hits: usize,
+    score: f64,
+    weight: f64,
+}
+
+fn score_ab_response(case: &BehavioralAbCase, response: &str) -> CaseRubricResult {
+    let lower = response.to_lowercase();
+    let required_total = case.required_signals.len();
+    let required_hits = case
+        .required_signals
+        .iter()
+        .filter(|group| {
+            group
+                .iter()
+                .any(|kw| lower.contains(&kw.to_lowercase()))
+        })
+        .count();
+    let forbidden_hits = case
+        .forbidden_signals
+        .iter()
+        .filter(|kw| lower.contains(&kw.to_lowercase()))
+        .count();
+
+    let raw_ratio = if required_total == 0 {
+        1.0
+    } else {
+        required_hits as f64 / required_total as f64
+    };
+    let penalty = (forbidden_hits as f64) * 0.5;
+    let score = (raw_ratio - penalty).clamp(0.0, 1.0);
+    CaseRubricResult {
+        id: case.id.clone(),
+        category: case.category.clone(),
+        required_hits,
+        required_total,
+        forbidden_hits,
+        score,
+        weight: case.weight,
+    }
+}
+
+fn summarize_ab_report(baseline: &[CaseRubricResult], treatment: &[CaseRubricResult]) -> String {
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct CatAgg {
+        w_sum: f64,
+        a_sum: f64,
+        b_sum: f64,
+        n: usize,
+    }
+    let mut by_cat: BTreeMap<String, CatAgg> = BTreeMap::new();
+    let mut total = CatAgg::default();
+    let mut lines = vec![
+        "| Category | Case | A (No Memory) | B (With Memory) | Delta |".to_string(),
+        "|---|---|---|---|---|".to_string(),
+    ];
+    for (a, b) in baseline.iter().zip(treatment.iter()) {
+        lines.push(format!(
+            "| {} | {} | {:.2} ({}/{}, -{}) | {:.2} ({}/{}, -{}) | {:+.2} |",
+            a.category,
+            a.id,
+            a.score,
+            a.required_hits,
+            a.required_total,
+            a.forbidden_hits,
+            b.score,
+            b.required_hits,
+            b.required_total,
+            b.forbidden_hits,
+            b.score - a.score
+        ));
+        let entry = by_cat.entry(a.category.clone()).or_default();
+        entry.w_sum += a.weight;
+        entry.a_sum += a.score * a.weight;
+        entry.b_sum += b.score * b.weight;
+        entry.n += 1;
+
+        total.w_sum += a.weight;
+        total.a_sum += a.score * a.weight;
+        total.b_sum += b.score * b.weight;
+        total.n += 1;
+    }
+    lines.push(String::new());
+    lines.push("| Category | N | Mean A | Mean B | Mean Delta |".to_string());
+    lines.push("|---|---|---|---|---|".to_string());
+    for (cat, agg) in &by_cat {
+        let ma = if agg.w_sum > 0.0 { agg.a_sum / agg.w_sum } else { 0.0 };
+        let mb = if agg.w_sum > 0.0 { agg.b_sum / agg.w_sum } else { 0.0 };
+        lines.push(format!("| {cat} | {} | {ma:.3} | {mb:.3} | {:+.3} |", agg.n, mb - ma));
+    }
+    let ma = if total.w_sum > 0.0 { total.a_sum / total.w_sum } else { 0.0 };
+    let mb = if total.w_sum > 0.0 { total.b_sum / total.w_sum } else { 0.0 };
+    lines.push(format!("| **OVERALL** | **{}** | **{ma:.3}** | **{mb:.3}** | **{:.3}** |", total.n, mb - ma));
+    lines.join("\n")
+}
+
+#[test]
+fn behavioral_ab_fixture_and_scorer_sanity() {
+    let raw = fixture("MEMORY_EVAL_BEHAVIORAL_AB", "behavioral_ab_cases.json");
+    let cases: Vec<BehavioralAbCase> = serde_json::from_str(&raw).expect("valid A/B cases JSON");
+    assert_eq!(cases.len(), 16, "expected 16 A/B evaluation cases across 4 categories");
+
+    let mut categories: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &cases {
+        assert!(!c.required_signals.is_empty(), "case {} needs required_signals", c.id);
+        categories.insert(c.category.as_str());
+    }
+    assert_eq!(categories.len(), 4);
+
+    // Check scoring separates a memory-aligned response from a generic baseline.
+    let arxiv = cases.iter().find(|c| c.id == "pw_arxiv_sources").expect("arxiv case");
+    let base_res = score_ab_response(arxiv, "Check academic library portals and textbooks.");
+    let mem_res = score_ab_response(
+        arxiv,
+        "Look on arXiv for the latest empirical preprints and ablation benchmarks.",
+    );
+    assert!(
+        mem_res.score > base_res.score,
+        "aligned score ({:.2}) must exceed baseline ({:.2})",
+        mem_res.score,
+        base_res.score
+    );
+    let report = summarize_ab_report(&[base_res], &[mem_res]);
+    assert!(report.contains("OVERALL"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn memory_eval_behavioral_ab() {
+    let Some(base_url) = env("EVAL_BASE_URL") else {
+        eprintln!("memory_eval_behavioral_ab: set EVAL_BASE_URL, EVAL_MODEL (and optional EVAL_API_KEY); skipping");
+        return;
+    };
+    let model = env("EVAL_MODEL").expect("EVAL_MODEL required when EVAL_BASE_URL is set");
+    let api_key = env("EVAL_API_KEY").unwrap_or_default();
+    let cases: Vec<BehavioralAbCase> = serde_json::from_str(&fixture(
+        "MEMORY_EVAL_BEHAVIORAL_AB",
+        "behavioral_ab_cases.json",
+    ))
+    .expect("valid A/B cases JSON");
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let ask = |messages: Vec<serde_json::Value>| {
+        let client = &client;
+        let url = &url;
+        let model = &model;
+        let api_key = &api_key;
+        async move {
+            let mut req = client.post(url).json(&serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "temperature": 0.2,
+            }));
+            if !api_key.is_empty() {
+                req = req.bearer_auth(api_key);
+            }
+            let resp = req
+                .send()
+                .await
+                .expect("HTTP request to EVAL_BASE_URL")
+                .error_for_status()
+                .expect("non-success status from EVAL_BASE_URL");
+            let v: serde_json::Value = resp.json().await.expect("JSON completion response");
+            v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        }
+    };
+
+    let mut base_results = Vec::with_capacity(cases.len());
+    let mut mem_results = Vec::with_capacity(cases.len());
+    for c in &cases {
+        let a = ask(vec![serde_json::json!({"role": "user", "content": c.prompt})]).await;
+        let b = ask(vec![serde_json::json!({
+            "role": "user",
+            "content": format!("{}\n\n{}", c.memory_block, c.prompt)
+        })])
+        .await;
+        base_results.push(score_ab_response(c, &a));
+        mem_results.push(score_ab_response(c, &b));
+    }
+    println!("\n{}", summarize_ab_report(&base_results, &mem_results));
 }

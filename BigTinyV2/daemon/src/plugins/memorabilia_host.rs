@@ -83,16 +83,29 @@ impl memorabilia::traits::StructuredChat for SummarizerChatAdapter {
         schema: &Value,
     ) -> Result<Value, String> {
         // Read per call rather than at open: the user can change the default
-        // card while the instance is live.
+        // card or learning model while the instance is live.
         let app_default = crate::storage::apps::get_app(&self.pool, &self.app_id)
             .await
             .ok()
             .flatten()
             .and_then(|a| a.default_provider_id);
+        let choice = crate::agent::learning_model::get(&self.pool, &self.app_id).await;
+        let own = self.inner.app_provider(&self.app_id, app_default.as_deref());
         self.inner
-            .structured_chat_for_app(&self.app_id, app_default.as_deref(), messages, schema)
+            .structured_chat_learning(&choice, own.as_deref(), None, messages, schema, true)
             .await
     }
+}
+
+/// How long after a failed width probe the next open tries again.
+const PROBE_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// The shared embedder's resolution: settled once known (the model's width,
+/// or the hash embedder when there is no shared model at all), else when the
+/// last probe failed.
+struct ResolvedState {
+    settled: Option<(MemConfig, Arc<dyn memorabilia::traits::Embedder>)>,
+    last_failure: Option<std::time::Instant>,
 }
 
 /// One app's live memorabilia instance.
@@ -120,10 +133,11 @@ pub struct MemorabiliaHost {
     /// The extraction/maintenance chat (SummarizerChain), daemon-wide. Each
     /// instance wraps it in its own app-scoped `SummarizerChatAdapter`.
     chat: Arc<SummarizerChain>,
-    /// Memoized `(config, embedder)` resolved from `raw_embedder` on first use.
-    /// Sized to the embedder's live width once, then fixed for the process so
-    /// every app's `chunks_vec` table agrees on a dimension.
-    resolved: tokio::sync::OnceCell<(MemConfig, Arc<dyn memorabilia::traits::Embedder>)>,
+    /// Memoized `(config, embedder, semantic)` resolved from `raw_embedder`.
+    /// Permanently cached once semantic succeeds (or when `raw_embedder` is
+    /// `None`), and retries after `PROBE_RETRY_COOLDOWN` on transient probe
+    /// timeouts instead of permanently latching `HashEmbedder`.
+    resolved: Mutex<ResolvedState>,
     instances: Mutex<HashMap<String, Instance>>,
     /// Last engine-open failure per app, cleared on a successful open. Lets the
     /// routes say *why* memory is unavailable instead of reporting every failed
@@ -167,7 +181,10 @@ impl MemorabiliaHost {
             raw_embedder: embedder,
             embed_space,
             chat,
-            resolved: tokio::sync::OnceCell::new(),
+            resolved: Mutex::new(ResolvedState {
+                settled: None,
+                last_failure: None,
+            }),
             instances: Mutex::new(HashMap::new()),
             open_errors: Mutex::new(HashMap::new()),
             decider: std::sync::OnceLock::new(),
@@ -187,72 +204,88 @@ impl MemorabiliaHost {
         self.open_errors.lock().await.get(app_id).cloned()
     }
 
-    /// Resolve `(engine config, embedder)` once, lazily, memoized. The shared
-    /// embedder's live vector width is probed on the first engine open (during
-    /// a turn, when the model is warm) rather than at daemon startup, so a cold
-    /// LiteRt load never delays `/api/health`. The probe is time-bounded; on
-    /// timeout or failure it falls back to memorabilia's own lexical hash
-    /// embedder at the default width. The result is fixed for the process, so
-    /// every app's `chunks_vec` table is created with the same dimension.
-    async fn resolved(&self) -> &(MemConfig, Arc<dyn memorabilia::traits::Embedder>) {
-        self.resolved
-            .get_or_init(|| async {
-                let default_dim = MemConfig::default().embedding_dim;
-                let (dim, embedder, semantic): (
-                    usize,
-                    Arc<dyn memorabilia::traits::Embedder>,
-                    bool,
-                ) = match &self.raw_embedder {
-                    Some(e) => match tokio::time::timeout(
-                        Duration::from_secs(30),
-                        e.embed("dimension probe"),
-                    )
-                    .await
-                    {
-                        Ok(Some(v)) if !v.is_empty() => {
-                            let dim = v.len();
-                            (
-                                dim,
-                                Arc::new(SharedSemanticEmbedder {
-                                    inner: e.clone(),
-                                    dim,
-                                    tag: self.embed_space.clone(),
-                                }),
-                                true,
-                            )
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "memorabilia: embedder width probe failed/timed out; \
-                                 using the lexical hash fallback"
-                            );
-                            (
-                                default_dim,
-                                Arc::new(memorabilia::embed::HashEmbedder::new(default_dim)),
-                                false,
-                            )
-                        }
+    /// The engine config and embedder at width `dim` over the shared model.
+    /// Each call falls back to a hash vector *at the same width* while the
+    /// model is unavailable (`SharedSemanticEmbedder`), tagged so
+    /// `reembed_stale` upgrades it later.
+    fn semantic_at(
+        &self,
+        e: &Arc<dyn SemanticEmbedder>,
+        dim: usize,
+    ) -> (MemConfig, Arc<dyn memorabilia::traits::Embedder>) {
+        let mem_config = MemConfig {
+            embedding_dim: dim,
+            maintenance_tick_s: self.sweep_interval_s,
+            embedding_model: self.embed_space.clone(),
+            ..MemConfig::default()
+        };
+        let embedder: Arc<dyn memorabilia::traits::Embedder> = Arc::new(SharedSemanticEmbedder {
+            inner: e.clone(),
+            dim,
+            tag: self.embed_space.clone(),
+        });
+        (mem_config, embedder)
+    }
+
+    /// Resolve `(engine config, embedder)` lazily. The shared embedder's live
+    /// width is probed on the first engine open (during a turn, when the
+    /// model is warm) rather than at daemon startup, so a cold LiteRt load
+    /// never delays `/api/health`. Once it answers, the result is fixed for
+    /// the process. With no shared model at all, memorabilia's lexical hash
+    /// embedder is used, also fixed.
+    ///
+    /// A failed or timed-out probe returns `None` and is retried after
+    /// [`PROBE_RETRY_COOLDOWN`]. It used to settle on the hash embedder at
+    /// the default width for the whole process, so an engine opened in that
+    /// moment never used the real model, and a new database got an index of
+    /// the wrong width.
+    async fn resolved(&self) -> Option<(MemConfig, Arc<dyn memorabilia::traits::Embedder>)> {
+        let Some(e) = &self.raw_embedder else {
+            let mut guard = self.resolved.lock().await;
+            let settled = guard.settled.get_or_insert_with(|| {
+                let dim = MemConfig::default().embedding_dim;
+                (
+                    MemConfig {
+                        embedding_dim: dim,
+                        maintenance_tick_s: self.sweep_interval_s,
+                        ..MemConfig::default()
                     },
-                    None => (
-                        default_dim,
-                        Arc::new(memorabilia::embed::HashEmbedder::new(default_dim)),
-                        false,
-                    ),
-                };
-                let mut mem_config = MemConfig {
-                    embedding_dim: dim,
-                    maintenance_tick_s: self.sweep_interval_s,
-                    ..MemConfig::default()
-                };
-                // Tag the vector space with the shared model's identity only
-                // when the semantic embedder actually resolved; the hash
-                // fallback keeps its own per-call HASH_EMBED_MODEL tag.
-                if semantic {
-                    mem_config.embedding_model = self.embed_space.clone();
-                }
-                (mem_config, embedder)
-            })
-            .await
+                    Arc::new(memorabilia::embed::HashEmbedder::new(dim)),
+                )
+            });
+            return Some(settled.clone());
+        };
+        {
+            let guard = self.resolved.lock().await;
+            if let Some(settled) = &guard.settled {
+                return Some(settled.clone());
+            }
+            if guard
+                .last_failure
+                .is_some_and(|t| t.elapsed() < PROBE_RETRY_COOLDOWN)
+            {
+                return None;
+            }
+        }
+        let probe = tokio::time::timeout(Duration::from_secs(30), e.embed("dimension probe")).await;
+        let mut guard = self.resolved.lock().await;
+        match probe {
+            Ok(Some(v)) if !v.is_empty() => {
+                let settled = self.semantic_at(e, v.len());
+                guard.settled = Some(settled.clone());
+                guard.last_failure = None;
+                Some(settled)
+            }
+            _ => {
+                tracing::warn!(
+                    "memorabilia: embedding model width probe failed or timed out; \
+                     retrying in {}s",
+                    PROBE_RETRY_COOLDOWN.as_secs()
+                );
+                guard.last_failure = Some(std::time::Instant::now());
+                None
+            }
+        }
     }
 
     fn db_path(&self, app_id: &str) -> PathBuf {
@@ -288,11 +321,29 @@ impl MemorabiliaHost {
         }
 
         // Resolve the shared config/embedder before taking the write lock, so
-        // the one-time (bounded) width probe never holds it. Memoized, so this
-        // is instant on every open after the first.
-        let (mem_config, embedder) = {
-            let r = self.resolved().await;
-            (r.0.clone(), r.1.clone())
+        // the (bounded) width probe never holds it. Memoized once it answers.
+        // While the model is not answering, an existing database opens at its
+        // own index width (each embed falls back to a same-width hash vector
+        // until the model is back); a new one waits, rather than be created
+        // at a width the model will not have.
+        let (mem_config, embedder) = match self.resolved().await {
+            Some(r) => r,
+            None => {
+                let path = self.db_path(app_id);
+                let existing =
+                    memorabilia::store::Db::peek_vec_dim(&path.to_string_lossy()).await;
+                match (existing, &self.raw_embedder) {
+                    (Some(dim), Some(e)) => self.semantic_at(e, dim),
+                    _ => {
+                        self.open_errors.lock().await.insert(
+                            app_id.to_string(),
+                            "the embedding model is not answering yet; memory starts once it loads"
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                }
+            }
         };
 
         let mut instances = self.instances.lock().await;
@@ -455,14 +506,20 @@ impl MemorabiliaHost {
 /// every waiting candidate with every other) runs at most this often.
 const ALWAYS_PASS_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// Model-free light maintenance cadence (outbox, decay/archive, hard delete,
+/// plus 6h-gated corpus_mean/cut_log/promotion), independent of overnight passes.
+const LIGHT_MAINTENANCE_EVERY: Duration = Duration::from_secs(15 * 60);
+
 /// The per-instance background sweep, on the configured cadence until the
 /// instance is closed (docs/MEMORY_OVERNIGHT.md in Kitty):
 ///
 /// - every tick, captures that waited for the decision model are screened
 ///   (cheap: the model is remote);
+/// - every 15 minutes, model-free light maintenance runs (decay, archive,
+///   corpus_mean refresh, cut_log folding) even if overnight windows were missed;
 /// - the overnight pass (chunking, embedding, recurrence, extraction) runs
-///   when the app's window allows ([`crate::overnight::OvernightHub`]), or
-///   hourly for an app with no window.
+///   when the app's window or daytime idle micro-burst allows
+///   ([`crate::overnight::OvernightHub`]), or hourly for an app with no window.
 ///
 /// Not tied to any turn, so nothing aborts it but shutdown; missed ticks are
 /// skipped, so a long pass never overlaps itself.
@@ -473,10 +530,11 @@ async fn sweep(
     overnight: Option<Arc<crate::overnight::OvernightHub>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use crate::overnight::Permit;
+    use crate::overnight::{Permit, Trigger, IDLE_MICRO_MAX_CHUNKS};
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_s.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_always: Option<std::time::Instant> = None;
+    let mut last_light_maint: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -490,6 +548,19 @@ async fn sweep(
                 let (grounded, reinforced) = engine.drain_outbox_fully(&now).await;
                 if grounded + reinforced > 0 {
                     tracing::debug!(grounded, reinforced, "memorabilia: outbox drained");
+                }
+                if last_light_maint.is_none_or(|t| t.elapsed() >= LIGHT_MAINTENANCE_EVERY) {
+                    last_light_maint = Some(std::time::Instant::now());
+                    let m = engine.light_maintenance_tick(&now).await;
+                    if m.chunks_archived > 0 || m.heavy_ran {
+                        tracing::debug!(
+                            app_id,
+                            archived = m.chunks_archived,
+                            promoted = m.promoted,
+                            heavy = m.heavy_ran,
+                            "memorabilia: light maintenance tick"
+                        );
+                    }
                 }
                 let permit = match &overnight {
                     Some(h) => h.memory_permit(&app_id).await,
@@ -510,7 +581,14 @@ async fn sweep(
                     Permit::Now { trigger, deadline, watch_user } => {
                         let Some(hub) = overnight.clone() else { continue };
                         hub.pass_started(&app_id).await;
-                        let ctl = crate::overnight::PassGuard { hub, deadline, watch_user };
+                        let is_micro = trigger == Trigger::IdleMicro;
+                        let ctl = crate::overnight::PassGuard {
+                            hub,
+                            deadline,
+                            watch_user,
+                            max_extractions: is_micro.then_some(IDLE_MICRO_MAX_CHUNKS),
+                            skip_analogies: is_micro,
+                        };
                         (Some(trigger), engine.overnight_pass(&ctl).await)
                     }
                 };

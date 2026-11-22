@@ -377,6 +377,98 @@ impl AnthropicProvider {
             msg.clone()
         }
     }
+
+    /// Separate ONLY the leading contiguous run of `role: "system"` messages
+    /// for top-level `body["system"]`, preserving Anthropic's prompt-cache
+    /// prefix. Any non-leading `system` message (e.g. mid-conversation re-emitted
+    /// `memory_block`, Layer 7 `ap_hints`, Layer 7.5 `preflight_recalled`) is
+    /// folded into the top of the immediately following `user` message (matching
+    /// `openai_compat::hoist_all_system_messages` semantics without mutating
+    /// `body["system"]` every turn).
+    fn split_system_and_fold_mid_system(messages: &[Value]) -> (Vec<String>, Vec<Value>) {
+        let mut leading_system: Vec<String> = Vec::new();
+        let mut non_system: Vec<Value> = Vec::with_capacity(messages.len());
+        let mut in_leading = true;
+        let mut pending_sys: Vec<String> = Vec::new();
+
+        for msg in messages {
+            if msg["role"] == "system" {
+                let text = msg["content"].as_str().unwrap_or("");
+                if in_leading {
+                    leading_system.push(text.to_string());
+                } else if !text.trim().is_empty() {
+                    pending_sys.push(text.to_string());
+                }
+                continue;
+            }
+            in_leading = false;
+            if msg["role"] == "user" && !pending_sys.is_empty() {
+                let prefix = std::mem::take(&mut pending_sys).join("\n\n");
+                let mut m = msg.clone();
+                match &mut m["content"] {
+                    Value::String(s) => {
+                        *s = if s.is_empty() {
+                            prefix
+                        } else {
+                            format!("{prefix}\n\n{s}")
+                        };
+                    }
+                    Value::Array(arr) => {
+                        arr.insert(0, serde_json::json!({ "type": "text", "text": prefix }));
+                    }
+                    other => {
+                        *other = Value::String(prefix);
+                    }
+                }
+                non_system.push(m);
+            } else {
+                non_system.push(msg.clone());
+            }
+        }
+        if !pending_sys.is_empty() {
+            non_system.push(serde_json::json!({
+                "role": "user",
+                "content": pending_sys.join("\n\n"),
+            }));
+        }
+        (leading_system, non_system)
+    }
+
+    /// When `anthropic_cache_control` is enabled and there is history before
+    /// the current turn, place an ephemeral breakpoint on the last message
+    /// *before the current user message*: everything up to there is the same
+    /// on the next turn. The current user message (with this turn's memory
+    /// folded into it) and anything after it, such as a thought-seed prefill,
+    /// change every turn, so a breakpoint there would only pay for cache
+    /// writes nothing reads.
+    fn apply_history_cache_breakpoint(grouped: &mut [Value]) {
+        let Some(current) = grouped.iter().rposition(|m| m["role"] == "user") else {
+            return;
+        };
+        if current == 0 {
+            return;
+        }
+        let target = &mut grouped[current - 1];
+        match &mut target["content"] {
+            Value::String(s) => {
+                let text = s.clone();
+                target["content"] = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": { "type": "ephemeral" },
+                }]);
+            }
+            Value::Array(arr) => {
+                if let Some(last_obj) = arr.last_mut().and_then(|v| v.as_object_mut()) {
+                    last_obj.insert(
+                        "cache_control".into(),
+                        serde_json::json!({ "type": "ephemeral" }),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[async_trait]
@@ -420,12 +512,12 @@ impl Provider for AnthropicProvider {
         let model = self.resolve_model(model.as_deref());
         let url = format!("{}/v1/messages", self.config.base_url);
 
-        let (system, non_system): (Vec<Value>, Vec<Value>) = messages
-            .iter()
-            .map(Self::convert_tool_calls)
-            .partition(|m| m["role"] == "system");
-
-        let grouped = Self::group_tool_results(&non_system);
+        let converted_msgs: Vec<Value> = messages.iter().map(Self::convert_tool_calls).collect();
+        let (leading_system, non_system) = Self::split_system_and_fold_mid_system(&converted_msgs);
+        let mut grouped = Self::group_tool_results(&non_system);
+        if self.cache.anthropic_cache_control {
+            Self::apply_history_cache_breakpoint(&mut grouped);
+        }
 
         // Clamp max_tokens to a sane range before it hits the wire: a
         // configured 0/negative (or a huge over-limit value) is answered with
@@ -512,19 +604,13 @@ impl Provider for AnthropicProvider {
             (thinking_budget.is_some(), body)
         };
 
-        if !system.is_empty() {
-            // Context building layers up to 5 separate system messages
-            // (persona, session override, writable-dir hint, anchored first
-            // message, consolidated memory — see
-            // `agent/context/builder.rs`). Anthropic's API takes a single
-            // `system` string, so all of them need to survive here, not
-            // just the first — keeping only `system[0]` silently dropped
-            // every layer after the base persona on every Anthropic turn.
-            let joined = system
-                .iter()
-                .filter_map(|m| m["content"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
+        if !leading_system.is_empty() {
+            // Context building layers stable head system messages (persona,
+            // session override, writable-dir hint, anchored first message,
+            // consolidated memory) before any conversation turn. Mid-conversation
+            // and tail system blocks were folded into user messages above so
+            // `body["system"]` stays byte-identical across turns.
+            let joined = leading_system.join("\n\n");
             body["system"] = if self.cache.anthropic_cache_control {
                 // A single `cache_control` breakpoint on the (whole,
                 // already-joined) system block caches everything upstream of
@@ -1887,5 +1973,61 @@ mod sse_tests {
         let converted = AnthropicProvider::tools_to_anthropic(&[nameless, good]);
         assert_eq!(converted.len(), 1, "the usable tool survives");
         assert_eq!(converted[0]["name"], "ok");
+    }
+
+    #[test]
+    fn leading_system_hoisted_mid_conversation_system_folded_into_user() {
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "persona"}),
+            serde_json::json!({"role": "system", "content": "memory summary"}),
+            serde_json::json!({"role": "user", "content": "turn 1"}),
+            serde_json::json!({"role": "assistant", "content": "reply 1"}),
+            serde_json::json!({"role": "system", "content": "[Working assumptions about you]\n- Reads ArXiv"}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "turn 2"}]}),
+        ];
+        let (leading, non_system) = AnthropicProvider::split_system_and_fold_mid_system(&msgs);
+        assert_eq!(leading, vec!["persona", "memory summary"]);
+        assert_eq!(non_system.len(), 3);
+        assert_eq!(non_system[0]["content"], "turn 1");
+        assert_eq!(non_system[1]["content"], "reply 1");
+        let blocks = non_system[2]["content"].as_array().expect("array user content preserved");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "[Working assumptions about you]\n- Reads ArXiv");
+        assert_eq!(blocks[1]["text"], "turn 2");
+    }
+
+    #[test]
+    fn anthropic_cache_control_marks_stable_history_breakpoint() {
+        let mut short = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        AnthropicProvider::apply_history_cache_breakpoint(&mut short);
+        assert_eq!(short[0]["content"], "hi", "single message gets no history breakpoint");
+
+        let mut multi = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "q2"}),
+        ];
+        AnthropicProvider::apply_history_cache_breakpoint(&mut multi);
+        assert_eq!(
+            multi[1]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(multi[2]["content"], "q2");
+
+        // A trailing prefill (thought seed) does not move the breakpoint onto
+        // the current user turn.
+        let mut seeded = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "q2"}),
+            serde_json::json!({"role": "assistant", "content": "<think>seed"}),
+        ];
+        AnthropicProvider::apply_history_cache_breakpoint(&mut seeded);
+        assert_eq!(
+            seeded[1]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        assert_eq!(seeded[2]["content"], "q2");
+        assert_eq!(seeded[3]["content"], "<think>seed");
     }
 }

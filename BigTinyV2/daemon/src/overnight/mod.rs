@@ -43,6 +43,26 @@ pub const AWAKE_LEASE: Duration = Duration::from_secs(3 * 60);
 /// Pathway sessions learned per sweep tick inside the window (the daytime
 /// default is the pathway sweep's own `IDLE_SWEEP_BATCH`).
 pub const NIGHT_LEARN_BATCH: usize = 10;
+/// Daytime micro-burst: runs when idle this long on mains power outside the window.
+pub const IDLE_MICRO_AFTER: Duration = Duration::from_secs(7 * 60);
+/// Minimum cooldown between daytime Memorabilia micro-bursts.
+pub const IDLE_MICRO_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// Maximum duration of one daytime micro-burst.
+pub const IDLE_MICRO_BURST: Duration = Duration::from_secs(5 * 60);
+/// Maximum Memorabilia chunks extracted per daytime micro-burst.
+pub const IDLE_MICRO_MAX_CHUNKS: usize = 2;
+/// Adaptive Pathway sessions learned per daytime micro-burst.
+pub const IDLE_MICRO_PATHWAY_BATCH: usize = 1;
+/// How long one CPU/GPU load sample averages over.
+const LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
+/// How long a load verdict is reused before the machine is sampled again.
+const LOAD_SAMPLE_TTL: Duration = Duration::from_secs(60);
+/// Minimum cooldown between daytime Adaptive Pathway micro-bursts.
+pub const IDLE_MICRO_PATHWAY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+fn default_true() -> bool {
+    true
+}
 
 /// An app's settings, as stored and as PUT.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +75,9 @@ pub struct OvernightConfig {
     pub end: String,
     /// Move adaptive-pathway's learning into the window as well.
     pub pathway: bool,
+    /// Run small bounded micro-batches during short daytime idle periods on AC power.
+    #[serde(default = "default_true")]
+    pub idle_micro: bool,
 }
 
 impl Default for OvernightConfig {
@@ -64,6 +87,7 @@ impl Default for OvernightConfig {
             start: "00:00".into(),
             end: "05:00".into(),
             pathway: true,
+            idle_micro: true,
         }
     }
 }
@@ -107,6 +131,7 @@ pub enum Trigger {
     Window,
     CatchUp,
     RunNow,
+    IdleMicro,
 }
 
 /// The answer to "may memorabilia work now?".
@@ -135,6 +160,12 @@ pub struct Situation {
     /// When the settings were first saved: a catch-up is never due before a
     /// window could have run.
     pub configured_at: Option<DateTime<Utc>>,
+    /// When the last daytime idle micro-burst ended for this app.
+    pub last_micro: Option<DateTime<Utc>>,
+    /// Something else is loading the CPU or GPU heavily (a build, render or
+    /// game left running): daytime passes wait. Only measured when a daytime
+    /// pass could otherwise start.
+    pub busy: bool,
 }
 
 fn idle_at_least(idle: Option<Duration>, d: Duration) -> bool {
@@ -189,11 +220,31 @@ pub fn decide(cfg: Option<&OvernightConfig>, s: &Situation) -> (Permit, Option<D
     }
     let reference = s.last_finished.or(s.configured_at);
     let due = reference.is_some_and(|r| s.utc_now - r > CATCH_UP_AFTER);
-    if due && idle_at_least(s.idle, CATCH_UP_IDLE) && s.on_ac != Some(false) {
+    if due && idle_at_least(s.idle, CATCH_UP_IDLE) && s.on_ac != Some(false) && !s.busy {
         let until = s.utc_now + chrono::Duration::from_std(BURST).unwrap_or_default();
         return (
             Permit::Now {
                 trigger: Trigger::CatchUp,
+                deadline: to_instant(until),
+                watch_user: true,
+            },
+            None,
+        );
+    }
+    let micro_cooldown = chrono::Duration::from_std(IDLE_MICRO_COOLDOWN).unwrap_or_default();
+    let micro_ready = s
+        .last_micro
+        .is_none_or(|t| s.utc_now - t >= micro_cooldown);
+    if cfg.idle_micro
+        && micro_ready
+        && idle_at_least(s.idle, IDLE_MICRO_AFTER)
+        && s.on_ac != Some(false)
+        && !s.busy
+    {
+        let until = s.utc_now + chrono::Duration::from_std(IDLE_MICRO_BURST).unwrap_or_default();
+        return (
+            Permit::Now {
+                trigger: Trigger::IdleMicro,
                 deadline: to_instant(until),
                 watch_user: true,
             },
@@ -234,6 +285,11 @@ pub struct OvernightHub {
     pool: SqlitePool,
     run_now: Mutex<HashMap<String, DateTime<Utc>>>,
     running: Mutex<HashMap<String, bool>>,
+    last_micro: Mutex<HashMap<String, DateTime<Utc>>>,
+    last_pathway_micro: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The last CPU/GPU load verdict and when it was taken (shared by every
+    /// app and both engines, so the machine is sampled at most this often).
+    load: tokio::sync::Mutex<Option<(Instant, bool)>>,
     awake: power::KeepAwake,
 }
 
@@ -243,6 +299,9 @@ impl OvernightHub {
             pool,
             run_now: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
+            last_micro: Mutex::new(HashMap::new()),
+            last_pathway_micro: Mutex::new(HashMap::new()),
+            load: tokio::sync::Mutex::new(None),
             awake: power::KeepAwake::default(),
         })
     }
@@ -312,15 +371,54 @@ impl OvernightHub {
         .await
         .ok()
         .flatten();
+        let last_micro = self
+            .last_micro
+            .lock()
+            .ok()
+            .and_then(|m| m.get(app_id).copied());
+        let idle = power::idle_for();
+        // The load is sampled (a second, off the async threads) only when a
+        // daytime pass could otherwise start: the user has been away long
+        // enough.
+        let busy = if idle_at_least(idle, IDLE_MICRO_AFTER.min(CATCH_UP_IDLE)) {
+            self.machine_busy().await
+        } else {
+            false
+        };
         Situation {
             local_now: Local::now().naive_local(),
             utc_now: Utc::now(),
-            idle: power::idle_for(),
+            idle,
             on_ac: power::on_ac_power(),
+            busy,
             run_now_until: self.run_now_until(app_id),
             last_finished: parse_ts(row.and_then(|r| r.last_finished.as_deref())),
             configured_at: parse_ts(configured_at.as_deref()),
+            last_micro,
         }
+    }
+
+    /// Whether something else is loading the machine, cached for
+    /// [`LOAD_SAMPLE_TTL`].
+    async fn machine_busy(&self) -> bool {
+        let mut cached = self.load.lock().await;
+        if let Some((at, busy)) = *cached {
+            if at.elapsed() < LOAD_SAMPLE_TTL {
+                return busy;
+            }
+        }
+        let busy = tokio::task::spawn_blocking(|| {
+            let (cpu, gpu) = power::load_sample(LOAD_SAMPLE_WINDOW);
+            let busy = power::is_busy(cpu, gpu);
+            if busy {
+                tracing::debug!(?cpu, ?gpu, "overnight: machine busy; daytime learning waits");
+            }
+            busy
+        })
+        .await
+        .unwrap_or(false);
+        *cached = Some((Instant::now(), busy));
+        busy
     }
 
     /// May memorabilia's pass run for `app_id` now?
@@ -333,7 +431,7 @@ impl OvernightHub {
 
     /// How many pathway sessions may learn this tick for `app_id`: the
     /// default batch without settings, the night batch inside a permit,
-    /// `None` outside it.
+    /// `1` on an idle daytime micro-burst, `None` outside it.
     pub async fn pathway_batch(&self, app_id: &str) -> Option<usize> {
         let row = self.row(app_id).await;
         let cfg: Option<OvernightConfig> =
@@ -347,6 +445,15 @@ impl OvernightHub {
         let s = self.situation(app_id, row.as_ref()).await;
         let in_window = cfg.window_at(s.local_now).is_some() && idle_at_least(s.idle, WINDOW_IDLE);
         match decide(Some(&cfg), &s).0 {
+            Permit::Now { trigger: Trigger::IdleMicro, .. } => {
+                let cooldown = chrono::Duration::from_std(IDLE_MICRO_PATHWAY_COOLDOWN).unwrap_or_default();
+                let mut map = self.last_pathway_micro.lock().ok()?;
+                if map.get(app_id).is_some_and(|t| s.utc_now - *t < cooldown) {
+                    return None;
+                }
+                map.insert(app_id.to_string(), s.utc_now);
+                Some(IDLE_MICRO_PATHWAY_BATCH)
+            }
             Permit::Now { .. } => Some(NIGHT_LEARN_BATCH),
             _ if in_window => Some(NIGHT_LEARN_BATCH),
             _ => None,
@@ -371,7 +478,14 @@ impl OvernightHub {
         if let Ok(mut m) = self.running.lock() {
             m.remove(app_id);
         }
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let now_dt = Utc::now();
+        let now = now_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        if trigger == Some(Trigger::IdleMicro) {
+            if let Ok(mut m) = self.last_micro.lock() {
+                m.insert(app_id.to_string(), now_dt);
+            }
+            return;
+        }
         let mut report = report.clone();
         if let (Some(obj), Some(t)) = (report.as_object_mut(), trigger) {
             obj.insert("trigger".into(), serde_json::json!(t));
@@ -420,6 +534,8 @@ pub struct PassGuard {
     pub hub: Arc<OvernightHub>,
     pub deadline: Instant,
     pub watch_user: bool,
+    pub max_extractions: Option<usize>,
+    pub skip_analogies: bool,
 }
 
 impl memorabilia::learn::overnight::PassControl for PassGuard {
@@ -436,6 +552,14 @@ impl memorabilia::learn::overnight::PassControl for PassGuard {
 
     fn now(&self) -> String {
         Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    fn max_extractions(&self) -> Option<usize> {
+        self.max_extractions
+    }
+
+    fn skip_analogies(&self) -> bool {
+        self.skip_analogies
     }
 }
 
@@ -482,6 +606,8 @@ mod tests {
             run_now_until: None,
             last_finished: None,
             configured_at: Some(utc - chrono::Duration::hours(1)),
+            last_micro: None,
+            busy: false,
         }
     }
 
@@ -528,7 +654,7 @@ mod tests {
 
     #[test]
     fn daytime_catch_up_needs_a_stale_run_idle_and_mains() {
-        let c = OvernightConfig::default();
+        let c = OvernightConfig { idle_micro: false, ..Default::default() };
         let mut s = situation(at(14, 0));
         assert_eq!(decide(Some(&c), &s).0, Permit::NotNow, "configured an hour ago");
         s.last_finished = Some(s.utc_now - chrono::Duration::hours(40));
@@ -537,6 +663,37 @@ mod tests {
         assert_eq!(decide(Some(&c), &s).0, Permit::NotNow);
         s.on_ac = Some(true);
         s.idle = Some(Duration::from_secs(5 * 60));
+        assert_eq!(decide(Some(&c), &s).0, Permit::NotNow);
+    }
+
+    #[test]
+    fn idle_micro_runs_when_idle_on_ac_and_respects_cooldown() {
+        let c = OvernightConfig::default();
+        let mut s = situation(at(14, 0));
+        // Idle 1h on AC -> IdleMicro triggers.
+        assert!(matches!(
+            decide(Some(&c), &s).0,
+            Permit::Now { trigger: Trigger::IdleMicro, watch_user: true, .. }
+        ));
+        // Below 7m idle -> NotNow.
+        s.idle = Some(Duration::from_secs(4 * 60));
+        assert_eq!(decide(Some(&c), &s).0, Permit::NotNow);
+        // On battery -> NotNow.
+        s.idle = Some(Duration::from_secs(15 * 60));
+        s.on_ac = Some(false);
+        assert_eq!(decide(Some(&c), &s).0, Permit::NotNow);
+        // Within 30m cooldown -> NotNow.
+        s.on_ac = Some(true);
+        s.last_micro = Some(s.utc_now - chrono::Duration::minutes(10));
+        assert_eq!(decide(Some(&c), &s).0, Permit::NotNow);
+        // Past 30m cooldown -> triggers again.
+        s.last_micro = Some(s.utc_now - chrono::Duration::minutes(35));
+        assert!(matches!(
+            decide(Some(&c), &s).0,
+            Permit::Now { trigger: Trigger::IdleMicro, .. }
+        ));
+        // Something else loading the machine -> waits.
+        s.busy = true;
         assert_eq!(decide(Some(&c), &s).0, Permit::NotNow);
     }
 
@@ -572,5 +729,13 @@ mod tests {
         assert!(st.last_finished.is_some());
         assert_eq!(st.last_report.unwrap()["chunks_promoted"], 2);
         assert!(!st.running);
+
+        // IdleMicro must not overwrite last_finished or last_report.
+        let prev_finished = st.last_finished.clone();
+        hub.pass_ended("kitty", Some(Trigger::IdleMicro), &serde_json::json!({"chunks_promoted": 99}), true)
+            .await;
+        let st2 = hub.status("kitty").await;
+        assert_eq!(st2.last_finished, prev_finished);
+        assert_eq!(st2.last_report.unwrap()["chunks_promoted"], 2);
     }
 }

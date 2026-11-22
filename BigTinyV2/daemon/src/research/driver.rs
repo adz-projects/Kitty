@@ -1784,6 +1784,7 @@ async fn append_assistant_message(pool: &SqlitePool, chat: &str, text: &str) -> 
         provider_id: None,
         model: None,
         memory_block: None,
+        memory_trace: None,
     };
     messages::save_messages(pool, chat, &[row])
         .await

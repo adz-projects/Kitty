@@ -1129,6 +1129,7 @@ mod tests {
                 provider_id: None,
                 model: None,
                 memory_block: None,
+                memory_trace: None,
             },
             messages::MessageRow {
                 rowid: 0,
@@ -1145,6 +1146,7 @@ mod tests {
                 provider_id: None,
                 model: None,
                 memory_block: None,
+                memory_trace: None,
             },
         ];
         messages::save_messages(&pool, "msg-session-1", &msgs)

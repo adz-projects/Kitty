@@ -279,6 +279,7 @@ mod tests {
             provider_id: None,
             model: None,
             memory_block: None,
+            memory_trace: None,
         }
     }
 

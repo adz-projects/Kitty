@@ -32,6 +32,10 @@ pub enum SSEEventType {
     /// | `failed` | `cancelled`), and `tool_args` the detail: turn, wave,
     /// budget, counts, coverage, tokens, and the step sessions.
     ResearchProgress,
+    /// Turn-start memory recall diagnostics (Memorabilia, Adaptive Pathway,
+    /// Counterpoint, Preflight), persisted in `messages.memory_trace` and
+    /// emitted on the turn's SSE stream for the UI Memory Inspector.
+    MemoryRecall,
 }
 
 /// Wire-format event pushed over SSE from the agent loop to the frontend.
@@ -112,6 +116,9 @@ pub struct SSEEvent {
     /// On `ResearchProgress`: the research run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub research_id: Option<String>,
+    /// On `MemoryRecall`: structured recall trace (statuses, items, text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_recall: Option<serde_json::Value>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -185,6 +192,7 @@ impl Default for SSEEvent {
             from_provider_id: None,
             schedule_id: None,
             research_id: None,
+            memory_recall: None,
         }
     }
 }

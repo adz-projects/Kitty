@@ -481,6 +481,28 @@ inside the session's allowed folders, its shell command does not match
 `shell_sensitive_pattern`, and the app's decision-model shell screen (if on)
 does not flag it. Anything else pauses as before.
 
+## Memory learning model (2.9.0)
+
+`GET /api/apps/me/learning-model` → `{learning_model | null}` (`null` means
+`auto`). `PUT` one of `{"kind": "auto"}` (the local helper model, else the
+chat's own provider), `{"kind": "chat"}` (the chat's own provider first, the
+helper model only if it fails) or `{"kind": "provider", "provider_id",
+"model"?}` (one of the app's provider rows, optionally with a model override;
+400 on an empty id). `DELETE` returns to `auto`. Applies to adaptive-pathway's
+extraction and cross-session synthesis and to memorabilia's extraction, read
+per call. A chosen provider that fails falls back to `auto`, so learning never
+stops on a broken choice. A pass about no one chat (synthesis) uses the app's
+own provider, never another app's.
+
+## Overnight learning: daytime passes (2.9.0)
+
+`/api/apps/me/overnight` settings gain `idle_micro` (default `true`): outside
+the window, after 7 minutes idle on mains power, a short bounded pass runs (two
+memorabilia extractions, one pathway session, no analogy pass), at most every
+30 minutes per app. Daytime passes (this and the catch-up) also wait while
+something else loads the machine: CPU at or above 50%, or (Windows) the GPU's
+3D engines at or above 40%, sampled over a second and reused for a minute.
+
 ## Decision model
 
 An app may point the engine at a **decision model**: a small classifier that

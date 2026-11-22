@@ -16,11 +16,14 @@
 //! on every target, not only the one it ships the OS calls for.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(not(windows))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current wall-clock time in microseconds since the Unix epoch — the unit
 /// logind reports `IdleSinceHint` in. `0` if the clock is before the epoch
 /// (never, in practice), which makes [`idle_from_logind`] report no idle.
+#[cfg(not(windows))]
 fn now_realtime_usec() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -33,6 +36,7 @@ fn now_realtime_usec() -> u64 {
 /// microsecond realtime timestamp the idle began. `no` → zero (active); `yes`
 /// → now − since; anything else, or a missing timestamp when idle, → `None`
 /// (the caller then counts the host as "away", so the window still bounds it).
+#[cfg(any(not(windows), test))]
 fn idle_from_logind(idle_hint: &str, idle_since_usec: Option<u64>, now_usec: u64) -> Option<Duration> {
     match idle_hint.trim() {
         "no" => Some(Duration::ZERO),
@@ -46,6 +50,7 @@ fn idle_from_logind(idle_hint: &str, idle_since_usec: Option<u64>, now_usec: u64
 /// offline means not on AC. With no mains supply at all (a typical desktop
 /// exposes none) the answer is unknown — never guessed from a battery alone,
 /// since "no mains entry" does not mean "on battery".
+#[cfg(any(not(windows), test))]
 fn ac_from_supplies(saw_mains: bool, mains_online: bool) -> Option<bool> {
     if saw_mains {
         Some(mains_online)
@@ -131,6 +136,25 @@ impl KeepAwake {
     }
 }
 
+/// CPU load (all cores) at or above which the machine counts as busy.
+pub const BUSY_CPU: f64 = 0.50;
+/// GPU 3D-engine load at or above which the machine counts as busy.
+pub const BUSY_GPU: f64 = 0.40;
+
+/// CPU and GPU utilisation, each `0.0..=1.0`, averaged over `window`
+/// (blocking: the caller sleeps through it). `None` for a figure the OS
+/// cannot give; GPU load is read on Windows only.
+pub fn load_sample(window: Duration) -> (Option<f64>, Option<f64>) {
+    imp::load_sample(window)
+}
+
+/// Whether something else is using the machine heavily (a build, render,
+/// download or game running while the user is away). An unknown figure
+/// never counts as busy.
+pub fn is_busy(cpu: Option<f64>, gpu: Option<f64>) -> bool {
+    cpu.is_some_and(|c| c >= BUSY_CPU) || gpu.is_some_and(|g| g >= BUSY_GPU)
+}
+
 #[cfg(windows)]
 mod imp {
     use std::time::Duration;
@@ -181,10 +205,161 @@ mod imp {
         // SAFETY: plain flags; affects only the calling thread's request.
         unsafe { SetThreadExecutionState(flags) };
     }
+
+    fn filetime(ft: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+    }
+
+    /// `(idle, kernel, user)` system times; kernel includes idle.
+    fn system_times() -> Option<(u64, u64, u64)> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetSystemTimes;
+        // SAFETY: zeroed FILETIMEs are valid out-parameters.
+        let (mut i, mut k, mut u): (FILETIME, FILETIME, FILETIME) =
+            unsafe { (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed()) };
+        // SAFETY: three valid out-pointers.
+        if unsafe { GetSystemTimes(&mut i, &mut k, &mut u) } == 0 {
+            return None;
+        }
+        Some((filetime(&i), filetime(&k), filetime(&u)))
+    }
+
+    /// A PDH query over every process's 3D-engine utilisation.
+    struct GpuQuery {
+        query: windows_sys::Win32::System::Performance::PDH_HQUERY,
+        counter: windows_sys::Win32::System::Performance::PDH_HCOUNTER,
+    }
+
+    impl GpuQuery {
+        fn open() -> Option<Self> {
+            use windows_sys::Win32::System::Performance::{
+                PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhOpenQueryW,
+            };
+            let mut query = std::ptr::null_mut();
+            // SAFETY: null data source = live counters; valid out-pointer.
+            if unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } != 0 {
+                return None;
+            }
+            let path: Vec<u16> = "\\GPU Engine(*engtype_3D)\\Utilization Percentage"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut counter = std::ptr::null_mut();
+            // SAFETY: `query` is open; `path` is NUL-terminated UTF-16.
+            if unsafe { PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) } != 0 {
+                // SAFETY: `query` is open.
+                unsafe { PdhCloseQuery(query) };
+                return None;
+            }
+            // First collection: a rate counter needs two.
+            // SAFETY: `query` is open.
+            unsafe { PdhCollectQueryData(query) };
+            Some(Self { query, counter })
+        }
+
+        /// Total 3D utilisation since `open`, `0.0..=1.0`.
+        fn read(&self) -> Option<f64> {
+            use windows_sys::Win32::System::Performance::{
+                PdhCollectQueryData, PdhGetFormattedCounterArrayW, PDH_FMT_COUNTERVALUE_ITEM_W,
+                PDH_FMT_DOUBLE, PDH_MORE_DATA,
+            };
+            // SAFETY: `query` is open.
+            if unsafe { PdhCollectQueryData(self.query) } != 0 {
+                return None;
+            }
+            let (mut bytes, mut count) = (0u32, 0u32);
+            // SAFETY: a null buffer with size 0 asks for the size needed.
+            let status = unsafe {
+                PdhGetFormattedCounterArrayW(
+                    self.counter,
+                    PDH_FMT_DOUBLE,
+                    &mut bytes,
+                    &mut count,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != PDH_MORE_DATA || bytes == 0 {
+                return if count == 0 { Some(0.0) } else { None };
+            }
+            // 8-byte aligned storage for the items plus their name strings.
+            let mut buf = vec![0u64; (bytes as usize).div_ceil(8)];
+            let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+            // SAFETY: `buf` holds `bytes` bytes, aligned for the item type.
+            let status = unsafe {
+                PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, items)
+            };
+            if status != 0 {
+                return None;
+            }
+            let mut total = 0.0f64;
+            for n in 0..count as usize {
+                // SAFETY: PDH wrote `count` items at the start of `buf`.
+                let item = unsafe { &*items.add(n) };
+                // CStatus 0 (valid) or 1 (new data) carry a value.
+                if item.FmtValue.CStatus <= 1 {
+                    // SAFETY: PDH_FMT_DOUBLE fills `doubleValue`.
+                    total += unsafe { item.FmtValue.Anonymous.doubleValue };
+                }
+            }
+            Some((total / 100.0).clamp(0.0, 1.0))
+        }
+    }
+
+    impl Drop for GpuQuery {
+        fn drop(&mut self) {
+            // SAFETY: `query` is open and closed once, here.
+            unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(self.query) };
+        }
+    }
+
+    pub fn load_sample(window: Duration) -> (Option<f64>, Option<f64>) {
+        let t0 = system_times();
+        let gpu = GpuQuery::open();
+        std::thread::sleep(window);
+        let t1 = system_times();
+        let gpu = gpu.and_then(|g| g.read());
+        let cpu = match (t0, t1) {
+            (Some((i0, k0, u0)), Some((i1, k1, u1))) => {
+                let total = k1.saturating_sub(k0) + u1.saturating_sub(u0);
+                (total > 0).then(|| 1.0 - i1.saturating_sub(i0) as f64 / total as f64)
+            }
+            _ => None,
+        };
+        (cpu.map(|c| c.clamp(0.0, 1.0)), gpu)
+    }
 }
 
 #[cfg(not(windows))]
 mod imp {
+    /// `(idle, total)` jiffies from the aggregate `cpu` line of /proc/stat.
+    fn proc_stat() -> Option<(u64, u64)> {
+        let text = std::fs::read_to_string("/proc/stat").ok()?;
+        let line = text.lines().find(|l| l.starts_with("cpu "))?;
+        let v: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        if v.len() < 4 {
+            return None;
+        }
+        let idle = v[3] + v.get(4).copied().unwrap_or(0);
+        Some((idle, v.iter().sum()))
+    }
+
+    pub fn load_sample(window: Duration) -> (Option<f64>, Option<f64>) {
+        let a = proc_stat();
+        std::thread::sleep(window);
+        let b = proc_stat();
+        let cpu = match (a, b) {
+            (Some((i0, t0)), Some((i1, t1))) if t1 > t0 => {
+                Some((1.0 - (i1 - i0) as f64 / (t1 - t0) as f64).clamp(0.0, 1.0))
+            }
+            _ => None,
+        };
+        (cpu, None)
+    }
+
     use std::process::{Child, Command, Stdio};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -308,6 +483,21 @@ mod tests {
         assert_eq!(idle_from_logind("", Some(1), now), None);
         // A since stamp in the future never yields a negative duration.
         assert_eq!(idle_from_logind("yes", Some(now + 5), now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn busy_needs_a_known_high_figure() {
+        assert!(!is_busy(None, None));
+        assert!(!is_busy(Some(0.2), Some(0.1)));
+        assert!(is_busy(Some(0.8), None));
+        assert!(is_busy(None, Some(0.6)));
+    }
+
+    #[test]
+    fn a_load_sample_is_in_range() {
+        let (cpu, gpu) = load_sample(Duration::from_millis(200));
+        assert!(cpu.is_none_or(|c| (0.0..=1.0).contains(&c)));
+        assert!(gpu.is_none_or(|g| (0.0..=1.0).contains(&g)));
     }
 
     #[test]

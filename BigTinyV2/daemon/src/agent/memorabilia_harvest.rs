@@ -40,6 +40,76 @@ const SEARCH_TOOL: &str = "lean_web_search";
 /// The client's inlined-attachment path-list header (see `chatStore.ts`).
 const FILES_HEADER: &str = "Files provided by the user:";
 
+/// Appended on "Regenerate" turns (kept in sync with `bigtiny::turn_text::REGENERATE_NOTE`).
+const REGENERATE_NOTE: &str =
+    "\n\n(Please reconsider your previous answer above and provide an improved response.)";
+
+/// Strip inlined documents (`--- <label> ---`), dropped file path lists, and
+/// regenerate boilerplate from a user message before embedding it as a memory
+/// recall query. Falls back to the first 500 chars of `text` if the user sent
+/// only attachments with no typed prompt.
+pub(crate) fn strip_turn_attachments(text: &str) -> String {
+    let mut rest = text.strip_suffix(REGENERATE_NOTE).unwrap_or(text).trim();
+
+    // Strip leading `--- <label> --- ... --- end of <label> ---` blocks.
+    while let Some(first_nl) = rest.find('\n') {
+        let open_line = rest[..first_nl].trim_end();
+        let Some(inner) = open_line
+            .strip_prefix("--- ")
+            .and_then(|s| s.strip_suffix(" ---"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with("end of "))
+        else {
+            break;
+        };
+        let (clean_label, _) = split_pinned(inner);
+        let after_open = &rest[first_nl + 1..];
+        let close = format!("\n--- end of {clean_label} ---");
+        if let Some(end) = after_open.find(&close) {
+            rest = after_open[end + close.len()..].trim_start_matches('\n');
+        } else {
+            // Legacy unclosed marker block: skip to file list or last paragraph.
+            let files_marker = format!("\n\n{FILES_HEADER}\n");
+            let boundary = rest.find(&files_marker).or_else(|| rest.rfind("\n\n"));
+            if let Some(b) = boundary {
+                rest = rest[b..].trim_start_matches('\n');
+            }
+            break;
+        }
+    }
+
+    // Strip leading `Files provided by the user:\n- ...` list.
+    if let Some(after) = rest.strip_prefix(FILES_HEADER) {
+        let after = after.strip_prefix('\n').unwrap_or(after);
+        let mut lines = after.lines();
+        let mut consumed = 0usize;
+        let mut saw_item = false;
+        for line in &mut lines {
+            let t = line.trim();
+            if t.starts_with("- ") {
+                saw_item = true;
+                consumed += line.len() + 1;
+            } else if t.is_empty() {
+                consumed += line.len() + 1;
+                if saw_item {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if saw_item {
+            rest = after.get(consumed..).unwrap_or("").trim();
+        }
+    }
+
+    let cleaned = rest.trim();
+    if !cleaned.is_empty() {
+        return cleaned.to_string();
+    }
+    text.trim().chars().take(500).collect()
+}
+
 /// Harvest and ingest this turn's documents. Called fire-and-forget from the
 /// agent loop's turn-end hook, after the pause check.
 pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) {
@@ -754,5 +824,23 @@ mod tests {
         assert_eq!(strip_trailing_call_to_action("  Read more  "), "");
         // A sentence merely ending in the same letters is left alone.
         assert_eq!(strip_trailing_call_to_action("We spread more"), "We spread more");
+    }
+
+    #[test]
+    fn strip_turn_attachments_isolates_user_question() {
+        let msg = "--- paper.pdf [remember] ---\nLong PDF body about transformers\n--- end of paper.pdf ---\n\n\
+                   Files provided by the user:\n- C:\\tmp\\notes.md\n\n\
+                   What does section 3 argue?";
+        assert_eq!(strip_turn_attachments(msg), "What does section 3 argue?");
+    }
+
+    #[test]
+    fn strip_turn_attachments_handles_regenerate_and_attachment_only() {
+        let regen = "Explain attention\n\n(Please reconsider your previous answer above and provide an improved response.)";
+        assert_eq!(strip_turn_attachments(regen), "Explain attention");
+
+        let only_doc = format!("--- big.txt ---\n{}\n--- end of big.txt ---", "a".repeat(800));
+        let out = strip_turn_attachments(&only_doc);
+        assert_eq!(out.chars().count(), 500);
     }
 }

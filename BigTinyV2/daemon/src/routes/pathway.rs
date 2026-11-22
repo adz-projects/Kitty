@@ -62,6 +62,7 @@ pub async fn list_beliefs(
                         "id": b.id,
                         "text": b.text,
                         "layer": b.layer.as_str(),
+                        "kind": b.kind.as_str(),
                         "confidence": b.confidence,
                         "tested": b.tested,
                         "domain": b.domain,
@@ -104,15 +105,36 @@ pub async fn stats(
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM beliefs")
             .fetch_one(pool)
             .await?;
+        let (tested, contradicted, avg_confidence): (i64, i64, f64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(CASE WHEN tested != 0 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(SUM(CASE WHEN contradict_count > 0 THEN 1 ELSE 0 END), 0), \
+                    COALESCE(AVG(confidence), 0.0) \
+             FROM beliefs",
+        )
+        .fetch_one(pool)
+        .await?;
         let layer_rows: Vec<(String, i64)> =
             sqlx::query_as("SELECT layer, COUNT(*) FROM beliefs GROUP BY layer")
                 .fetch_all(pool)
-            .await?;
+                .await?;
         let pending_reembed: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM beliefs WHERE embedding_model != ?1")
                 .bind(&current_model)
                 .fetch_one(pool)
                 .await?;
+        let (staged_pending, staged_sessions): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(DISTINCT session_id) FROM staged_evidence WHERE synthesized_at IS NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or((0, 0));
+        let signal_rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT signal_kind, COALESCE(SUM(engaged), 0), COUNT(*) \
+             FROM signal_feedback GROUP BY signal_kind",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
         let last_learn_at: Option<String> = sqlx::query_scalar(
             "SELECT MAX(created_at) FROM audit_log WHERE event LIKE 'learn_%'",
         )
@@ -140,18 +162,51 @@ pub async fn stats(
             .iter()
             .filter(|(id, max)| learned.get(id).copied().unwrap_or(0) < *max)
             .count();
-        Ok::<_, sqlx::Error>((total, layer_rows, pending_reembed, last_learn_at, unlearned))
+        Ok::<_, sqlx::Error>((
+            total,
+            tested,
+            contradicted,
+            avg_confidence,
+            layer_rows,
+            pending_reembed,
+            staged_pending,
+            staged_sessions,
+            signal_rows,
+            last_learn_at,
+            unlearned,
+        ))
     }
     .await;
 
     match result {
-        Ok((total, layer_rows, pending_reembed, last_learn_at, unlearned)) => {
+        Ok((
+            total,
+            tested,
+            contradicted,
+            avg_confidence,
+            layer_rows,
+            pending_reembed,
+            staged_pending,
+            staged_sessions,
+            signal_rows,
+            last_learn_at,
+            unlearned,
+        )) => {
             let by_layer: serde_json::Map<String, Value> = layer_rows
                 .into_iter()
                 .map(|(layer, count)| (layer, json!(count)))
                 .collect();
+            let signals: serde_json::Map<String, Value> = signal_rows
+                .into_iter()
+                .map(|(kind, engaged, total)| {
+                    (kind, json!({ "engaged": engaged, "total": total }))
+                })
+                .collect();
             Json(json!({
                 "total": total,
+                "tested": tested,
+                "contradicted": contradicted,
+                "avg_confidence": avg_confidence,
                 "by_layer": by_layer,
                 "embedding_migration": {
                     "pending": pending_reembed,
@@ -161,6 +216,11 @@ pub async fn stats(
                     "last_learn_at": last_learn_at,
                     "unlearned_sessions": unlearned,
                 },
+                "staged": {
+                    "pending": staged_pending,
+                    "sessions": staged_sessions,
+                },
+                "signals": signals,
             }))
             .into_response()
         }

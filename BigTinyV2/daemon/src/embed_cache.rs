@@ -18,7 +18,9 @@ use adaptive_pathway::embed::SemanticEmbedder;
 
 /// Texts kept. A turn needs two; a few turns' worth covers follow-ups and
 /// the counterpoint lookup without growing.
-const CAPACITY: usize = 64;
+/// Texts kept. Interactive turns insert into this cache; background jobs
+/// read hits without evicting hot interactive embeddings.
+const CAPACITY: usize = 256;
 
 pub struct SharedEmbedCache {
     inner: Arc<dyn SemanticEmbedder>,
@@ -37,6 +39,14 @@ impl SharedEmbedCache {
 #[async_trait]
 impl SemanticEmbedder for SharedEmbedCache {
     async fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        // Non-interactive background work reads existing hits but bypasses
+        // cache insertion so batch chunking doesn't evict hot turn queries.
+        if !crate::embed_priority::is_interactive() {
+            if let Some(cell) = self.entries.get(text).map(|r| r.value().clone()) {
+                return cell.get_or_init(|| async { self.inner.embed(text).await }).await.clone();
+            }
+            return self.inner.embed(text).await;
+        }
         if self.entries.len() >= CAPACITY && !self.entries.contains_key(text) {
             self.entries.clear();
         }
@@ -77,11 +87,29 @@ mod tests {
     async fn concurrent_requests_for_one_text_share_one_call() {
         let inner = Arc::new(Counting(AtomicUsize::new(0)));
         let cache = SharedEmbedCache::new(inner.clone());
-        let (a, b) = tokio::join!(cache.embed("hello"), cache.embed("hello"));
-        assert_eq!(a, b);
-        assert_eq!(cache.embed("hello").await, a);
+        crate::embed_priority::interactive(async {
+            let (a, b) = tokio::join!(cache.embed("hello"), cache.embed("hello"));
+            assert_eq!(a, b);
+            assert_eq!(cache.embed("hello").await, a);
+            assert_eq!(inner.0.load(Ordering::SeqCst), 1);
+            cache.embed("other").await;
+            assert_eq!(inner.0.load(Ordering::SeqCst), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn background_misses_do_not_evict_interactive_entries() {
+        let inner = Arc::new(Counting(AtomicUsize::new(0)));
+        let cache = SharedEmbedCache::new(inner.clone());
+        crate::embed_priority::interactive(cache.embed("hot")).await;
         assert_eq!(inner.0.load(Ordering::SeqCst), 1);
-        cache.embed("other").await;
-        assert_eq!(inner.0.load(Ordering::SeqCst), 2);
+
+        // Background misses bypass cache insertion so hot interactive entries remain cached.
+        for i in 0..300 {
+            cache.embed(&format!("bg-{i}")).await;
+        }
+        crate::embed_priority::interactive(cache.embed("hot")).await;
+        assert_eq!(inner.0.load(Ordering::SeqCst), 301, "hot key must still hit cache");
     }
 }

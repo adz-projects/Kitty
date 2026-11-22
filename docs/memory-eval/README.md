@@ -106,3 +106,31 @@ Rows without `cache_read_tokens` are excluded because the provider didn't
 report them, which is not the same as a miss. Record the numbers for a few
 multi-turn, tool-using chats before Phase 2. Phase 2 (saving the memory block
 into history) should raise them.
+
+## 4. Behavioral A/B eval (`behavioral_ab_cases.json`)
+
+Measures whether injected memory blocks actually change live LLM outputs across
+4 categories (16 cases total):
+
+- `memorabilia_grounding` (4 cases): factual recall fidelity & citation.
+- `pathway_epistemic` (4 cases): source & collaboration style alignment (e.g.
+  ArXiv preprints over delayed journals, pedagogical AI framing).
+- `antisycophancy` (4 cases): pushing back via `[Worth challenging]` and
+  `[In tension]` instead of nodding along.
+- `creative_framing` (4 cases): breaking conversational ruts with `[Fresh angle]`.
+
+Run offline rubric validation anytime:
+
+```bash
+cargo test --lib plugins::memory_eval::behavioral_ab_fixture_and_scorer_sanity
+```
+
+Run live A (no memory block) vs. B (with `memory_block`) comparison against any
+OpenAI-compatible endpoint from `BigTinyV2/daemon`:
+
+```bash
+EVAL_BASE_URL="https://api.openai.com/v1" \
+EVAL_API_KEY="sk-..." \
+EVAL_MODEL="gpt-4o-mini" \
+  cargo test --lib -- --ignored memory_eval_behavioral_ab --nocapture
+```

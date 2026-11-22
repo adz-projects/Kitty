@@ -188,8 +188,20 @@ impl ContextBuilder {
             .await
             .map_err(|e| format!("Failed to fetch first message: {}", e))?;
 
+        let mut last_seen_sections: std::collections::HashMap<MemorySectionKind, String> =
+            std::collections::HashMap::new();
         let _anchor_first_user = first_user_row.is_some();
         if let Some(row) = &first_user_row {
+            // If Turn 0 had a recalled memory block persisted on `first_user_row`,
+            // keep it anchored right before `[Original request]` inside the
+            // stable head so Turn 1+ retain it without re-injecting it in the tail.
+            if let Some(mb) = row.memory_block.as_deref().filter(|b| !b.trim().is_empty()) {
+                messages.push(json!({
+                    "role": "system",
+                    "content": mb
+                }));
+                record_memory_sections(mb, &mut last_seen_sections);
+            }
             // A first message with image attachments stores `content` as a
             // blocks JSON array full of base64 payloads — inlining it here
             // would put megabytes of base64 into the permanent system head
@@ -269,7 +281,6 @@ impl ContextBuilder {
             .filter_map(|r| Some((r.id.as_str(), r.memory_block.as_deref()?)))
             .filter(|(_, b)| !b.trim().is_empty())
             .collect();
-        let mut last_stored_block: Option<String> = None;
         let live_messages: Vec<Value> = if blocks.is_empty() {
             live_messages
         } else {
@@ -277,7 +288,7 @@ impl ContextBuilder {
             for m in live_messages {
                 if let Some(block) = m.get("id").and_then(|v| v.as_str()).and_then(|id| blocks.get(id)) {
                     out.push(json!({"role": "system", "content": block}));
-                    last_stored_block = Some(block.to_string());
+                    record_memory_sections(block, &mut last_seen_sections);
                 }
                 out.push(m);
             }
@@ -313,17 +324,16 @@ impl ContextBuilder {
         // message (`_memory_block`, persisted by `save_messages`) so later
         // turns re-emit it in this same position.
         let mut tail_extra_tokens: i32 = 0;
-        let mut new_memory_block: Option<&str> = None;
+        let mut new_memory_block: Option<String> = None;
         if let Some(hints) = ap_hints {
-            let unchanged = last_stored_block.as_deref().map(str::trim) == Some(hints.trim());
-            if !hints.trim().is_empty() && !unchanged {
+            if let Some(delta) = diff_memory_block(hints, &last_seen_sections) {
                 let block = json!({
                     "role": "system",
-                    "content": hints
+                    "content": delta
                 });
                 tail_extra_tokens += count_messages_tokens(std::slice::from_ref(&block));
                 messages.push(block);
-                new_memory_block = Some(hints);
+                new_memory_block = Some(delta);
             }
         }
 
@@ -504,6 +514,7 @@ impl ContextBuilder {
                 provider_id: private("_provider_id"),
                 model: private("_model"),
                 memory_block: private("_memory_block"),
+                memory_trace: private("_memory_trace"),
             });
         }
 
@@ -708,6 +719,97 @@ fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {
     }
 
     Value::Object(msg)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MemorySectionKind {
+    Pathway,
+    Memorabilia,
+    Counterpoint,
+    Other,
+}
+
+fn classify_memory_section(text: &str) -> MemorySectionKind {
+    let t = text.trim_start();
+    if t.starts_with("## Relevant memory") {
+        MemorySectionKind::Memorabilia
+    } else if t.starts_with("[A documented counter-view]") {
+        MemorySectionKind::Counterpoint
+    } else if [
+        "[Working assumptions about you]",
+        "[In tension]",
+        "[Worth challenging]",
+        "[Fresh angle]",
+        "[Worth testing this turn]",
+        "[Where I'm unsure]",
+        "[Check yourself]",
+    ]
+    .iter()
+    .any(|h| t.starts_with(h))
+    {
+        MemorySectionKind::Pathway
+    } else {
+        MemorySectionKind::Other
+    }
+}
+
+/// Split a combined tail memory block into independent top-level channels
+/// (`Pathway`, `Memorabilia`, `Counterpoint`, `Other`) by top-level markers.
+fn split_memory_sections(block: &str) -> Vec<(MemorySectionKind, String)> {
+    let trimmed = block.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut cuts: Vec<usize> = vec![0];
+    for needle in ["\n\n## Relevant memory", "\n\n[A documented counter-view]"] {
+        let mut search_from = 0;
+        while let Some(rel) = trimmed[search_from..].find(needle) {
+            let cut = search_from + rel + 2; // step past "\n\n"
+            if cut > 0 && cut < trimmed.len() && !cuts.contains(&cut) {
+                cuts.push(cut);
+            }
+            search_from = cut;
+        }
+    }
+    cuts.sort_unstable();
+    let mut out = Vec::with_capacity(cuts.len());
+    for (idx, &start) in cuts.iter().enumerate() {
+        let end = cuts.get(idx + 1).copied().unwrap_or(trimmed.len());
+        let part = trimmed[start..end].trim();
+        if !part.is_empty() {
+            out.push((classify_memory_section(part), part.to_string()));
+        }
+    }
+    out
+}
+
+fn record_memory_sections(
+    block: &str,
+    seen: &mut std::collections::HashMap<MemorySectionKind, String>,
+) {
+    for (kind, text) in split_memory_sections(block) {
+        seen.insert(kind, text);
+    }
+}
+
+fn diff_memory_block(
+    current: &str,
+    seen: &std::collections::HashMap<MemorySectionKind, String>,
+) -> Option<String> {
+    let sections = split_memory_sections(current);
+    if sections.is_empty() {
+        return None;
+    }
+    let changed: Vec<String> = sections
+        .into_iter()
+        .filter(|(kind, text)| seen.get(kind).map(String::as_str) != Some(text.as_str()))
+        .map(|(_, text)| text)
+        .collect();
+    if changed.is_empty() {
+        None
+    } else {
+        Some(changed.join("\n\n"))
+    }
 }
 
 #[cfg(test)]
@@ -1230,6 +1332,7 @@ mod tests {
             provider_id: None,
             model: None,
             memory_block: None,
+            memory_trace: None,
         };
         let msg = row_to_message(&row);
         assert_eq!(msg.get("role").and_then(|r| r.as_str()), Some("user"));
@@ -1404,5 +1507,143 @@ mod tests {
         assert_eq!(out[1]["content"], "Started.\n\nWave 1 done.\n\nReport.");
         assert!(out[2].get("tool_calls").is_some());
         assert_eq!(out[3]["content"], "After a tool call.");
+    }
+
+    #[tokio::test]
+    async fn turn_one_memory_block_survives_onto_turn_two_and_dedups() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-t1", "Test").await.unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+        let wire = |m: &[Value]| crate::provider::wire::sanitize_for_wire(m).into_owned();
+
+        // Turn 0 (very first turn in session) receives `[memory] T0`.
+        let mut turn0 = builder
+            .build_messages(
+                "sess-t1",
+                "first question",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("[memory] T0"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        builder.save_messages("sess-t1", &mut turn0).await.unwrap();
+        let mut reply0 = vec![json!({"role": "assistant", "content": "answer 0"})];
+        builder.save_messages("sess-t1", &mut reply0).await.unwrap();
+
+        // Turn 1 repeats `[memory] T0`: Turn 0's block is anchored before [Original request],
+        // so it must appear once (not duplicated before `second question`).
+        let turn1 = wire(
+            &builder
+                .build_messages(
+                    "sess-t1",
+                    "second question",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("[memory] T0"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        let count = turn1.iter().filter(|m| m["content"] == "[memory] T0").count();
+        assert_eq!(count, 1, "Turn 0 memory block stays anchored once without re-injection");
+        assert_eq!(turn1[turn1.len() - 2]["content"], "answer 0");
+    }
+
+    #[tokio::test]
+    async fn independent_memory_section_delta_omits_unchanged_pathway_and_keeps_prefix_determinism() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-split", "Test").await.unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+        let mut seed = vec![json!({"role": "user", "content": "hello"})];
+        builder.save_messages("sess-split", &mut seed).await.unwrap();
+        let wire = |m: &[Value]| crate::provider::wire::sanitize_for_wire(m).into_owned();
+
+        let pw = "[Working assumptions about you]\n- Reads ArXiv preprints";
+        let mem1 = "## Relevant memory\nMost relevant: Fact 1\n\nIndex:\n- [p1] Fact 1";
+        let mem2 = "## Relevant memory\nMost relevant: Fact 2\n\nIndex:\n- [p2] Fact 2";
+
+        let combined1 = format!("{pw}\n\n{mem1}");
+        let mut turn1 = builder
+            .build_messages(
+                "sess-split",
+                "q1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&combined1),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        builder.save_messages("sess-split", &mut turn1).await.unwrap();
+        let mut r1 = vec![json!({"role": "assistant", "content": "r1"})];
+        builder.save_messages("sess-split", &mut r1).await.unwrap();
+
+        // Turn 2: Pathway unchanged, Memorabilia updated -> only Memorabilia is injected.
+        let combined2 = format!("{pw}\n\n{mem2}");
+        let mut turn2 = builder
+            .build_messages(
+                "sess-split",
+                "q2",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&combined2),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let sent2 = wire(&turn2);
+        let tail_sys = sent2[sent2.len() - 2]["content"].as_str().unwrap();
+        assert_eq!(tail_sys, mem2, "unchanged Pathway must not be re-injected when only Memorabilia changed");
+        builder.save_messages("sess-split", &mut turn2).await.unwrap();
+        let mut r2 = vec![json!({"role": "assistant", "content": "r2"})];
+        builder.save_messages("sess-split", &mut r2).await.unwrap();
+
+        // Turn 3 with same `{pw}\n\n{mem2}`: Turn 2 must remain a byte-exact prefix of Turn 3.
+        let turn3 = builder
+            .build_messages(
+                "sess-split",
+                "q3",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&combined2),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let sent3 = wire(&turn3);
+        assert_eq!(
+            serde_json::to_string(&sent3[..sent2.len()]).unwrap(),
+            serde_json::to_string(&sent2).unwrap(),
+            "turn 2 must be a byte-exact prefix of turn 3"
+        );
+        assert_eq!(sent3[sent3.len() - 2]["content"], "r2", "nothing new injected before q3");
     }
 }

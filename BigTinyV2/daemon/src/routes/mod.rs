@@ -8,6 +8,7 @@ pub mod events;
 pub mod health;
 pub mod hitl;
 pub mod jobs;
+pub mod learning_model;
 pub mod local;
 pub mod mcp;
 pub mod memorabilia;
@@ -129,6 +130,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/apps/me/overnight",
             get(overnight::get).put(overnight::put).delete(overnight::clear),
+        )
+        .route(
+            "/api/apps/me/learning-model",
+            get(learning_model::get)
+                .put(learning_model::put)
+                .delete(learning_model::clear),
         )
         .route("/api/apps/me/overnight/run", post(overnight::run_now))
         .route(

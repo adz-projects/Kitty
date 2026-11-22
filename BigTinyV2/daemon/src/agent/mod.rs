@@ -2,6 +2,7 @@ pub mod admission;
 pub mod approval_policy;
 pub mod compaction;
 pub mod context;
+pub mod learning_model;
 pub(crate) mod json_extract;
 pub mod loop_;
 pub mod memorabilia_harvest;

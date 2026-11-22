@@ -227,6 +227,7 @@ impl PluginHost {
             crate::agent::summarizer_chain::SessionSummarizerFactory {
                 chain: self.chat.clone(),
                 pool: self.pool.clone(),
+                app_id: Some(app_id.to_string()),
             },
             Some(app_id.to_string()),
             schedule,

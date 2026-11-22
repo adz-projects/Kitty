@@ -42,6 +42,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::agent::learning_model::LearningModel;
+
 use adaptive_pathway::traits::StructuredChat;
 
 use crate::config::SummarizerConfig;
@@ -280,6 +282,20 @@ impl SummarizerChain {
         schema: &Value,
         preemptible: bool,
     ) -> Result<Value, String> {
+        self.local_then_provider(provider_id, model, messages, schema, preemptible)
+            .await
+    }
+
+    /// [`Self::structured_chat_for_session_opts`]'s body: local first, then
+    /// `provider_id`.
+    async fn local_then_provider(
+        &self,
+        provider_id: Option<&str>,
+        model: Option<String>,
+        messages: Vec<Value>,
+        schema: &Value,
+        preemptible: bool,
+    ) -> Result<Value, String> {
         if let Some(v) = self.try_local(&messages, schema).await {
             return Ok(v);
         }
@@ -289,6 +305,66 @@ impl SummarizerChain {
         let provider_id = provider_id
             .ok_or_else(|| "no provider available for the summarizer fallback".to_string())?;
         self.via_router_opts(provider_id, model, messages, schema, preemptible).await
+    }
+
+    /// Memory learning's entry point: runs on the app's chosen
+    /// [`LearningModel`]. `own_provider`/`own_model` are the chat's (or, for
+    /// a pass with no chat, the app's) provider: what `auto` falls back to
+    /// and what `chat` tries first. A chosen provider that fails falls back
+    /// to `auto`, so a removed or broken choice never stops learning.
+    pub async fn structured_chat_learning(
+        &self,
+        choice: &LearningModel,
+        own_provider: Option<&str>,
+        own_model: Option<String>,
+        messages: Vec<Value>,
+        schema: &Value,
+        preemptible: bool,
+    ) -> Result<Value, String> {
+        match choice {
+            LearningModel::Auto => {
+                self.local_then_provider(own_provider, own_model, messages, schema, preemptible)
+                    .await
+            }
+            LearningModel::Chat => {
+                if let Some(pid) = own_provider {
+                    match self
+                        .via_router_opts(pid, own_model.clone(), messages.clone(), schema, preemptible)
+                        .await
+                    {
+                        Ok(v) => return Ok(v),
+                        Err(e) => tracing::warn!(
+                            "memory learning on the chat's provider failed ({e}); trying the helper model"
+                        ),
+                    }
+                }
+                self.try_local(&messages, schema)
+                    .await
+                    .ok_or_else(|| "chat provider failed and the helper model is unavailable".into())
+            }
+            LearningModel::Provider { provider_id, model } => {
+                match self
+                    .via_router_opts(provider_id, model.clone(), messages.clone(), schema, preemptible)
+                    .await
+                {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        tracing::warn!(
+                            "memory learning on the chosen model '{provider_id}' failed ({e}); \
+                             falling back to the helper model / chat provider"
+                        );
+                        self.local_then_provider(own_provider, own_model, messages, schema, preemptible)
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    /// The provider a pass belonging to `app_id` but no one chat falls back
+    /// to: its default card, else the healthiest provider *it* can see.
+    pub fn app_provider(&self, app_id: &str, app_default: Option<&str>) -> Option<String> {
+        self.router.resolve_provider_for_app(app_id, None, app_default).ok()
     }
 
     /// For a pass that belongs to an app but no one session (memorabilia
@@ -358,17 +434,26 @@ pub struct SessionSummarizer {
     pub chain: Arc<SummarizerChain>,
     pub provider_id: Option<String>,
     pub model: Option<String>,
+    /// Where the app's [`LearningModel`] is read from (per call), with the
+    /// app it belongs to. `None` means `auto`.
+    pub learning: Option<(sqlx::SqlitePool, String)>,
 }
 
 #[async_trait::async_trait]
 impl StructuredChat for SessionSummarizer {
     async fn structured_chat(&self, messages: Vec<Value>, schema: &Value) -> Result<Value, String> {
+        let choice = match &self.learning {
+            Some((pool, app_id)) => crate::agent::learning_model::get(pool, app_id).await,
+            None => LearningModel::Auto,
+        };
         self.chain
-            .structured_chat_for_session(
+            .structured_chat_learning(
+                &choice,
                 self.provider_id.as_deref(),
                 self.model.clone(),
                 messages,
                 schema,
+                true,
             )
             .await
     }
@@ -382,6 +467,13 @@ impl StructuredChat for SessionSummarizer {
 pub struct SessionSummarizerFactory {
     pub chain: Arc<SummarizerChain>,
     pub pool: sqlx::SqlitePool,
+    pub app_id: Option<String>,
+}
+
+impl SessionSummarizerFactory {
+    fn learning(&self) -> Option<(sqlx::SqlitePool, String)> {
+        self.app_id.clone().map(|a| (self.pool.clone(), a))
+    }
 }
 
 #[async_trait::async_trait]
@@ -413,6 +505,29 @@ impl adaptive_pathway::traits::SessionChat for SessionSummarizerFactory {
             chain: self.chain.clone(),
             provider_id: field("provider"),
             model: field("model"),
+            learning: self.learning(),
+        }
+    }
+
+    /// A pass about no one chat (cross-session synthesis): the app's own
+    /// provider, never the router's cross-app default.
+    async fn for_background(&self) -> SessionSummarizer {
+        let provider_id = match &self.app_id {
+            Some(app_id) => {
+                let app_default = crate::storage::apps::get_app(&self.pool, app_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|a| a.default_provider_id);
+                self.chain.app_provider(app_id, app_default.as_deref())
+            }
+            None => None,
+        };
+        SessionSummarizer {
+            chain: self.chain.clone(),
+            provider_id,
+            model: None,
+            learning: self.learning(),
         }
     }
 }
@@ -465,6 +580,7 @@ mod tests {
             chain: Arc::new(chain(router, "session_model")),
             provider_id: None,
             model: None,
+            learning: None,
         };
         let err = session
             .structured_chat(vec![], &json!({}))
@@ -600,6 +716,67 @@ mod tests {
             .await
             .expect("the mocked provider must be reachable and its JSON extracted");
         assert_eq!(v, json!({"ok": true}));
+    }
+
+    /// A chosen learning model is used; when it fails, learning falls back to
+    /// the chat's own provider instead of stopping.
+    #[tokio::test]
+    async fn learning_uses_the_chosen_model_and_falls_back_when_it_fails() {
+        let mut ok = mockito::Server::new_async().await;
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"from\\\":\\\"MARK\\\"}\"}}]}
+
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}
+
+                   data: [DONE]
+
+";
+        let _m = ok
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse.replace("MARK", "chosen"))
+            .create_async()
+            .await;
+        let mut chat = mockito::Server::new_async().await;
+        let _c = chat
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(sse.replace("MARK", "chat"))
+            .create_async()
+            .await;
+        let router = Arc::new(ProviderRouter::default());
+        for (id, url) in [("chosen", ok.url()), ("chat", chat.url()), ("broken", "http://127.0.0.1:9".into())] {
+            router.register_openai(
+                id,
+                ProviderConfig {
+                    provider_type: "custom_openai".into(),
+                    base_url: url,
+                    ..Default::default()
+                },
+            );
+        }
+        let chain = chain(router, "session_model");
+        let msgs = vec![json!({"role":"user","content":"hi"})];
+        let pick = |id: &str| LearningModel::Provider { provider_id: id.into(), model: None };
+
+        let v = chain
+            .structured_chat_learning(&pick("chosen"), Some("chat"), None, msgs.clone(), &json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(v, json!({"from": "chosen"}));
+
+        let v = chain
+            .structured_chat_learning(&pick("broken"), Some("chat"), None, msgs.clone(), &json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(v, json!({"from": "chat"}), "a failed choice falls back");
+
+        let v = chain
+            .structured_chat_learning(&LearningModel::Chat, Some("chat"), None, msgs, &json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(v, json!({"from": "chat"}));
     }
 
     /// #13: a runaway summarizer stream (output far past the 1024-token
