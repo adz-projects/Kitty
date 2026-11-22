@@ -78,6 +78,14 @@ where
 /// Back up `db_path`, create a fresh migrated database beside it, salvage every
 /// table that still reads, and swap it into place. The caller guarantees no
 /// connection holds `db_path` (see [`heal_before_open`]).
+///
+/// What is swapped in is a self-contained copy (`VACUUM INTO`), never the
+/// working file itself. The working file is a WAL database the engine's own
+/// `Db::open` created, with a reader pool beside the writer, so closing the
+/// writer need not checkpoint: the salvaged rows can still sit in its `-wal`.
+/// Renaming only the main file into place used to leave them behind. That
+/// lost memorabilia's whole store on 2026-11-18, and on 2026-11-20 left a
+/// pathway file that failed to open as malformed.
 async fn rebuild<F, Fut>(label: &str, db_path: &Path, create_fresh: F) -> RecoverReport
 where
     F: FnOnce(PathBuf) -> Fut,
@@ -91,11 +99,22 @@ where
     let rebuilt = append(db_path, ".rebuilt");
     clear_rebuilt(&rebuilt).await;
 
+    let finished = append(db_path, ".rebuilt-final");
+    clear_rebuilt(&finished).await;
     match create_fresh(rebuilt.clone()).await {
         Ok(pool) => {
             report.salvaged = salvage_into(&pool, db_path).await;
-            report.integrity_ok = integrity_ok(&pool).await;
+            let vacuumed = sqlx::query("VACUUM INTO ?")
+                .bind(finished.to_string_lossy().to_string())
+                .execute(&pool)
+                .await;
             pool.close().await;
+            clear_rebuilt(&rebuilt).await;
+            if let Err(e) = vacuumed {
+                tracing::warn!("{label}: could not write the rebuilt database out: {e}");
+                clear_rebuilt(&finished).await;
+                return report;
+            }
         }
         Err(e) => {
             tracing::warn!("{label}: could not create a fresh database to rebuild into: {e}");
@@ -103,7 +122,21 @@ where
             return report;
         }
     }
-    match swap_in(&rebuilt, db_path).await {
+    // Judge the file that will be swapped in, on its own.
+    report.integrity_ok = match open_existing(&finished).await {
+        Some(pool) => {
+            let ok = integrity_ok(&pool).await;
+            pool.close().await;
+            ok
+        }
+        None => false,
+    };
+    if !report.integrity_ok {
+        tracing::warn!("{label}: the rebuilt database failed its own check; leaving {db_path:?} as it was");
+        clear_rebuilt(&finished).await;
+        return report;
+    }
+    match swap_in(&finished, db_path).await {
         Ok(()) => tracing::info!(
             backup = ?report.backup,
             salvaged = ?report.salvaged,
@@ -558,6 +591,83 @@ mod tests {
         let again = heal_before_open("test", &path, |_| async { Err("must not rebuild".to_string()) })
             .await;
         assert!(again.is_none());
+    }
+
+    /// The field failure: the fresh database is a WAL file and another
+    /// connection to it is still open when the rebuild finishes, so the
+    /// salvaged rows are still in its `-wal`. They must reach the swapped-in
+    /// file anyway.
+    #[tokio::test]
+    async fn salvaged_rows_survive_when_the_rebuilt_file_is_not_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.db");
+        corrupt_db(&path).await;
+
+        let holder: std::sync::Arc<tokio::sync::Mutex<Option<SqlitePool>>> = Default::default();
+        let slot = holder.clone();
+        let report = heal_before_open("test", &path, move |p| async move {
+            let opts = SqliteConnectOptions::new()
+                .filename(&p)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            create_schema(&pool).await;
+            // Like the engine's reader pool: a second connection that outlives
+            // the writer, so closing the writer does not checkpoint.
+            let reader = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alpha")
+                .fetch_one(&reader)
+                .await
+                .map_err(|e| e.to_string())?;
+            *slot.lock().await = Some(reader);
+            Ok(pool)
+        })
+        .await
+        .expect("a corrupt file is rebuilt");
+
+        assert!(report.integrity_ok, "{report:?}");
+        assert_eq!(report.salvaged.get("beta"), Some(&60));
+        let pool = open_existing(&path).await.unwrap();
+        let beta: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM beta")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(beta, 60, "the salvaged rows are in the swapped-in file");
+        assert!(integrity_ok(&pool).await);
+        pool.close().await;
+        let reader = holder.lock().await.take();
+        if let Some(reader) = reader {
+            reader.close().await;
+        }
+    }
+
+    /// The rebuild's self-contained copy works on memorabilia's real schema,
+    /// vec0 index and FTS5 table included, and the engine opens the result.
+    #[tokio::test]
+    async fn a_memorabilia_rebuild_opens_with_its_vector_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memorabilia.db");
+        corrupt_db(&path).await;
+        let report = heal_before_open("memorabilia", &path, |p| async move {
+            let db = memorabilia::store::Db::open(&p.to_string_lossy())
+                .await
+                .map_err(|e| e.to_string())?;
+            db.init_vectors(8).await.map_err(|e| e.to_string())?;
+            Ok(db.pool().clone())
+        })
+        .await
+        .expect("rebuilt");
+        assert!(report.integrity_ok, "{report:?}");
+        let db = memorabilia::store::Db::open(&path.to_string_lossy()).await.unwrap();
+        assert_eq!(db.vec_dim().await.unwrap(), Some(8), "the vector index came across");
     }
 
     #[tokio::test]
