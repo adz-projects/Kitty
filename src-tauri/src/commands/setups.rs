@@ -31,7 +31,7 @@ pub async fn upsert_setup(app: AppHandle, mut setup: Setup) -> Result<Setup, Str
             .providers
             .iter()
             .find(|p| p.id == setup.provider_id)
-            .ok_or("Choose a provider for this setup.")?;
+            .ok_or("Choose a provider for this model.")?;
         if !provider.is_enabled(&setup.model) {
             return Err(format!(
                 "Check {} in {}'s model list first.",

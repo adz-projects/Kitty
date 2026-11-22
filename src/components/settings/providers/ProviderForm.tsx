@@ -220,7 +220,7 @@ export function ProviderForm({
         models.length === 1 ? 'it' : 'them'
       }, and can't be used until you choose another model for ${
         names.length === 1 ? 'it' : 'them'
-      } under Setups.`,
+      } under Models.`,
       confirmLabel: 'Uncheck',
     });
   };
@@ -366,8 +366,8 @@ export function ProviderForm({
         )}
         {profile.models.length === 0 ? (
           <small className="muted">
-            Fetch the provider&apos;s models, then check the ones you may want to use. Setups choose
-            from the checked models.
+            Fetch the provider&apos;s models, then check the ones you may want to use. Only checked
+            models can be added under Models.
           </small>
         ) : (
           <>
@@ -398,7 +398,7 @@ export function ProviderForm({
                 <UncheckAllIcon />
               </button>
             </div>
-            <ul className="model-checklist" aria-label="Checked models, for setups">
+            <ul className="model-checklist" aria-label="Checked models">
               {shown.map((m) => {
                 const id = `prov-model-${m.model}`;
                 const marked = profile.vision_models.includes(m.model);

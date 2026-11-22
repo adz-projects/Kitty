@@ -6,6 +6,7 @@ import {
   duplicateOf,
   modelKey,
   moved,
+  droppedAt,
   setupsUsing,
   splitModelKey,
 } from './setupUtils';
@@ -80,6 +81,12 @@ describe('setup helpers', () => {
 
   it('moves within bounds', () => {
     expect(moved([1, 2, 3], 0, 1)).toEqual([2, 1, 3]);
+    expect(droppedAt([1, 2, 3], 0, 3)).toEqual([2, 3, 1]);
+    expect(droppedAt([1, 2, 3], 2, 0)).toEqual([3, 1, 2]);
+    expect(droppedAt([1, 2, 3], 1, 3)).toEqual([1, 3, 2]);
+    const fixed = [1, 2, 3];
+    expect(droppedAt(fixed, 1, 1)).toBe(fixed);
+    expect(droppedAt(fixed, 1, 2)).toBe(fixed);
     expect(moved([1, 2, 3], 2, 1)).toEqual([1, 2, 3]);
     const same = [1, 2];
     expect(moved(same, 0, -1)).toBe(same);

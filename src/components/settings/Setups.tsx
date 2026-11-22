@@ -9,9 +9,16 @@ import { TrashIcon } from '@/components/icons/TrashIcon';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { Banner } from '@/components/shared/Banner';
 import { SetupForm } from './setups/SetupForm';
-import { blankSetup, checkedModels, duplicateOf, moved, setupTitle } from './setups/setupUtils';
+import {
+  blankSetup,
+  checkedModels,
+  droppedAt,
+  duplicateOf,
+  moved,
+  setupTitle,
+} from './setups/setupUtils';
 
-/** Settings → Setups: what chats run on. Each is a checked model with a
+/** Settings → Models (internally "setups"): what chats run on. Each is a checked model with a
     name, a thinking level, a context length and a system prompt; the chat's
     model menu lists them in this order. */
 export function Setups({ highlight }: { highlight: string | null }) {
@@ -24,6 +31,8 @@ export function Setups({ highlight }: { highlight: string | null }) {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [redetecting, setRedetecting] = useState(false);
+  // Drag to reorder: the row being dragged and the gap it would drop into.
+  const [drag, setDrag] = useState<{ from: number; gap: number } | null>(null);
 
   const refresh = () =>
     Promise.all([ipc.listProviders(), ipc.listProviderAccounts(), ipc.getConfig()])
@@ -75,7 +84,7 @@ export function Setups({ highlight }: { highlight: string | null }) {
   const onDelete = async (c: ProviderView) => {
     const ok = await confirmDialog({
       title: `Delete "${c.name}"?`,
-      message: 'Chats that use it stay readable, but continue only after you choose another setup.',
+      message: 'Chats that use it stay readable, but continue only after you choose another model.',
       confirmLabel: 'Delete',
       danger: true,
     });
@@ -88,8 +97,8 @@ export function Setups({ highlight }: { highlight: string | null }) {
         const def = now.find((x) => x.id === next);
         setNotice(
           def
-            ? `${def.name} is now the default setup for new chats.`
-            : 'There is no default setup now. Add one to start new chats.'
+            ? `${def.name} is now the default model for new chats.`
+            : 'There is no default model now. Add one to start new chats.'
         );
       }
     } catch (e) {
@@ -97,8 +106,7 @@ export function Setups({ highlight }: { highlight: string | null }) {
     }
   };
 
-  const move = async (index: number, delta: number) => {
-    const order = moved(cards, index, delta);
+  const reorder = async (order: ProviderView[]) => {
     if (order === cards) return;
     setCards(order);
     try {
@@ -107,6 +115,15 @@ export function Setups({ highlight }: { highlight: string | null }) {
       setError(String(e));
     }
     await refresh();
+  };
+
+  /** The gap under the pointer: before or after the row it is over. */
+  const gapAt = (x: number, y: number): number | null => {
+    const row = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-setup-index]');
+    if (!row) return null;
+    const index = Number(row.dataset.setupIndex);
+    const rect = row.getBoundingClientRect();
+    return y < rect.top + rect.height / 2 ? index : index + 1;
   };
 
   const redetectAll = async () => {
@@ -126,7 +143,7 @@ export function Setups({ highlight }: { highlight: string | null }) {
   return (
     <section className="settings-section">
       <div className="row" style={{ justifyContent: 'space-between' }}>
-        <h1>Setups</h1>
+        <h1>Models</h1>
         <div className="row">
           <button
             onClick={() => void redetectAll()}
@@ -141,13 +158,14 @@ export function Setups({ highlight }: { highlight: string | null }) {
             disabled={!hasModels}
             title={hasModels ? undefined : 'Add a provider and check a model first'}
           >
-            Add setup
+            Add model
           </button>
         </div>
       </div>
       <p className="muted">
-        A setup is a model with its own name, thinking level, context length and system prompt.
-        Chats, scheduled tasks and specialists run on setups.
+        The models your chats can use: each is one of your providers&apos; models, with your own
+        name for it and optional settings (how hard it thinks, its context size, a system prompt).
+        Drag ⠿ to set the order the chat&apos;s model menu shows them in.
       </p>
       {error && <div className="chat-error">{error}</div>}
       {notice && (
@@ -170,7 +188,7 @@ export function Setups({ highlight }: { highlight: string | null }) {
       )}
 
       <label className="field default-model-field">
-        <span>Default setup for new chats</span>
+        <span>Default model for new chats</span>
         <select
           value={active?.id ?? ''}
           disabled={settingDefault || usable.length === 0}
@@ -179,7 +197,7 @@ export function Setups({ highlight }: { highlight: string | null }) {
         >
           {!active && (
             <option value="" disabled>
-              {usable.length === 0 ? 'Add a setup first' : 'Choose a setup'}
+              {usable.length === 0 ? 'Add a model first' : 'Choose a model'}
             </option>
           )}
           {usable.map((c) => (
@@ -189,7 +207,7 @@ export function Setups({ highlight }: { highlight: string | null }) {
           ))}
         </select>
         <small className="muted">
-          {settingDefault ? 'Checking the model…' : 'Chats already open keep their own setup.'}
+          {settingDefault ? 'Checking the model…' : 'Chats already open keep their own model.'}
         </small>
       </label>
 
@@ -197,15 +215,59 @@ export function Setups({ highlight }: { highlight: string | null }) {
         {cards.length === 0 && (
           <p className="muted">
             {hasModels
-              ? 'No setups yet. Add one to start chatting.'
-              : 'No setups yet. Add a provider and check its models first.'}
+              ? 'No models yet. Add one to start chatting.'
+              : 'No models yet. Add a provider and check the models you want first.'}
           </p>
         )}
         {cards.map((c, i) => {
           const price = priceHint(c.info);
           const level = c.setup.effort;
+          const dropClass =
+            drag && drag.from !== i && drag.gap === i
+              ? ' drop-before'
+              : drag && drag.from !== i && drag.gap === i + 1 && i === cards.length - 1
+                ? ' drop-after'
+                : '';
           return (
-            <div key={c.id} className={`provider-row${highlight === c.id ? ' highlight' : ''}`}>
+            <div
+              key={c.id}
+              data-setup-index={i}
+              className={`provider-row setup-row${highlight === c.id ? ' highlight' : ''}${
+                drag?.from === i ? ' dragging' : ''
+              }${dropClass}`}
+            >
+              <span
+                className="drag-handle muted"
+                role="button"
+                tabIndex={0}
+                title="Drag to reorder (or use the arrow keys)"
+                aria-label={`Reorder ${c.name}`}
+                onPointerDown={(e) => {
+                  e.preventDefault();
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  setDrag({ from: i, gap: i });
+                }}
+                onPointerMove={(e) => {
+                  if (!drag) return;
+                  const gap = gapAt(e.clientX, e.clientY);
+                  if (gap !== null && gap !== drag.gap) setDrag({ ...drag, gap });
+                }}
+                onPointerUp={() => {
+                  if (!drag) return;
+                  const order = droppedAt(cards, drag.from, drag.gap);
+                  setDrag(null);
+                  void reorder(order);
+                }}
+                onPointerCancel={() => setDrag(null)}
+                onKeyDown={(e) => {
+                  const delta = e.key === 'ArrowUp' ? -1 : e.key === 'ArrowDown' ? 1 : 0;
+                  if (!delta) return;
+                  e.preventDefault();
+                  void reorder(moved(cards, i, delta));
+                }}
+              >
+                ⠿
+              </span>
               <div className="provider-row-info">
                 <div className="provider-name">
                   <span className="provider-name-text">{c.name}</span>
@@ -237,24 +299,6 @@ export function Setups({ highlight }: { highlight: string | null }) {
                 )}
               </div>
               <div className="row provider-row-actions">
-                <button
-                  className="icon-button"
-                  onClick={() => void move(i, -1)}
-                  disabled={i === 0}
-                  title="Move up"
-                  aria-label={`Move ${c.name} up`}
-                >
-                  ↑
-                </button>
-                <button
-                  className="icon-button"
-                  onClick={() => void move(i, 1)}
-                  disabled={i === cards.length - 1}
-                  title="Move down"
-                  aria-label={`Move ${c.name} down`}
-                >
-                  ↓
-                </button>
                 <button
                   className="icon-button"
                   onClick={() => setEditing({ ...c.setup })}

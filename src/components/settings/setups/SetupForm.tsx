@@ -77,7 +77,7 @@ export function SetupForm({
   const canSave = !!setup.provider_id && !!setup.model && !unavailable && !saving;
 
   return (
-    <Modal title={setup.id ? 'Edit setup' : 'Add setup'} onClose={onCancel}>
+    <Modal title={setup.id ? 'Edit model' : 'Add model'} onClose={onCancel}>
       <label className="field">
         <span>Model</span>
         <select
@@ -109,9 +109,7 @@ export function SetupForm({
           {unavailable
             ? 'This model is no longer checked in its provider. Choose another, or check it again under Providers.'
             : 'The models checked under Providers, best first. $ is up to $3 per million output tokens, $$ up to $8, $$$ more.'}
-          {setup.id &&
-            !unavailable &&
-            ' Chats already on this setup keep the model they started on.'}
+          {setup.id && !unavailable && ' Chats already using it keep the model they started on.'}
         </small>
       </label>
 
@@ -207,11 +205,11 @@ export function SetupForm({
             }
           >
             <option value="allowed">If it is the best available</option>
-            <option value="preferred">Prefer this setup</option>
+            <option value="preferred">Prefer this model</option>
             <option value="never">Never</option>
           </select>
           <small className="muted">
-            Where delegated work may run. A cheap, fast setup is usually the right one to prefer.
+            Whether specialists may run on it. A cheap, fast model is usually the one to prefer.
           </small>
         </label>
       )}

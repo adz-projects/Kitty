@@ -8,7 +8,6 @@ import { Providers } from '@/components/settings/Providers';
 import { Setups } from '@/components/settings/Setups';
 import { HelperModels } from '@/components/settings/HelperModels';
 import { McpServers } from '@/components/settings/McpServers';
-import { NotificationsSection } from '@/components/settings/NotificationsSection';
 import { Appearance } from '@/components/settings/Appearance';
 import { Advanced } from '@/components/settings/Advanced';
 import { AdaptivePathway } from '@/components/settings/AdaptivePathway';
@@ -21,15 +20,14 @@ function sectionLabels(): Record<string, string> {
   return {
     general: 'General',
     providers: 'Providers',
-    setups: 'Setups',
-    local_models: 'Helper Models',
-    mcp_servers: 'MCP Servers',
+    setups: 'Models',
+    local_models: 'Helper models',
+    mcp_servers: 'MCP servers',
     tool_permissions: 'Tool permissions',
-    scheduled_tasks: 'Scheduled Tasks',
+    scheduled_tasks: 'Scheduled tasks',
     specialists: 'Specialists',
     adaptive_pathway: 'Adaptive Pathway',
     memorabilia: 'Memorabilia',
-    notifications: 'Notifications',
     appearance: 'Appearance',
     advanced: 'Advanced',
   };
@@ -43,9 +41,8 @@ function buildGroups(): { label: string; sections: string[] }[] {
   return [
     {
       label: 'Essentials',
-      // Notifications are the OS's job on Android: the system Settings app
-      // owns per-channel control there, and a second in-app copy would be a
-      // set of toggles that the OS can silently override.
+      // Notifications live in General (desktop only): on Android the system
+      // Settings app owns per-channel control.
       sections: [
         // General is desktop-only: on Android everything in it is either
         // desktop-only (hotkeys/clipboard/autostart) or relocated — the chats
@@ -56,7 +53,6 @@ function buildGroups(): { label: string; sections: string[] }[] {
         'setups',
         'local_models',
         'appearance',
-        ...(isAndroid() ? [] : ['notifications']),
       ],
     },
     {
@@ -182,7 +178,6 @@ export function SettingsView() {
         {section === 'specialists' && <Specialists />}
         {section === 'adaptive_pathway' && <AdaptivePathway />}
         {section === 'memorabilia' && <Memorabilia />}
-        {section === 'notifications' && <NotificationsSection />}
         {section === 'appearance' && <Appearance />}
         {section === 'advanced' && <Advanced />}
       </main>

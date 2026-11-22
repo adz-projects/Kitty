@@ -3,10 +3,11 @@ import { ipc } from '@/lib/ipc';
 import type { DebateSeat, ModelInfo, ProviderAccountView } from '@/lib/types';
 import { modelLabel, modelTitle } from '@/lib/models';
 
-/** Settings → Specialists → Debate panel: the models a `/debate` may seat its
-    personas on. Any model a provider lists can sit here, checked or not and
-    whether or not a setup uses it, since a debate wants capable models. With
-    no seats, a debate uses the setups. Mirrors `config::providers::debate`. */
+/** Settings → Specialists → debater → Edit → Debate panel: the models a
+    `/debate` may seat its personas on. Any model a provider lists can sit
+    here, checked or not and whether or not a setup uses it, since a debate
+    wants capable models. With no seats, a debate uses the setups. Mirrors
+    `config::providers::debate`. */
 export function DebatePanel() {
   const [seats, setSeats] = useState<DebateSeat[]>([]);
   const [accounts, setAccounts] = useState<ProviderAccountView[]>([]);
@@ -59,16 +60,14 @@ export function DebatePanel() {
 
   return (
     <>
-      <h2>Debate panel</h2>
-      <p className="muted">
-        The models a debate can seat its personas on. Start a message with <code>/debate</code>,
-        describe the personas, the number of rounds and what the debate should examine, and attach
-        or link what is being debated. Your chat&apos;s model moderates and gives each persona one
-        of these models. Seats are picked for what they can do, so the subagent denylist and each
-        setup&apos;s specialist setting do not apply here. With no seats, a debate uses your setups;
-        with only one model available, your chat&apos;s model voices every persona itself. A{' '}
-        <code>/critique</code> puts its lenses on the same panel.
-      </p>
+      <div className="settings-subhead">
+        <h3>Debate panel</h3>
+        <p className="muted">
+          Models a <code>/debate</code> seats its personas on (and <code>/critique</code> its
+          lenses). Any model a provider lists; the subagent denylist does not apply. With none, your
+          models are used.
+        </p>
+      </div>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-list">
         {seats.map((s) => {
@@ -87,7 +86,7 @@ export function DebatePanel() {
             </div>
           );
         })}
-        {seats.length === 0 && <p className="muted">No seats: debates use your setups.</p>}
+        {seats.length === 0 && <p className="muted">No seats yet.</p>}
       </div>
       <div className="row">
         <select

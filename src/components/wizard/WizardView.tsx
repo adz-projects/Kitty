@@ -210,7 +210,7 @@ export function WizardView() {
           role="chat"
           title="Summarizer model (recommended)"
           blurb="Long chats get summarized so they don't run out of room. With this model it happens here on your computer — private, and free. Without it, your chat provider does it, which costs tokens."
-          skipNote="Optional — you can download it later in Settings → Helper Models."
+          skipNote="Optional — you can download it later in Settings → Helper models."
           onBack={back}
           onNext={nextAndMark}
           onSkip={nextAndMark}

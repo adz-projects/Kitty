@@ -137,8 +137,6 @@ export function Memorabilia() {
         )}
       </div>
 
-      {!modelMissing && <OvernightLearning />}
-
       {enabled && !modelMissing && (
         <>
           <MemorabiliaHealth refreshKey={refreshKey} />
@@ -182,6 +180,8 @@ export function Memorabilia() {
           </div>
         </>
       )}
+
+      {!modelMissing && <OvernightLearning />}
     </section>
   );
 }

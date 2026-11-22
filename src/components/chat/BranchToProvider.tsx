@@ -137,9 +137,9 @@ export function BranchProviderDialog({ onClose }: { onClose: () => void }) {
 
   if (flow.gate) return flow.gate;
   return (
-    <Dialog title="Continue on another setup" onClose={onClose}>
+    <Dialog title="Continue on another model" onClose={onClose}>
       <p className="muted" style={{ margin: 0 }}>
-        The conversation continues in a new chat on the setup you pick. This chat stays as it is.
+        The conversation continues in a new chat on the model you pick. This chat stays as it is.
       </p>
       <div className="provider-choice-list">
         {others.map((p) => (
@@ -154,7 +154,7 @@ export function BranchProviderDialog({ onClose }: { onClose: () => void }) {
             <span className="provider-option-name">{p.name}</span>
           </button>
         ))}
-        {others.length === 0 && <p className="muted">There is no other setup.</p>}
+        {others.length === 0 && <p className="muted">There is no other model.</p>}
       </div>
       {flow.error && <p className="error">{flow.error}</p>}
       <div className="modal-actions">

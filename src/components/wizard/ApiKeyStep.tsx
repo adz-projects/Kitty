@@ -247,7 +247,7 @@ export function ApiKeyStep({
         />
         <small className="muted">
           Kitty fetches the provider&apos;s models and starts you on a strong, sensibly priced one.
-          Check more models in Settings → Providers, and make setups of them in Settings → Setups.
+          Check more models in Settings → Providers, and add them in Settings → Models.
         </small>
       </label>
 

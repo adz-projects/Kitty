@@ -80,7 +80,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
         const def = now.find((c) => c.active);
         if (def) {
           setNotice(
-            `Kitty made a setup for ${def.info.name} and chose it for new chats. Add more under Setups.`
+            `Kitty added ${def.info.name} under Models and chose it for new chats. Add more there.`
           );
         }
       }
@@ -101,7 +101,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
     const ok = await confirmDialog({
       title: `Delete "${p.name}"?`,
       message:
-        'Its saved API key and every setup on its models are deleted too. Chats that used them stay readable, and continue once you choose another setup.',
+        'Its saved API key, and every model of it under Models, are deleted too. Chats that used them stay readable, and continue once you choose another model.',
       confirmLabel: 'Delete',
       danger: true,
     });
@@ -115,8 +115,8 @@ export function Providers({ highlight }: { highlight: string | null }) {
         const def = now.find((c) => c.id === next);
         setNotice(
           def
-            ? `${def.name} is now the default setup for new chats.`
-            : 'There is no default setup now. Add a provider to start new chats.'
+            ? `${def.name} is now the default model for new chats.`
+            : 'There is no default model now. Add a provider to start new chats.'
         );
       }
     } catch (e) {
@@ -188,7 +188,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
                   {checked} of {p.models.length} model{p.models.length === 1 ? '' : 's'} checked ·{' '}
                   {(() => {
                     const n = cards.filter((c) => c.info.provider_id === p.id).length;
-                    return `${n} setup${n === 1 ? '' : 's'}`;
+                    return `${n} in use under Models`;
                   })()}
                   {['custom_openai', 'ollama', 'local'].includes(p.provider_type) &&
                     ` · ${p.base_url}`}

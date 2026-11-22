@@ -27,6 +27,11 @@ const HIDDEN_SERVER_NAMES = new Set([
   // by `ensure_builtin_servers` like the rest of this set, and configured
   // under Settings -> Specialists rather than as an editable MCP card.
   'specialists',
+  // Memorabilia is switched on and off under Settings -> Memorabilia, and the
+  // deep-research tools are a fixed part of the app: neither is a server to
+  // manage here.
+  'memorabilia',
+  'research',
   'adaptive-pathway',
   'replacement-mcp',
   'wasm-math-mcp',
@@ -324,9 +329,10 @@ export function McpServers() {
 
   return (
     <section className="settings-section">
-      <h1>MCP Servers</h1>
+      <h1>MCP servers</h1>
       <p className="muted">
-        Tools available to the agent. Changes here take effect immediately — no restart needed.
+        Extra tools your chats can use, from tool servers you add here. Kitty&apos;s own tools are
+        built in. Changes apply at once.
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-grid ext-grid-1col" style={{ marginBottom: 16 }}>
@@ -828,9 +834,8 @@ function BraveMcpSearchCard({ parentOn }: { parentOn: boolean }) {
     unless set explicitly. */
 function BaconMcpCard() {
   // Whether to show the card at all, decided once per visit to this panel:
-  // only when Bacon is installed, or when the switch is already on (so it
-  // can still be turned off after Bacon is uninstalled). Hidden until known,
-  // and hidden if the check itself fails.
+  // only when Bacon is installed. Hidden until known, and hidden if the check
+  // itself fails.
   const [offered, setOffered] = useState(false);
   const [enabled, setEnabled] = useState(false);
   const [path, setPath] = useState('');
@@ -842,7 +847,7 @@ function BaconMcpCard() {
     void ipc
       .getBaconMcpStatus()
       .then((s) => {
-        setOffered(s.installed || s.enabled);
+        setOffered(s.installed);
         setEnabled(s.enabled);
         setPath(s.path ?? '');
         setRegistered(s.registered);

@@ -88,7 +88,9 @@ export function DecisionModel() {
   if (!draft || !saved) {
     return (
       <>
-        <h2>Decision model</h2>
+        <div className="settings-subhead">
+          <h2>Decision model</h2>
+        </div>
         {error && <div className="chat-error">{error}</div>}
       </>
     );
@@ -218,57 +220,45 @@ export function DecisionModel() {
 
   return (
     <>
-      <h2>Decision model</h2>
-      <p className="muted">
-        A small, fast classifier Kitty can ask quick yes/no questions — which tools a chat needs,
-        whether a page is a bot check, what is worth remembering, whether a shell command needs your
-        approval. It runs on a server you point Kitty at, not inside Kitty. Optional: with no model,
-        or when its server can&apos;t be reached, everything works exactly as before.
-      </p>
+      <div className="settings-subhead">
+        <h2>Decision model</h2>
+        <p className="muted">
+          An optional classifier on a server you run, which Kitty asks quick yes/no questions.
+          Without it, everything works as before.
+        </p>
+      </div>
 
-      <label className="field">
-        <span>Type</span>
-        <select
-          value={draft.dialect}
-          onChange={(e) => setDraft({ ...draft, dialect: e.target.value })}
-        >
-          {dialects.map((d) => (
-            <option key={d} value={d}>
-              {DIALECT_LABELS[d] ?? d}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="field">
-        <span>Endpoint</span>
-        <input
-          type="text"
-          placeholder="http://127.0.0.1:8080"
-          value={draft.url}
-          onChange={(e) => {
-            setDraft({ ...draft, url: e.target.value });
-            setProbe(null);
-          }}
-        />
-      </label>
-      <p className="muted" style={{ marginTop: 4 }}>
-        {isHosted(draft.dialect) ? (
-          <>
-            The full System One endpoint. For Cloudflare Clef, paste{' '}
-            <code>
-              https://api.cloudflare.com/client/v4/accounts/&lt;id&gt;/ai/run/@cf/cloudflare/clef
-            </code>{' '}
-            with your API token and model <code>clef</code>. For a hosted gateway (Jev, Drex, d1
-            aggregators), paste its endpoint, key, and a model id like <code>drex-2.0</code>.
-          </>
-        ) : (
-          <>
-            For self-hosted d1, the root of a <code>llama-server</code> running the GGUF (it answers
-            on <code>/v1/systemone</code>). Reachable from this device — over Tailscale works on
-            Android.
-          </>
-        )}
-      </p>
+      <div className="decider-endpoint">
+        <label className="field">
+          <span>Type</span>
+          <select
+            value={draft.dialect}
+            onChange={(e) => setDraft({ ...draft, dialect: e.target.value })}
+          >
+            {dialects.map((d) => (
+              <option key={d} value={d}>
+                {DIALECT_LABELS[d] ?? d}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>Endpoint</span>
+          <input
+            type="text"
+            placeholder={
+              isHosted(draft.dialect)
+                ? 'https://…/ai/run/@cf/cloudflare/clef'
+                : 'http://127.0.0.1:8080 (llama-server root)'
+            }
+            value={draft.url}
+            onChange={(e) => {
+              setDraft({ ...draft, url: e.target.value });
+              setProbe(null);
+            }}
+          />
+        </label>
+      </div>
       {isHosted(draft.dialect) && (
         <>
           <label className="field">
@@ -331,17 +321,14 @@ export function DecisionModel() {
           <button onClick={() => addSecondary()} disabled={!draft.url.trim()}>
             Add a fallback model
           </button>
-          <span className="muted">Used only if the model above can&apos;t be reached.</span>
+          <span className="muted">Tried only when the model above fails.</span>
         </div>
       ) : (
         <div className="field" style={{ marginTop: 8 }}>
           <span>
-            <strong>Fallback model</strong>
+            <strong>Fallback model</strong>{' '}
+            <span className="muted">(tried only when the model above fails)</span>
           </span>
-          <p className="muted" style={{ marginTop: 0 }}>
-            Tried only when the model above fails to answer a question (its server is down, errors,
-            or replies in an unexpected shape). Thresholds stay those of the primary.
-          </p>
           <label className="field">
             <span>Type</span>
             <select
@@ -431,8 +418,8 @@ export function DecisionModel() {
         </div>
       )}
 
-      <p className="muted">
-        Each use can be switched on or off on its own. Saving applies them at once, with no restart.
+      <p className="muted" style={{ margin: 0 }}>
+        Uses (applied on Save, no restart):
       </p>
       {DECIDER_FEATURES.map((f) => {
         const line = statLine(f.id, stats[f.id]);
@@ -485,11 +472,8 @@ export function DecisionModel() {
           Chunk the memory intake screen
         </label>
         <p className="muted" style={{ margin: 0 }}>
-          When Kitty decides which pasted/attached passages are worth remembering, it asks the
-          decision model about each passage. <strong>On</strong>, it bundles several passages into
-          one call — cheaper and faster, but on a quick test it let through a bit more filler.{' '}
-          <strong>Off</strong> (the default) asks about one passage at a time, the most precise.
-          Only affects what gets saved to memory, not the four checks above.
+          Screens several passages per call: cheaper, but lets a little more filler through. Off
+          (the default) is the most precise.
         </p>
       </div>
 
@@ -502,9 +486,7 @@ export function DecisionModel() {
       </button>
       {thresholdsOpen && (
         <>
-          <p className="muted">
-            Probability cutoffs, tuned for the model. Leave a field empty to use the default.
-          </p>
+          <p className="muted">Empty uses the model&apos;s default.</p>
           {DECIDER_THRESHOLDS.map((t) => (
             <label className="field" key={t.key}>
               <span>{t.label}</span>

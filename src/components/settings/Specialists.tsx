@@ -289,9 +289,9 @@ export function Specialists() {
     <section className="settings-section">
       <h1>Specialists</h1>
       <p className="muted">
-        Delegate agents the model can call mid-turn. A specialist runs in its own context with its
-        own tools, so its searching and reading never fills up your conversation — only its result
-        comes back. You never invoke one directly; the model picks one when a request calls for it.
+        Helpers your chat&apos;s model can hand a piece of work to, such as researching a question.
+        Their searching and reading happens off to the side, and only the answer comes back into
+        your chat. The model decides when to use one.
       </p>
       <label className="check">
         <input
@@ -301,10 +301,8 @@ export function Specialists() {
         />
         Enable specialists
       </label>
-      <p className="muted" style={{ marginTop: 4 }}>
-        Turn this off to stop the model delegating entirely — it will no longer be offered the
-        delegation tools. Takes effect immediately, no restart. Your specialist definitions below
-        are kept.
+      <p className="muted" style={{ margin: 0 }}>
+        Off: the model does everything itself. Your specialists are kept.
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-list">
@@ -331,18 +329,14 @@ export function Specialists() {
         + New specialist
       </button>
 
-      <DebatePanel />
-
-      <CritiquePanel />
-
-      <h2>Never use as a subagent</h2>
-      <p className="muted">
-        Models that may never host a specialist, however the daemon would otherwise pick. Exact ids,
-        or a prefix like <code>claude-fable-*</code>. This is checked last as well as first, so a
-        denied model is refused even when it is the only one left — you will be told rather than
-        quietly billed. Applies when Kitty&apos;s engine next restarts, which Kitty does for you as
-        soon as nothing is using it.
-      </p>
+      <div className="settings-subhead">
+        <h2>Models specialists never use</h2>
+        <p className="muted">
+          Keeps expensive models off background work. Exact model ids, or a prefix such as{' '}
+          <code>claude-opus-*</code>. Applies once Kitty restarts its engine, which it does as soon
+          as nothing is running.
+        </p>
+      </div>
       <div className="ext-list">
         {deny.map((m) => (
           <div className="row" key={m} style={{ alignItems: 'center' }}>
@@ -370,7 +364,9 @@ export function Specialists() {
         </button>
       </div>
 
-      <h2>Limits</h2>
+      <div className="settings-subhead">
+        <h2>Limits</h2>
+      </div>
       {limits && (
         <>
           <div className="row">
@@ -409,18 +405,18 @@ export function Specialists() {
         </>
       )}
 
-      <h2>Recent delegate runs</h2>
-      <p className="muted">
-        Which specialist answered which request, and on what. The model chooses a specialist by
-        reading its description, so this is where a description that is drawing the wrong work
-        becomes visible. Expand a run to read the delegate&apos;s own transcript — delegate sessions
-        are deliberately kept out of Saved Chats, so this is where they live.
-      </p>
+      <div className="settings-subhead">
+        <h2>Recent runs</h2>
+        <p className="muted">
+          The last 10 jobs: which specialist did what, on which model. Open one to read its work. A
+          specialist that keeps getting the wrong jobs needs a sharper description.
+        </p>
+      </div>
       {runs.length === 0 ? (
         <p className="muted">Nothing delegated yet.</p>
       ) : (
         <div className="ext-list">
-          {runs.slice(0, 20).map((r) => (
+          {runs.slice(0, 10).map((r) => (
             <DelegateRunRow key={r.id} run={r} />
           ))}
         </div>
@@ -460,9 +456,8 @@ export function Specialists() {
               placeholder="Answers a factual question that needs sources from the web…"
             />
             <small className="muted">
-              This is the only thing the model reads when deciding whether to delegate. Say what
-              this specialist is for and, where it matters, what it is not for — a vague description
-              does not fail loudly, it just gets used for the wrong things.
+              The model reads only this to decide when to use the specialist. Say what it is for,
+              and what it is not for.
             </small>
           </div>
           <div className="field">
@@ -495,12 +490,11 @@ export function Specialists() {
               </div>
             )}
             <small className="muted">
-              Exactly what this specialist may call — anything else is refused, even if it asks for
-              it by name. Leave everything unchecked for a specialist that only reasons.
+              The only tools it may use. None checked: it only thinks.
             </small>
           </div>
           <div className="field">
-            <span>Setup (optional)</span>
+            <span>Model (optional)</span>
             {/* Each entry is a setup (its card: the engine row the specialist
                 is pinned to), so the model comes with it. The specialist's own
                 prompt replaces the setup's. */}
@@ -519,8 +513,8 @@ export function Specialists() {
               ))}
             </select>
             <small className="muted">
-              Pin a cheaper or faster setup for work that does not need your main one. The
-              specialist&apos;s own instructions replace the setup&apos;s system prompt.
+              A cheaper or faster model for work that doesn&apos;t need your main one. The
+              specialist&apos;s instructions replace the model&apos;s system prompt.
             </small>
           </div>
           <div className="field">
@@ -532,10 +526,9 @@ export function Specialists() {
               placeholder='{"type": "object", "properties": {…}, "required": […], "additionalProperties": false}'
             />
             <small className="muted">
-              JSON Schema the answer must match. Without one the specialist replies in prose, which
-              the calling model has to interpret — the point of delegating is usually to get back
-              something small and exact. Hosted OpenAI models require every property listed in{' '}
-              <code>required</code> and <code>additionalProperties: false</code>.
+              A JSON Schema for a short, exact answer; without one it answers in prose. (OpenAI
+              models need every property in <code>required</code> and{' '}
+              <code>additionalProperties: false</code>.)
             </small>
           </div>
           <div className="field">
@@ -546,10 +539,8 @@ export function Specialists() {
               onChange={(e) => setForm({ ...form, reasoningCap: e.target.value })}
             />
             <small className="muted">
-              How much of the run may go on thinking — a token count, or a percentage of the
-              model&apos;s remaining context like <code>25%</code>. Leave blank for the default.
-              When it runs out the specialist stops thinking and writes its answer with what it has,
-              rather than being cut off.
+              How much it may think before answering: tokens, or a share of its context such as{' '}
+              <code>25%</code>. Blank uses the default.
             </small>
           </div>
           <label className="check">
@@ -561,9 +552,8 @@ export function Specialists() {
             Run one instance per source
           </label>
           <small className="muted">
-            Splits a call carrying several documents into one delegate each, processed in parallel.
-            Right for per-document work like extraction; wrong for anything that has to look{' '}
-            <em>across</em> the whole set, which needs to see all of it at once.
+            Several documents are handled one per copy, in parallel. Right for per-document work;
+            wrong for anything that compares across them.
           </small>
           <div className="field">
             <span>Step limit</span>
@@ -574,9 +564,7 @@ export function Specialists() {
               value={form.maxSteps}
               onChange={(e) => setForm({ ...form, maxSteps: Number(e.target.value) })}
             />
-            <small className="muted">
-              How many tool-calling rounds it may take before it has to answer with what it has.
-            </small>
+            <small className="muted">How many rounds of tool use before it must answer.</small>
           </div>
           <div className="field">
             <span>At most this many at once (optional)</span>
@@ -589,8 +577,7 @@ export function Specialists() {
               onChange={(e) => setForm({ ...form, maxConcurrent: e.target.value })}
             />
             <small className="muted">
-              For a specialist on a provider that throttles parallel requests. The overall limit
-              below still applies.
+              For a provider that limits parallel requests. The overall limit still applies.
             </small>
           </div>
           <label className="check">
@@ -601,6 +588,19 @@ export function Specialists() {
             />
             Offer this specialist to the model
           </label>
+          {/* Kitty's own two specialists carry settings of their own, kept
+              with them rather than as panels of the Specialists page. They
+              save on their own; Save below is for the specialist. */}
+          {editing !== 'new' && editing.name === 'debater' && (
+            <div className="specialist-extra">
+              <DebatePanel />
+            </div>
+          )}
+          {editing !== 'new' && editing.name === 'critic' && (
+            <div className="specialist-extra">
+              <CritiquePanel />
+            </div>
+          )}
           <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
             <button onClick={() => setEditing(null)}>Cancel</button>
             <button className="primary" disabled={saving} onClick={() => void save()}>

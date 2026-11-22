@@ -5,26 +5,23 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
   {
     id: 'tool_gating',
     label: 'Tool gating',
-    blurb:
-      'Offers each chat only the tool groups it needs (documents, web, charts, code…). Groups are added as a chat needs them and only pruned when the provider cache has gone cold anyway, so cache hits are kept.',
+    blurb: 'Offers each chat only the tool groups it needs, without breaking the prompt cache.',
   },
   {
     id: 'ingest_gate',
     label: 'Memory: paragraph screen',
-    blurb:
-      'Reads each paragraph a chat brings in and keeps only the ones that will stay informative and are well supported, so specs, prices, announcements and filler stay out of Memorabilia. While the model is unreachable, documents wait (up to three days) rather than going in unchecked.',
+    blurb: 'Lets only lasting, well-supported paragraphs from a chat into Memorabilia.',
   },
   {
     id: 'page_classify',
     label: 'Web: page check',
-    blurb:
-      'Recognises bot challenges, paywalls and error pages when a page is scraped, instead of handing them to the model as content.',
+    blurb: 'Spots bot challenges, paywalls and error pages in scraped pages.',
   },
   {
     id: 'shell_screen',
     label: 'Shell screen',
     blurb:
-      'A second opinion on shell commands Kitty would otherwise run without asking: one that could delete files, change settings, install software, send data out or expose credentials is held for your approval. It can only add a prompt, never remove one.',
+      'Holds a risky shell command for your approval that Kitty would otherwise run; it only ever adds a prompt.',
   },
 ];
 

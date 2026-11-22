@@ -5,12 +5,10 @@ import { defaultFor } from '@/lib/curated_models';
 import { BeliefBrowser } from './BeliefBrowser';
 import { GraphHealth } from './GraphHealth';
 import { EraseMemory } from './EraseMemory';
-import { LearningModel } from './LearningModel';
+import { OvernightLearning } from './OvernightLearning';
 import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { useMemoryStatus } from '@/hooks/useMemoryStatus';
-import { useRouteStore } from '@/stores/routeStore';
-import { isAndroid } from '@/lib/platform';
 
 /** Fixed id so the progress subscription can be registered before the
     download starts (unlike a user-initiated one, which gets a fresh id). */
@@ -29,7 +27,6 @@ const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
 export function AdaptivePathway() {
   const memory = useMemoryStatus();
   const modelMissing = memory !== null && !memory.model_installed;
-  const goto = useRouteStore((st) => st.goto);
   const [enabled, setEnabled] = useState(false);
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingModelStatus>('unknown');
   const [embeddingModel, setEmbeddingModel] = useState('');
@@ -179,12 +176,6 @@ export function AdaptivePathway() {
                 {EMBEDDING_STATUS_LABEL[embeddingStatus]}
               </span>
             )}
-
-            {!modelMissing && !isAndroid() && (
-              <button className="link" onClick={() => goto('settings', { section: 'memorabilia' })}>
-                Schedule & overnight settings →
-              </button>
-            )}
           </div>
         )}
 
@@ -196,8 +187,6 @@ export function AdaptivePathway() {
           </small>
         )}
       </div>
-
-      {enabled && !modelMissing && <LearningModel />}
 
       {(modelMissing || embeddingStatus === 'missing') && (
         <div className="mem-card">
@@ -310,6 +299,8 @@ export function AdaptivePathway() {
           </div>
         </>
       )}
+
+      {!modelMissing && <OvernightLearning />}
     </section>
   );
 }

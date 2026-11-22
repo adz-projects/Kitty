@@ -15,9 +15,10 @@ export function sameLearningModel(a: LearningModelSetting, b: LearningModelSetti
   return true;
 }
 
-/** Settings → Adaptive Pathway → Memory learning model: which model both
-    memory engines learn with (extraction and cross-session synthesis).
-    Mirrors `config::providers::learning`. */
+/** Settings → Helper Models → Memory learning model, shown while Adaptive
+    Pathway or Memorabilia is on: which model both memory engines learn with
+    (extraction and cross-session synthesis). Mirrors
+    `config::providers::learning`. */
 export function LearningModel() {
   const [saved, setSaved] = useState<LearningModelSetting>({ kind: 'auto' });
   const [draft, setDraft] = useState<LearningModelSetting>({ kind: 'auto' });
@@ -70,14 +71,14 @@ export function LearningModel() {
     : "Helper model, else the chat's own model";
 
   return (
-    <div className="mem-card">
-      <div className="mem-card-head">
+    <>
+      <div className="settings-subhead">
         <h2>Memory learning model</h2>
+        <p className="muted">
+          What Adaptive Pathway and Memorabilia learn with. Applies to the next pass; if it fails,
+          learning falls back rather than stopping.
+        </p>
       </div>
-      <p className="muted" style={{ margin: 0 }}>
-        The model Adaptive Pathway and Memorabilia learn with: picking out beliefs and facts, and
-        finding patterns across chats. Changes apply to the next pass.
-      </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="mem-setting-list">
         <label className="check">
@@ -146,20 +147,14 @@ export function LearningModel() {
             </select>
           </div>
         )}
-        <small className="muted">
-          If the chosen model fails, learning falls back to the helper model or the chat&apos;s
-          model rather than stopping.
-        </small>
       </div>
-      <div className="mem-card-actions">
-        <button
-          className="primary"
-          disabled={busy || !dirty || incomplete}
-          onClick={() => void save()}
-        >
-          Save
-        </button>
-      </div>
-    </div>
+      {dirty && (
+        <div className="row">
+          <button className="primary" disabled={busy || incomplete} onClick={() => void save()}>
+            Save
+          </button>
+        </div>
+      )}
+    </>
   );
 }

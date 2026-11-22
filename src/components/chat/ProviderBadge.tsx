@@ -56,7 +56,7 @@ export function ProviderBadge() {
       ? (providers.find((p) => p.id === sessionProviderId) ?? providers.find((p) => p.active))
       : providers.find((p) => p.active);
   const activeId = active?.id;
-  const label = active ? active.name : 'No setup';
+  const label = active ? active.name : 'No model';
   const icon = active ? (
     <TrustIcon tier={active.network_tier} isTrusted={active.is_trusted} />
   ) : (
@@ -97,8 +97,8 @@ export function ProviderBadge() {
         title={
           (active ? `${setupTitle(active)}\n` : '') +
           (locked
-            ? 'Click to continue this conversation on another setup'
-            : 'Click to switch this chat’s setup')
+            ? 'Click to continue this conversation on another model'
+            : 'Click to switch this chat’s model')
         }
         disabled={busy || branchFlow.busy}
       >
@@ -131,7 +131,7 @@ export function ProviderBadge() {
                 <span className="provider-option-name">{p.name}</span>
               </button>
             ))}
-          {providers.length === 0 && <span className="muted">No setups yet</span>}
+          {providers.length === 0 && <span className="muted">No models yet</span>}
         </div>
       )}
       {branchFlow.gate}

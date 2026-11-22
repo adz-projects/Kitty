@@ -180,11 +180,13 @@ export function Advanced() {
       {draft && (
         <>
           <div className="field">
-            <span>Background context summarization</span>
-            <p className="muted" style={{ margin: 0 }}>
-              Folds older conversation history into a running summary so long sessions don&apos;t
-              run out of context.
-            </p>
+            <div className="settings-subhead">
+              <h2>Long chats</h2>
+              <p className="muted">
+                When a chat grows long, its older part is folded into a summary so it keeps fitting
+                the model&apos;s context window.
+              </p>
+            </div>
             {/* Desktop only: Android always summarizes with the chat's own
                 provider, since no generative model runs on the phone. */}
             {!android && (
@@ -211,7 +213,7 @@ export function Advanced() {
                   className="link"
                   onClick={() => goto('settings', { section: 'local_models' })}
                 >
-                  Download it in Helper Models
+                  Download it in Helper models
                 </button>
               </p>
             )}
@@ -226,7 +228,7 @@ export function Advanced() {
               className="disclosure-toggle"
               onClick={() => setTokenMgmtOpen((o) => !o)}
             >
-              {tokenMgmtOpen ? '▾' : '▸'} <strong>Token management</strong>
+              {tokenMgmtOpen ? '▾' : '▸'} <strong>Code in older messages</strong>
             </button>
             {tokenMgmtOpen && (
               <>
@@ -279,8 +281,8 @@ export function Advanced() {
                     }
                   />
                   <small className="muted">
-                    Lines kept at head/tail of code blocks in older messages. Set to 0 to disable
-                    masking.
+                    Lines kept at the start and end of each code block in older messages; the middle
+                    is hidden from the model to save space. 0 keeps code whole.
                   </small>
                 </label>
               </>
@@ -291,20 +293,20 @@ export function Advanced() {
               className="disclosure-toggle"
               onClick={() => setMemoryOpen((o) => !o)}
             >
-              {memoryOpen ? '▾' : '▸'} <strong>Pre-flight memory recall</strong>
+              {memoryOpen ? '▾' : '▸'} <strong>Recall from earlier in the chat</strong>
             </button>
             {memoryOpen && (
               <>
                 <p className="muted" style={{ margin: 0 }}>
-                  Semantic recall of older turns is injected into each prompt tail so long agentic
-                  sessions retain cross-turn context.
+                  Before each reply, relevant parts of a long chat that were summarized away are
+                  brought back.
                 </p>
                 <label className="field">
-                  <span>Minimum bm25 relevance score</span>
+                  <span>Minimum match strength</span>
                   <input
                     type="number"
                     step={0.1}
-                    placeholder="-2.0 (empty = no gate)"
+                    placeholder="-2.0 (empty = every match)"
                     value={draft.memory.bm25_threshold ?? ''}
                     onChange={(e) => {
                       // Empty string ⇔ null (gate off); anything else must be
@@ -316,12 +318,12 @@ export function Advanced() {
                     }}
                   />
                   <small className="muted">
-                    FTS BM25 relevance scores are negative — closer to 0 is more relevant. Set a
-                    minimum (e.g. -2.0) to skip weaker matches. Leave empty to disable the gate.
+                    Scores are below zero; closer to 0 is a stronger match. A minimum such as -2.0
+                    skips weak ones.
                   </small>
                 </label>
                 <div className="field">
-                  <span>Prompts with injected context</span>
+                  <span>Replies that got recalled context</span>
                   {memoryStatsError ? (
                     <p className="error" style={{ margin: 0 }}>
                       {memoryStatsError}
@@ -343,9 +345,11 @@ export function Advanced() {
           </div>
 
           <div className="field">
-            <span>Engine and setup</span>
+            <div className="settings-subhead">
+              <h2>Engine</h2>
+            </div>
             <p className="muted" style={{ margin: 0 }}>
-              Stack status: <strong>{stackStatus.replace(/_/g, ' ')}</strong>
+              Status: <strong>{stackStatus.replace(/_/g, ' ')}</strong>
               {engine?.daemon_version ? ` · engine ${engine.daemon_version}` : ''}
             </p>
             {android ? (
@@ -373,7 +377,7 @@ export function Advanced() {
                 </button>
               )}
               <button onClick={() => void ipc.openWizard('setup')}>Run first-run wizard</button>
-              <button onClick={() => void ipc.openWizard('repair')}>Repair setup</button>
+              <button onClick={() => void ipc.openWizard('repair')}>Repair installation</button>
             </div>
             {repairMsg && <p className="muted">{repairMsg}</p>}
           </div>
@@ -398,20 +402,13 @@ export function Advanced() {
         </>
       )}
 
-      <p className="muted">
-        Temperature and context length are now set per provider in Settings → Providers.
-      </p>
-
       <button type="button" className="disclosure-toggle" onClick={() => setLogOpen((o) => !o)}>
         {logOpen ? '▾' : '▸'} <strong>Error log</strong>
       </button>
       {logOpen && (
         <div>
           <p className="muted">
-            Warnings and errors captured from Kitty&apos;s own background processes (engine
-            connection issues, health checks, provider/config problems) — useful for reporting a
-            bug. This doesn&apos;t include anything the model itself said, only Kitty&apos;s own
-            internal diagnostics.
+            Kitty&apos;s own warnings and errors (never anything a model said), for reporting a bug.
           </p>
           {logError && <div className="chat-error">{logError}</div>}
           {logEntries.length === 0 && !logError && (
@@ -456,7 +453,9 @@ export function Advanced() {
 
       {draft?.handoff_gate_choice && (
         <div className="field">
-          <span>Moving chats to less-trusted providers</span>
+          <div className="settings-subhead">
+            <h2>Moving chats to less-trusted providers</h2>
+          </div>
           <p className="muted" style={{ margin: 0 }}>
             Kitty remembers your answer:{' '}
             {draft.handoff_gate_choice === 'keep'

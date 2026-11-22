@@ -260,10 +260,10 @@ export function ScheduledTasks() {
 
   return (
     <section className="settings-section">
-      <h1>Scheduled Tasks</h1>
+      <h1>Scheduled tasks</h1>
       <p className="muted">
-        Give the agent an instruction to run later — once, or on a repeating interval. Each run
-        starts a brand-new session,{' '}
+        Instructions Kitty carries out later, once or on a repeating schedule. Each run starts a new
+        chat,{' '}
         {isAndroid()
           ? 'while Kitty is running — if Android has closed Kitty, a task that fell due runs as soon as you open it again.'
           : "with or without Kitty's window open."}
@@ -347,12 +347,12 @@ export function ScheduledTasks() {
             </div>
           </div>
           <div className="field">
-            <span>Setup (optional)</span>
+            <span>Model (optional)</span>
             <select
               value={form.providerId}
               onChange={(e) => setForm({ ...form, providerId: e.target.value })}
             >
-              <option value="">The default setup when it runs</option>
+              <option value="">The default model when it runs</option>
               {providers.map((p) => (
                 <option key={p.id} value={p.id} title={setupTitle(p)}>
                   {p.name}

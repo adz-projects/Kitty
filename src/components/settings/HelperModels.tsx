@@ -5,6 +5,8 @@ import { isAndroid } from '@/lib/platform';
 import { TrashIcon } from '@/components/icons/TrashIcon';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
 import { DecisionModel } from './DecisionModel';
+import { LearningModel } from './LearningModel';
+import { useMemoryStatus } from '@/hooks/useMemoryStatus';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 /** Bytes as a short human string. Exported for testing — the repo has no
@@ -142,27 +144,24 @@ export function HelperModels() {
   };
 
   const active = Object.values(downloads);
+  const memory = useMemoryStatus();
+  const memoryOn = Boolean(memory?.pathway_active || memory?.memorabilia_active);
 
   return (
-    <div className="settings-section">
-      {/* The nav entry already says which section this is ("Helper Models" on
-          both platforms), so no hardcoded title is repeated here — only the
-          body copy still differs, since what these models actually do for
-          you differs by platform (D18: chat never runs locally on Android). */}
-      <p className="muted">
-        {isAndroid()
-          ? 'Kitty runs this itself, in the background, to power memory. Chat — and summarizing long chats — runs through the provider you connect. Downloads come from Hugging Face.'
-          : 'Models run inside Kitty — no separate server to install or keep running. Downloads come from Hugging Face.'}
-      </p>
+    <section className="settings-section">
+      <h1>Helper models</h1>
+      <div className="settings-subhead">
+        <h2>Models</h2>
+        {/* What these models do differs by platform (D18: chat never runs
+            locally on Android). */}
+        <p className="muted">
+          {isAndroid()
+            ? 'Kitty runs this itself, in the background, to power memory. Chat, and summarizing long chats, runs through the provider you connect. Downloads come from Hugging Face.'
+            : 'Models run inside Kitty, with no separate server to install or keep running. Downloads come from Hugging Face.'}
+        </p>
+      </div>
 
       {error && <div className="chat-error">{error}</div>}
-
-      {free !== null && (
-        <p className={free < LOW_SPACE_BYTES ? 'chat-error' : 'muted'}>
-          {humanBytes(free)} free on this drive
-          {free < LOW_SPACE_BYTES && ' — that may not be enough for another model.'}
-        </p>
-      )}
 
       {active.length > 0 && (
         <div className="model-list">
@@ -209,10 +208,12 @@ export function HelperModels() {
 
       {partials.length > 0 && (
         <>
-          <h2>Unfinished downloads</h2>
-          <p className="muted">
-            Downloading one of these again picks up where it stopped. Delete one to free the space.
-          </p>
+          <div className="settings-subhead">
+            <h2>Unfinished downloads</h2>
+            <p className="muted">
+              Downloading one again picks up where it stopped. Delete one to free the space.
+            </p>
+          </div>
           <div className="model-list">
             {partials.map((p) => (
               <div key={p.file} className="model-row">
@@ -238,7 +239,6 @@ export function HelperModels() {
         </>
       )}
 
-      <h2>Models</h2>
       <div className="model-list">
         {curated.map((c) => {
           const have = installedByFile.get(c.file.toLowerCase());
@@ -324,10 +324,20 @@ export function HelperModels() {
         ))}
       </div>
 
+      {free !== null && (
+        <p className={free < LOW_SPACE_BYTES ? 'chat-error' : 'muted'} style={{ margin: 0 }}>
+          {humanBytes(free)} free on this drive
+          {free < LOW_SPACE_BYTES && ' — that may not be enough for another model.'}
+        </p>
+      )}
+
+      {/* Which model the memory engines learn with: only while one is on. */}
+      {memoryOn && <LearningModel />}
+
       {/* The optional decision model is a helper model too -- one served by a
           llama-server you run rather than downloaded here -- so it lives
           beside the others rather than in a panel of its own. */}
       <DecisionModel />
-    </div>
+    </section>
   );
 }

@@ -64,6 +64,18 @@ export function setupTitle(card: Pick<ProviderView, 'info'>): string {
 }
 
 /** `ids` with the one at `index` moved by `delta` (clamped). */
+/** `items` with the one at `from` dropped into gap `gap` (0 = before the
+    first, `items.length` = after the last), for drag-and-drop. The same
+    array when nothing moves. */
+export function droppedAt<T>(items: T[], from: number, gap: number): T[] {
+  const to = gap > from ? gap - 1 : gap;
+  if (to === from || from < 0 || from >= items.length) return items;
+  const next = [...items];
+  const [item] = next.splice(from, 1);
+  next.splice(Math.max(0, Math.min(next.length, to)), 0, item);
+  return next;
+}
+
 export function moved<T>(items: T[], index: number, delta: number): T[] {
   const to = Math.max(0, Math.min(items.length - 1, index + delta));
   if (to === index) return items;

@@ -4,6 +4,16 @@ import { isAndroid } from '@/lib/platform';
 import { ipc, pickFolder } from '@/lib/ipc';
 import { accelerator } from '@/lib/accelerator';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
+import type { NotificationPrefs } from '@/lib/types';
+
+/** Desktop notifications, one switch per event (they fire only while the
+    overlay is hidden). */
+const NOTIFICATION_EVENTS: { key: keyof NotificationPrefs; label: string }[] = [
+  { key: 'approval_needed', label: 'A tool call needs approval' },
+  { key: 'task_complete', label: 'A task completed' },
+  { key: 'task_failed', label: 'A task failed' },
+  { key: 'stack_degraded', label: 'The stack became degraded' },
+];
 
 /** General settings backed by app config. Tool approvals are decided per
     call (Settings → Tool permissions lists what is always allowed). */
@@ -252,6 +262,25 @@ export function General() {
             <span>Start Kitty when I sign in</span>
           </label>
           {autostartError && <div className="chat-error">{autostartError}</div>}
+
+          <div className="settings-subhead">
+            <h2>Notifications</h2>
+            <p className="muted">Shown only while the overlay is hidden.</p>
+          </div>
+          {NOTIFICATION_EVENTS.map((ev) => (
+            <label className="check" key={ev.key}>
+              <input
+                type="checkbox"
+                checked={draft.notifications?.[ev.key] ?? false}
+                onChange={(e) =>
+                  update({
+                    notifications: { ...(draft.notifications ?? {}), [ev.key]: e.target.checked },
+                  })
+                }
+              />
+              <span>{ev.label}</span>
+            </label>
+          ))}
         </>
       )}
 

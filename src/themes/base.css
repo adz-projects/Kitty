@@ -2741,6 +2741,47 @@ button.output-card-name:hover {
   font-size: var(--fs-3xl);
   margin: 0;
 }
+/* A sub-section's heading with its one-line explanation directly under it:
+   the section's own gap would otherwise open a blank line between them. */
+.settings-subhead {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.settings-subhead h2,
+.settings-subhead p {
+  margin: 0;
+}
+/* Decision model: type and endpoint side by side. */
+.decider-endpoint {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: 10px;
+}
+/* Specialists: a built-in's own settings inside its Edit form. */
+.specialist-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+/* Setups: drag a row by its handle to reorder. */
+.drag-handle {
+  cursor: grab;
+  user-select: none;
+  padding: 0 6px;
+}
+.setup-row.dragging {
+  opacity: 0.5;
+}
+.setup-row.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.setup-row.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
 .settings-section details summary {
   cursor: pointer;
   padding: 6px 0;
