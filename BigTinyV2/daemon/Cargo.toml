@@ -11,7 +11,7 @@
 
 [package]
 name = "bigtiny2_daemon"
-version = "2.8.1"
+version = "2.9.0"
 edition = "2021"
 
 [lib]
