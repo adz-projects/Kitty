@@ -179,6 +179,10 @@ Daemon **2.9.0** (Kitty 1.2.0). Additive; API version stays 2:
 | Pathway: one-offs staged 30 days and promoted on cross-chat corroboration or synthesis; contrary option for a relevant stance or preference every turn, fresh angle every third | (engine behaviour) |
 | Memorabilia: claim vectors searched in SQL with their own mean and floor; keyword search re-ranks only, except rare names and codes; wrong-width vector index rebuilt and re-embedded | (engine behaviour) |
 
+Daemon **2.9.1** (Kitty 1.2.1). No API change: a database repair writes the
+rebuilt file out self-contained before swapping it in, so salvaged rows are
+no longer left behind in its WAL (`plugins/db_recover.rs`).
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
