@@ -43,7 +43,8 @@ impl Proposition {
     /// The claim as recall shows it: attributed when the source does not
     /// state it as fact, so an argument never reads as an established fact.
     pub fn display_claim(&self) -> String {
-        let who = self.attribution.trim();
+        let cleaned = crate::core::clean_attribution(&self.attribution);
+        let who = cleaned.as_str();
         match (self.stance.as_str(), who.is_empty()) {
             ("argues", false) => format!("{who} argues: {}", self.claim),
             ("reports", false) => format!("{who} reports: {}", self.claim),
@@ -208,15 +209,20 @@ impl Db {
     /// COUNT(DISTINCT source_entity) over active support links — N_active
     /// in the §8.2 formula.
     pub async fn count_active_sources(&self, node_id: &str) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT c.source_entity)
+        // Distinct after `canonical_source`: copies of one document saved
+        // under several names are one source, not independent corroboration.
+        let entities: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT c.source_entity
              FROM chunks AS c
              JOIN chunk_propositions AS cp ON cp.chunk_id = c.chunk_id
              WHERE cp.node_id = ? AND c.status = 'active'",
         )
         .bind(node_id)
-        .fetch_one(self.read_pool())
-        .await?)
+        .fetch_all(self.read_pool())
+        .await?;
+        let distinct: std::collections::HashSet<String> =
+            entities.iter().map(|e| crate::core::canonical_source(e)).collect();
+        Ok(distinct.len() as i64)
     }
 
     pub async fn set_proposition_confidence(

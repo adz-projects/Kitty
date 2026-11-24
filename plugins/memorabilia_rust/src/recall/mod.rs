@@ -60,15 +60,55 @@ fn composite_relevance_key(relevance: Option<f64>, rrf: f64, confidence: f64) ->
     }
 }
 
+/// How much higher a short claim's centered relevance runs than a chunk's for
+/// the same match; subtracted when the two channels are fused.
+const CLAIM_RELEVANCE_OFFSET: f64 = 0.08;
+
+/// Items shown with the best one: only those within this much of its
+/// relevance. One good match no longer brings every item past the floor.
+const ITEM_WINDOW: f64 = 0.08;
+
+/// Items below this confidence (weakly corroborated) are shown only when
+/// they clear the inject bar by `LOW_CONFIDENCE_MARGIN` themselves.
+const LOW_CONFIDENCE: f64 = 0.5;
+const LOW_CONFIDENCE_MARGIN: f64 = 0.10;
+
+/// The items worth showing this turn, in rank order: not already shown in
+/// this chat (`exclude`), within [`ITEM_WINDOW`] of the best remaining item,
+/// and, when weakly corroborated, strongly relevant on their own. An analogy
+/// (an indirect link the overnight pass found) rides along only with a
+/// directly relevant item. Empty when nothing clears `bar`.
+fn select_shown(
+    items: Vec<RankedItem>,
+    exclude: &std::collections::HashSet<String>,
+    bar: f64,
+) -> Vec<RankedItem> {
+    let fresh: Vec<RankedItem> = items
+        .into_iter()
+        .filter(|i| !exclude.contains(&i.item_id))
+        .collect();
+    let best = fresh
+        .iter()
+        .filter_map(|i| i.relevance)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if best.is_nan() || best < bar {
+        return Vec::new();
+    }
+    fresh
+        .into_iter()
+        .filter(|i| match i.relevance {
+            Some(r) => {
+                r >= best - ITEM_WINDOW
+                    && (i.confidence >= LOW_CONFIDENCE || r >= bar + LOW_CONFIDENCE_MARGIN)
+            }
+            None => i.analogy.is_some(),
+        })
+        .collect()
+}
+
 /// How far above the base floor the claim channel's floor sits until it has
 /// a self-tuned (EWMA) floor of its own.
 const CLAIM_COLD_LIFT: f64 = 0.08;
-
-/// Whether the best directly-relevant item reaches `bar`. Spread-only items
-/// (no relevance of their own) never carry a turn.
-fn clears_inject_bar(items: &[RankedItem], bar: f64) -> bool {
-    items.iter().filter_map(|i| i.relevance).any(|r| r >= bar)
-}
 
 /// RRF damping constant (standard Cormack et al. k = 60).
 const RRF_K: f64 = 60.0;
@@ -136,8 +176,13 @@ fn fuse_seed_channels(
             .or_insert(act);
     }
 
+    // A short claim scores higher against a short question than the long
+    // chunk it came from would, so the claim channel's relevance is brought
+    // down onto the chunk scale before the two are compared (and before the
+    // inject bar, which was set on that scale).
     let mut relevance = chunk_seeds.relevance;
     for (node, rel) in claim_seeds.relevance {
+        let rel = rel - CLAIM_RELEVANCE_OFFSET;
         relevance
             .entry(node)
             .and_modify(|prev| *prev = prev.max(rel))
@@ -394,7 +439,19 @@ impl Engine {
     /// [`Self::record_use`] once the host knows the model used an item, so
     /// a claim that is shown every turn but never used still fades.
     pub async fn recall_turn(&self, query: &str, previous: Option<&str>) -> Option<Recalled> {
-        match self.recall_inner(query, previous).await {
+        self.recall_turn_excluding(query, previous, &Default::default()).await
+    }
+
+    /// [`Self::recall_turn`] that leaves out `exclude`: the items this chat
+    /// has already been shown. Their earlier blocks stay in the
+    /// conversation, so showing them again only repeats them.
+    pub async fn recall_turn_excluding(
+        &self,
+        query: &str,
+        previous: Option<&str>,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Option<Recalled> {
+        match self.recall_inner(query, previous, exclude).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("recall: soft-failed ({e}); injecting nothing");
@@ -403,7 +460,12 @@ impl Engine {
         }
     }
 
-    async fn recall_inner(&self, query: &str, previous: Option<&str>) -> Result<Option<Recalled>> {
+    async fn recall_inner(
+        &self,
+        query: &str,
+        previous: Option<&str>,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<Option<Recalled>> {
         let (mut qvec, tag) = self.embedder.embed(query).await.map_err(crate::error::Error::Embed)?;
         if let Some(prev) = previous.map(str::trim).filter(|p| !p.is_empty()) {
             if tag != crate::config::HASH_EMBED_MODEL {
@@ -428,10 +490,21 @@ impl Engine {
         // than this many can ever fit in the block.
         let max_items = (cap / INDEX_ITEM_MIN_TOKENS).max(1);
         let semantic = tag != crate::config::HASH_EMBED_MODEL;
+        // Over-fetch: items already shown and items outside the window are
+        // dropped below.
         let items = self
-            .ranked_items_from(qvec, tag, Some(query), true, max_items)
+            .ranked_items_from(qvec, tag, Some(query), true, max_items + exclude.len())
             .await?;
-        if items.is_empty() || (semantic && !clears_inject_bar(&items, self.config.recall_inject_min)) {
+        let items = if semantic {
+            select_shown(items, exclude, self.config.recall_inject_min)
+        } else {
+            items
+                .into_iter()
+                .filter(|i| !exclude.contains(&i.item_id))
+                .take(max_items)
+                .collect()
+        };
+        if items.is_empty() {
             return Ok(None);
         }
         let (block, grounded, shown) = render_index_block(&items, cap);
@@ -1769,11 +1842,11 @@ mod tests {
     }
 
     #[test]
-    fn the_inject_bar_needs_one_directly_relevant_item_past_it() {
-        let item = |rel: Option<f64>| RankedItem {
-            item_id: "p".into(),
+    fn shown_items_are_fresh_close_to_the_best_and_corroborated() {
+        let item = |id: &str, rel: Option<f64>, conf: f64| RankedItem {
+            item_id: id.into(),
             claim: "c".into(),
-            confidence: 0.5,
+            confidence: conf,
             importance: "medium".into(),
             urgency: "low".into(),
             is_disputed: false,
@@ -1784,8 +1857,37 @@ mod tests {
             disputed_by: None,
             analogy: None,
         };
-        assert!(clears_inject_bar(&[item(Some(0.13)), item(Some(0.30))], 0.24));
-        assert!(!clears_inject_bar(&[item(Some(0.13)), item(Some(0.20))], 0.24));
-        assert!(!clears_inject_bar(&[item(None)], 0.24), "spread-only never carries a turn");
+        let none = std::collections::HashSet::new();
+        let ids = |v: Vec<RankedItem>| v.into_iter().map(|i| i.item_id).collect::<Vec<_>>();
+
+        // Nothing clears the bar: nothing shown.
+        assert!(select_shown(vec![item("a", Some(0.20), 0.9)], &none, 0.24).is_empty());
+        // One good match no longer drags in everything past the floor.
+        let got = select_shown(
+            vec![
+                item("best", Some(0.40), 0.9),
+                item("close", Some(0.34), 0.9),
+                item("far", Some(0.20), 0.9),
+                item("spread", None, 0.9),
+            ],
+            &none,
+            0.24,
+        );
+        assert_eq!(ids(got), ["best", "close"]);
+        // A weakly corroborated item needs to clear the bar by a margin.
+        let got = select_shown(
+            vec![item("strong", Some(0.36), 0.9), item("weak", Some(0.33), 0.34)],
+            &none,
+            0.24,
+        );
+        assert_eq!(ids(got), ["strong"]);
+        // Already shown in this chat: left out, and the next best judged alone.
+        let shown: std::collections::HashSet<String> = ["best".to_string()].into();
+        let got = select_shown(
+            vec![item("best", Some(0.40), 0.9), item("next", Some(0.30), 0.9)],
+            &shown,
+            0.24,
+        );
+        assert_eq!(ids(got), ["next"]);
     }
 }

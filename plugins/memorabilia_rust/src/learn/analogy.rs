@@ -154,7 +154,10 @@ impl Engine {
         .await?;
         for (node_id, source_entity) in source_rows {
             if abstracts.contains_key(&node_id) {
-                sources.entry(node_id).or_default().insert(source_entity);
+                sources
+                    .entry(node_id)
+                    .or_default()
+                    .insert(crate::core::canonical_source(&source_entity));
             }
         }
         let models: HashSet<&String> = abstracts.values().map(|(_, m, _)| m).collect();

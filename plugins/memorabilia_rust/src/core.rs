@@ -245,6 +245,95 @@ pub fn unsupported_transition(importance: &str) -> &'static str {
     }
 }
 
+/// One source's identity for counting *distinct* sources: a file path is
+/// reduced to its file name, lowercased, without its extension and without a
+/// copy marker (`report (2).docx`, `report(1).pdf`, `report - Copy.docx`
+/// all become `report`). Copies of one document saved under several names
+/// must not corroborate each other. Other entities (sites, pasted notes) are
+/// only trimmed and lowercased.
+pub fn canonical_source(entity: &str) -> String {
+    let e = entity.trim();
+    let e = e.strip_prefix("inlined:").unwrap_or(e);
+    let looks_like_file = e.contains('/') || e.contains('\\') || {
+        let ext = e.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase());
+        matches!(
+            ext.as_deref(),
+            Some("docx" | "doc" | "pdf" | "md" | "txt" | "xlsx" | "csv" | "pptx" | "html" | "htm" | "rtf" | "odt" | "json")
+        )
+    };
+    if !looks_like_file {
+        return e.to_lowercase();
+    }
+    let name = e.rsplit(['/', '\\']).next().unwrap_or(e);
+    let stem = match name.rsplit_once('.') {
+        Some((stem, ext)) if !ext.is_empty() && ext.len() <= 5 && !stem.is_empty() => stem,
+        _ => name,
+    };
+    let mut stem = stem.trim().to_lowercase();
+    loop {
+        let before = stem.clone();
+        for suffix in [" - copy", " copy", "-copy"] {
+            if let Some(s) = stem.strip_suffix(suffix) {
+                stem = s.trim_end().to_string();
+            }
+        }
+        // A trailing "(N)" copy number.
+        if stem.ends_with(')') {
+            if let Some(open) = stem.rfind('(') {
+                let inner = &stem[open + 1..stem.len() - 1];
+                if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                    stem = stem[..open].trim_end().to_string();
+                }
+            }
+        }
+        if stem == before {
+            break;
+        }
+    }
+    stem
+}
+
+/// `attribution` with extraction placeholders removed: an internal chunk or
+/// item id, "Chunk 3", or a stand-in like "General statement…" or "Inferred
+/// from context" names no one, and recall used to show it as if it did.
+/// Returns an empty string for a placeholder.
+pub fn clean_attribution(attribution: &str) -> String {
+    let a = attribution.trim();
+    let lower = a.to_lowercase();
+    let id_like = |w: &str| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        (w.starts_with("c_") || w.starts_with("p_"))
+            && w.len() >= 10
+            && w[2..].chars().all(|c| c.is_ascii_hexdigit())
+    };
+    let placeholder = lower.is_empty()
+        || lower.split_whitespace().any(id_like)
+        || (lower.starts_with("chunk") && lower[5..].trim().chars().next().is_none_or(|c| c.is_ascii_digit()))
+        || [
+            "general statement",
+            "inferred from",
+            "not specified",
+            "unspecified",
+            "unattributed",
+            "unknown",
+            "n/a",
+            "none",
+            "this chunk",
+            "the chunk",
+            "the text",
+            "the document",
+            "the passage",
+            "the source",
+        ]
+        .iter()
+        .any(|p| lower == *p || lower.starts_with(p));
+    if placeholder {
+        String::new()
+    } else {
+        a.to_string()
+    }
+}
+
 /// §6.1 promotion gates (transient → static): all four must hold —
 /// `reinforcement_count ≥` threshold, no open DISPUTED edge,
 /// `source_reliability ≥` floor (or ≥ 3 distinct sources at `≥ 0.35` so
@@ -265,4 +354,36 @@ pub fn can_promote(
     reinforcement_count >= cfg.reinforcement_promote_threshold as i64
         && !open_dispute
         && (reliable_and_corroborated || widely_corroborated)
+}
+
+#[cfg(test)]
+mod source_and_attribution_tests {
+    use super::*;
+
+    #[test]
+    fn copies_of_one_document_are_one_source() {
+        let a = canonical_source(r"C:\Users\x\Downloads\Technology Bans and Inclusion.docx");
+        assert_eq!(a, "technology bans and inclusion");
+        assert_eq!(canonical_source(r"D:\work\Technology Bans and Inclusion (2).docx"), a);
+        assert_eq!(canonical_source("inlined:Technology Bans and Inclusion (3).docx"), a);
+        assert_eq!(canonical_source("Technology Bans and Inclusion - Copy.docx"), a);
+        assert_ne!(canonical_source("Other Paper.docx"), a);
+        assert_eq!(canonical_source("www.example.com"), "www.example.com");
+    }
+
+    #[test]
+    fn placeholder_attributions_are_dropped() {
+        for p in [
+            "Chunk 3",
+            "c_c6f0cb9870eaa6272d69b668",
+            "General statement based on recent developments in AI",
+            "Inferred from context",
+            "unknown",
+            "",
+        ] {
+            assert_eq!(clean_attribution(p), "", "{p}");
+        }
+        assert_eq!(clean_attribution("Naveed et al., 2023"), "Naveed et al., 2023");
+        assert_eq!(clean_attribution("Emily Wetzel"), "Emily Wetzel");
+    }
 }

@@ -249,7 +249,7 @@ fn verify_claim(raw: &Value, tombstones: &HashSet<String>) -> ClaimVerdict {
     let attribution = raw
         .get("attribution")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
+        .map(core::clean_attribution)
         .unwrap_or_default();
     let stance = match raw.get("stance").and_then(|v| v.as_str()) {
         Some(s @ ("reports" | "argues" | "refutes")) => s.to_string(),
@@ -862,7 +862,9 @@ impl Engine {
                 if ch.status != "active" {
                     continue;
                 }
-                if ch.source_entity == chunk.source_entity {
+                if core::canonical_source(&ch.source_entity)
+                    == core::canonical_source(&chunk.source_entity)
+                {
                     same.push(ch);
                 } else {
                     cross.push(ch);
@@ -924,7 +926,10 @@ impl Engine {
                 }
                 _ => 0.0,
             };
-            by_source.entry(ch.source_entity.clone()).or_default().push(weight * decay);
+            by_source
+                .entry(core::canonical_source(&ch.source_entity))
+                .or_default()
+                .push(weight * decay);
         }
         let entries: Vec<(String, Vec<f64>)> = by_source.into_iter().collect();
         let mut confidence = core::confidence(cfg.correlation_lambda, &entries);
