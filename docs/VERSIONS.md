@@ -189,6 +189,14 @@ turn's best match clears a bar of twice the floor (pathway
 profile meets the ordinary floor; counter-views target only beliefs relevant
 in their own right; memorabilia's claim channel starts 0.08 above the floor.
 
+Daemon **2.9.3** (Kitty 1.2.3). No API change: tool arguments a model sends
+as quoted numbers or booleans are coerced to the schema's type before
+validation (`mcp::tools::coerce_tool_args`); memorabilia recall keys on the
+message's topic, skips items the chat was already shown and shows only items
+near the best match; pathway shows only beliefs close to the turn's best,
+challenges stances only, and holds a task learned in another chat to the
+inject bar.
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
