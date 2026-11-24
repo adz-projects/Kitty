@@ -341,8 +341,11 @@ mod tests {
             .iter()
             .filter(|t| t["role"] == "user")
             .collect();
-        assert_eq!(users[1]["memory_block"], "## Relevant memory
-- [p_1] x");
+        assert_eq!(
+            users[1]["memory_block"],
+            "## Relevant memory
+- [p_1] x"
+        );
         assert_eq!(users[1]["memory_trace"]["status"], "injected");
         assert!(users[0]["memory_block"].is_null());
     }

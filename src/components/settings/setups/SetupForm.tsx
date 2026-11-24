@@ -72,7 +72,8 @@ export function SetupForm({
     });
   };
 
-  const detected = info?.context_length ?? provider?.context_lengths[setup.model] ?? null;
+  // The provider's own detected window first: the catalog's is a hosted maximum.
+  const detected = provider?.context_lengths[setup.model] ?? info?.context_length ?? null;
   const detents = detentsFor(detected);
   const canSave = !!setup.provider_id && !!setup.model && !unavailable && !saving;
 

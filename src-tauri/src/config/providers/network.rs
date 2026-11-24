@@ -94,9 +94,44 @@ pub fn is_hosted_endpoint(base_url: &str) -> bool {
         || !bare.contains('.'))
 }
 
+/// Whether the OpenRouter catalog's context window describes what this
+/// provider serves. It lists a model's largest hosted window (often 1M), so
+/// it holds for a hosted API, but never for a server the user runs: Ollama or
+/// a self-hosted OpenAI-compatible server has whatever window its operator
+/// built it with, and only the server itself can say.
+pub fn catalog_window_applies(provider_type: &str, base_url: &str) -> bool {
+    match provider_type {
+        "ollama" => false,
+        "custom_openai" => is_hosted_endpoint(base_url),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_catalog_window_is_for_hosted_providers_only() {
+        assert!(catalog_window_applies("openrouter", ""));
+        assert!(catalog_window_applies("anthropic", ""));
+        assert!(catalog_window_applies(
+            "custom_openai",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        ));
+        assert!(!catalog_window_applies(
+            "custom_openai",
+            "http://192.168.1.199:8081"
+        ));
+        assert!(!catalog_window_applies(
+            "custom_openai",
+            "http://100.82.113.84:8081"
+        ));
+        assert!(!catalog_window_applies(
+            "ollama",
+            "https://ollama.example.com"
+        ));
+    }
 
     /// The slot default turns on this: the user's DashScope endpoint is
     /// hosted, their llama-server on the LAN is not.

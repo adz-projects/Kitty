@@ -80,9 +80,15 @@ async fn apply_learning(app: &AppHandle) -> Result<(), String> {
         .cloned()
         .unwrap_or(Value::Null);
     // No row is `auto`.
-    let have = if have.is_null() { json!({"kind": "auto"}) } else { have };
+    let have = if have.is_null() {
+        json!({"kind": "auto"})
+    } else {
+        have
+    };
     if have != want {
-        client.put_json("/api/apps/me/learning-model", &want).await?;
+        client
+            .put_json("/api/apps/me/learning-model", &want)
+            .await?;
     }
     Ok(())
 }

@@ -34,7 +34,6 @@ mod v1_import;
 mod window;
 
 pub use adaptive_pathway::*;
-pub use research::*;
 pub use config::*;
 pub use decider::*;
 pub use export::*;
@@ -48,6 +47,7 @@ pub use memory::*;
 pub use models::*;
 pub use overnight::*;
 pub use provider::*;
+pub use research::*;
 pub use scheduled_tasks::*;
 #[cfg(windows)]
 pub use screenshot::*;

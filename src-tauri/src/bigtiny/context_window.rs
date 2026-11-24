@@ -86,11 +86,29 @@ async fn discover(
             .await
             .ok()
             .flatten(),
+        // A hosted OpenAI-compatible API (DashScope, Fireworks) often lists
+        // no window on `/models`; the catalog stands in for it there, never
+        // for a server the user runs.
         "custom_openai" => {
-            crate::commands::custom_openai_context_length(base_url.to_string(), model.to_string())
-                .await
-                .ok()
-                .flatten()
+            let own = crate::commands::custom_openai_context_length(
+                base_url.to_string(),
+                model.to_string(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(plausible);
+            match own {
+                Some(n) => Some(n),
+                None if crate::config::providers::catalog_window_applies(
+                    provider_type,
+                    base_url,
+                ) =>
+                {
+                    catalog_context_length(app, model).await
+                }
+                None => None,
+            }
         }
         // Hosted providers: the OpenRouter catalog is already the app's
         // universal capability source for every provider type, and it is

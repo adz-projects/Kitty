@@ -15,8 +15,8 @@
 mod connection;
 pub mod debate;
 pub mod endpoint;
-pub mod learning;
 mod keyring;
+pub mod learning;
 mod network;
 pub mod setups;
 
@@ -26,11 +26,11 @@ pub use keyring::{
     v1_encryption_key,
 };
 // Only the desktop uninstall cleanup removes it.
+pub use debate::DebateSeat;
 #[cfg(desktop)]
 pub use keyring::V1_ENCRYPTION_KEY_ACCOUNT;
-pub use network::{is_hosted_endpoint, network_tier_for, NetworkTier};
-pub use debate::DebateSeat;
 pub use learning::{LearningModelSetting, LEARNING_CARD_ID};
+pub use network::{catalog_window_applies, is_hosted_endpoint, network_tier_for, NetworkTier};
 pub use setups::{migrate_to_setups, repoint_setups, Setup};
 
 use std::collections::BTreeMap;

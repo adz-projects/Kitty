@@ -155,8 +155,27 @@ pub fn describe(
         price_in_per_m: per_m(entry.and_then(|e| e.pricing_prompt)),
         price_tier: price_tier(price),
         intelligence: entry.and_then(|e| e.intelligence_index),
-        context_length: entry.and_then(|e| e.context_length),
+        context_length: context_length(provider, model, entry),
     }
+}
+
+/// The window this provider serves `model` with: what Kitty detected for it
+/// (from the server, on first use) first; else the catalog's, but only for a
+/// hosted provider. The catalog's figure for a model is its largest hosted
+/// window, so on a self-hosted server it showed 1M where the server held 192K.
+fn context_length(
+    provider: &ProviderProfile,
+    model: &str,
+    entry: Option<&OpenRouterCatalogEntry>,
+) -> Option<u32> {
+    provider.context_lengths.get(model).copied().or_else(|| {
+        crate::config::providers::catalog_window_applies(
+            &provider.provider_type,
+            &provider.base_url,
+        )
+        .then(|| entry.and_then(|e| e.context_length))
+        .flatten()
+    })
 }
 
 /// Every listed model of one provider (checked or not), ranked.
@@ -250,6 +269,45 @@ pub(crate) mod tests {
         .unwrap();
         crate::config::providers::upgrade_to_model_lists(std::slice::from_mut(&mut p));
         p
+    }
+
+    #[test]
+    fn a_self_hosted_model_shows_its_servers_window_not_the_catalogs() {
+        let mut e = entry("qwen/qwen3.8-27b", "Qwen: Qwen3.8 27B", 1, 1.0, None, false);
+        e.context_length = Some(1_024_000);
+        let catalog = [e];
+
+        let mut local = provider(
+            "loc",
+            "custom_openai",
+            "http://192.168.1.199:8081",
+            &["qwen3.8-27b"],
+        );
+        assert_eq!(
+            describe(&local, "qwen3.8-27b", &catalog).context_length,
+            None
+        );
+        local.context_lengths.insert("qwen3.8-27b".into(), 192_000);
+        assert_eq!(
+            describe(&local, "qwen3.8-27b", &catalog).context_length,
+            Some(192_000)
+        );
+
+        let hosted = provider("or", "openrouter", "", &["qwen/qwen3.8-27b"]);
+        assert_eq!(
+            describe(&hosted, "qwen/qwen3.8-27b", &catalog).context_length,
+            Some(1_024_000)
+        );
+        let cloud = provider(
+            "qc",
+            "custom_openai",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            &["qwen3.8-27b"],
+        );
+        assert_eq!(
+            describe(&cloud, "qwen3.8-27b", &catalog).context_length,
+            Some(1_024_000)
+        );
     }
 
     #[test]
