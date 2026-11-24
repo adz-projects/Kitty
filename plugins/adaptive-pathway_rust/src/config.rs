@@ -416,13 +416,12 @@ fn default_recall_min_cosine() -> f64 {
     0.10
 }
 fn default_recall_min_cosine_identity() -> f64 {
-    // Gentler than the general floor, so a slow-moving profile belief can
-    // surface on a looser match, but never a free pass: the old -0.05 let a
-    // stale profile belief inject on essentially any turn via the reserved
-    // identity slots. Half the general floor; the sweep has no identity cases,
-    // so this is judgement, not measurement -- add identity cases to the eval
-    // before tuning it.
-    0.05
+    // Equal to the general floor (it was half of it, 0.05, and let an
+    // unrelated identity belief -- a home server -- ride along on an op-ed
+    // turn through a reserved slot). Reserved slots and the gap-cut exemption
+    // remain the identity layer's advantage. Judgement, not measurement: the
+    // sweep has no identity cases yet.
+    0.10
 }
 fn default_recall_inject_min() -> f64 {
     // Twice the ordinary floor: a turn whose closest belief barely clears the

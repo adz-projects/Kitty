@@ -925,11 +925,10 @@ impl PathwayEngine {
     }
 }
 
-/// `[Worth challenging]`: the contrary option for the top selected belief
-/// (display order) that is a stance, else a preference, among those relevant
-/// to the turn in their own right (`topical`: pinned or past the topical
-/// floor; a profile belief that only came along on a looser match draws no
-/// counter-view). A stance gets the strongest case against
+/// `[Worth challenging]`: the case against the top selected belief (display
+/// order) that is a *stance*, among those relevant to the turn in their own
+/// right (`topical`: pinned or past the topical floor). Preferences, context
+/// and traits are never challenged. A stance gets the strongest case against
 /// it; a preference gets one option that goes against the habit. Context and
 /// traits are never challenged: they are facts about the person, not choices.
 fn challenge_for(
@@ -950,18 +949,14 @@ fn challenge_for(
         });
         of_kind.first().map(|s| s.belief.text.clone())
     };
-    if let Some(text) = top_of(BeliefKind::Stance) {
-        return Some(Challenge {
-            line: crate::antisycophancy::challenge_line(&text),
-            text,
-            is_stance: true,
-        });
-    }
-    let text = top_of(BeliefKind::Preference)?;
+    // Stances only: arguing with how someone likes answers written, or
+    // offering "an option against your habit" on every reply, was noise that
+    // pulled replies off what was asked (seen in practice, Nov 2026).
+    let text = top_of(BeliefKind::Stance)?;
     Some(Challenge {
-        line: crate::antisycophancy::contrary_preference_line(&text),
+        line: crate::antisycophancy::challenge_line(&text),
         text,
-        is_stance: false,
+        is_stance: true,
     })
 }
 
@@ -1175,19 +1170,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_preference_draws_no_counter_view() {
+        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+        let mut b = test_belief("pref", "Prefers worked examples over theory.");
+        b.kind = crate::store::beliefs::BeliefKind::Preference;
+        engine.db.insert_belief(&b).await.unwrap();
+        let block = engine.recall("s_pref", "").await.unwrap();
+        assert!(!block.contains("[Worth challenging]") && !block.contains("[Fresh angle]"), "{block}");
+    }
+
+    #[tokio::test]
     async fn contrary_every_relevant_turn_and_fresh_angle_every_third() {
         let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
-        let mut b = test_belief("top", "Prefers worked examples over theory.");
+        let mut b = test_belief("top", "Thinks worked examples beat theory.");
         b.embedding = vec![1.0, 0.0];
-        b.kind = crate::store::beliefs::BeliefKind::Preference;
+        b.kind = crate::store::beliefs::BeliefKind::Stance;
         engine.db.insert_belief(&b).await.unwrap();
 
         let mut fresh = Vec::new();
         for _ in 0..7 {
             let block = engine.recall("s_nov", "").await.unwrap();
             assert!(
-                block.contains("[Worth challenging]") && block.contains("goes against that habit"),
-                "a relevant preference gets a contrary option every turn: {block}"
+                block.contains("[Worth challenging]") && block.contains("strongest honest counter-argument"),
+                "a relevant stance gets the case against it every turn: {block}"
             );
             fresh.push(block.contains("[Fresh angle]"));
             engine.record_turn_end("s_nov").await;

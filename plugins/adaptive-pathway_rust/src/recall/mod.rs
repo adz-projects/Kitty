@@ -25,6 +25,10 @@ pub mod cut_log;
 
 pub const MAX_BELIEFS: usize = 6;
 
+/// A selected belief is shown only within this much (centered relevance) of
+/// the turn's best one.
+pub const BELIEF_WINDOW: f64 = 0.15;
+
 /// Slots held for `Layer::Identity` beliefs before the general pool competes
 /// for the rest.
 ///
@@ -62,7 +66,8 @@ pub const FOOTER: &str =
     "These are inferences from earlier turns, not facts, and some are probably stale. \
      Check them against what's actually being asked rather than reasoning forward from \
      them -- and if the request itself rests on something shaky, say so plainly instead \
-     of working around it.";
+     of working around it. Any bracketed prompt above applies to this reply only; \
+     ignore such prompts left from earlier turns.";
 
 /// Select up to `MAX_BELIEFS` beliefs by weighted DPP over the candidate set.
 /// `query_domain` biases (via the effective weight) toward in-domain beliefs
@@ -280,9 +285,20 @@ pub fn select_beliefs_detailed(
         // Pinned beliefs alone are exempt.
         let is_identity_layer = |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity;
         let is_exempt = |b: &Belief| b.pinned;
+        // What someone is working on (`BeliefKind::Context`) learned in another
+        // chat must bear on this turn strongly to be shown at all: "working
+        // on an article and a critique" otherwise follows them into every
+        // later chat about anything.
+        let task_floor = cfg.recall.inject_min.max(floor);
+        let is_cross_chat_task = |b: &Belief| {
+            b.kind == crate::store::beliefs::BeliefKind::Context
+                && b.layer != crate::store::beliefs::Layer::Conversation
+        };
         cand.retain(|(_, b, _, _, rel)| {
             is_exempt(b)
-                || if is_identity_layer(b) {
+                || if is_cross_chat_task(b) {
+                    *rel >= task_floor
+                } else if is_identity_layer(b) {
                     *rel >= floor_identity
                 } else {
                     *rel >= floor
@@ -461,6 +477,15 @@ pub fn select_beliefs_detailed(
     let best_relevance = has_query
         .then(|| picked.iter().map(|(_, _, _, _, rel)| *rel).fold(f64::NEG_INFINITY, f64::max))
         .filter(|r| r.is_finite());
+    // Shown together with the best belief only when close to it: one strong
+    // match no longer brings along everything that cleared a floor.
+    let picked: Vec<&(usize, &Belief, f64, f64, f64)> = match best_relevance {
+        Some(best) => picked
+            .into_iter()
+            .filter(|(_, b, _, _, rel)| b.pinned || *rel >= best - BELIEF_WINDOW)
+            .collect(),
+        None => picked,
+    };
     let topical = picked
         .iter()
         .filter(|(_, b, _, _, rel)| !has_query || b.pinned || *rel >= floor)
@@ -1097,10 +1122,18 @@ mod tests {
         cfg.recall.min_cosine_identity = -2.0; // below any cosine → identity exempt
         let e0 = vec![1.0_f32, 0.0, 0.0];
         let e1 = vec![0.0_f32, 1.0, 0.0];
-        let id_off = belief("id", "identity off", 0.7, true, Layer::Identity, Some("d"), e1.clone());
+        // A trait: an identity belief about what someone is working on
+        // (kind `Context`) is held to the higher task bar instead.
+        let mut id_off = belief("id", "identity off", 0.7, true, Layer::Identity, Some("d"), e1.clone());
+        id_off.kind = crate::store::beliefs::BeliefKind::Trait;
         let ctx_off = belief("ctx", "context off", 0.7, true, Layer::Context, Some("d"), e1);
-        let on = belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), e0.clone());
-        let sel = select_beliefs_relevant(&[id_off, ctx_off, on], &e0, None, &[], &cfg);
+        // No on-axis belief: the identity belief is then the turn's best, so
+        // only the floors (not the window around the best) are under test.
+        // A third, unrelated belief keeps the corpus mean from collapsing
+        // onto the other two.
+        let mut z = belief("z", "z-axis", 0.7, true, Layer::Context, Some("d"), vec![0.0, 0.0, 1.0]);
+        z.kind = crate::store::beliefs::BeliefKind::Preference;
+        let sel = select_beliefs_relevant(&[id_off, ctx_off, z], &e0, None, &[], &cfg);
         let ids: std::collections::HashSet<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
         assert!(ids.contains("id"), "identity kept under its gentler floor");
         assert!(!ids.contains("ctx"), "context dropped under the strict floor");
@@ -1150,43 +1183,88 @@ mod tests {
 
     #[test]
     fn standing_profile_meets_the_ordinary_floor() {
-        // Against an e0 query the standing belief's centered relevance is
-        // about 0.38: shown under a 0.3 floor, not under 0.5. (The identity
-        // floor no longer lets a general preference ride along.)
+        // The standing belief without the on-axis one, so it is the turn's
+        // best and only the floor is under test: its centered relevance clears
+        // a 0.3 floor, not a 0.5 one. (The identity floor no longer lets a
+        // general preference ride along.)
+        let pool = || {
+            let mut p = profile_pool();
+            p.retain(|b| b.id != "on");
+            p
+        };
         let ids = |floor: f64, q: &[f32]| {
             let mut cfg = Config::default();
             cfg.recall.min_cosine = floor;
-            select_beliefs_relevant(&profile_pool(), q, None, &[], &cfg)
+            select_beliefs_relevant(&pool(), q, None, &[], &cfg)
                 .into_iter()
                 .map(|s| s.belief.id)
                 .collect::<std::collections::HashSet<String>>()
         };
-        assert!(ids(0.3, &[1.0, 0.0, 0.0]).contains("stand"));
-        assert!(!ids(0.5, &[1.0, 0.0, 0.0]).contains("stand"));
-        assert!(!ids(0.3, &[0.0, 0.0, 1.0]).contains("stand"), "unrelated: not shown");
+        assert!(ids(0.2, &[1.0, 0.0, 0.0]).contains("stand"));
+        assert!(!ids(0.9, &[1.0, 0.0, 0.0]).contains("stand"));
+        assert!(!ids(0.2, &[0.0, 0.0, 1.0]).contains("stand"), "unrelated: not shown");
+    }
+
+    #[test]
+    fn only_beliefs_close_to_the_best_come_along() {
+        let mut cfg = Config::default();
+        cfg.recall.min_cosine = 0.1;
+        let turn = select_beliefs_detailed(&profile_pool(), &[1.0, 0.0, 0.0], None, &[], None, &cfg);
+        let best = turn.best_relevance.expect("a query measures relevance");
+        let ids: std::collections::HashSet<&str> =
+            turn.selected.iter().map(|s| s.belief.id.as_str()).collect();
+        assert!(ids.contains("on"));
+        // Every shown belief sits within the window of the best.
+        let pool = profile_pool();
+        let rel = |id: &str| {
+            let b = pool.iter().find(|b| b.id == id).unwrap();
+            let mean = corpus_mean(&pool).unwrap();
+            ops::cosine(&sub(&[1.0, 0.0, 0.0], &mean), &sub(&b.embedding, &mean))
+        };
+        for id in &ids {
+            assert!(rel(id) >= best - BELIEF_WINDOW - 1e-9, "{id} outside the window");
+        }
+        assert!(!ids.contains("neg"), "the opposite belief never comes along");
+    }
+
+    #[test]
+    fn a_task_from_another_chat_needs_the_inject_bar() {
+        // A context-kind belief in the context layer (learned in another
+        // chat) is held to `inject_min`; a preference at the same relevance
+        // only to the floor.
+        let mut cfg = Config::default();
+        cfg.recall.min_cosine = 0.0;
+        cfg.recall.inject_min = 0.99;
+        let mk = |id: &str, kind| {
+            let mut b = belief(id, id, 0.7, true, Layer::Context, None, vec![0.9, 0.1, 0.0]);
+            b.kind = kind;
+            b
+        };
+        let pool = vec![
+            mk("task", crate::store::beliefs::BeliefKind::Context),
+            mk("pref", crate::store::beliefs::BeliefKind::Preference),
+            belief("far", "far", 0.7, true, Layer::Context, None, vec![0.0, 0.0, 1.0]),
+        ];
+        let ids: std::collections::HashSet<String> =
+            select_beliefs_relevant(&pool, &[1.0, 0.0, 0.0], None, &[], &cfg)
+                .into_iter()
+                .map(|s| s.belief.id)
+                .collect();
+        assert!(ids.contains("pref"), "{ids:?}");
+        assert!(!ids.contains("task"), "{ids:?}");
     }
 
     #[test]
     fn detailed_selection_reports_best_relevance_and_topical_beliefs() {
         let mut cfg = Config::default();
-        cfg.recall.min_cosine = 0.3;
-        cfg.recall.min_cosine_identity = 0.0;
-        // An identity belief that clears only its own gentler floor.
-        let mut ident = belief("id", "identity", 0.8, true, Layer::Identity, None, vec![0.3, 0.1, 0.95]);
-        ident.support_count = 3;
-        let mut pool = profile_pool();
-        pool.push(ident);
-        let turn = select_beliefs_detailed(&pool, &[1.0, 0.0, 0.0], None, &[], None, &cfg);
+        cfg.recall.min_cosine = 0.1;
+        let turn = select_beliefs_detailed(&profile_pool(), &[1.0, 0.0, 0.0], None, &[], None, &cfg);
         let best = turn.best_relevance.expect("a query measures relevance");
         assert!(best > 0.5, "the on-axis belief leads: {best}");
         assert!(turn.topical.contains("on"));
-        assert!(turn.topical.contains("stand"));
-        if turn.selected.iter().any(|s| s.belief.id == "id") {
-            assert!(!turn.topical.contains("id"), "came along on the gentler floor only");
-        }
 
         // No query: nothing measured, every selected belief counts.
-        let blind = select_beliefs_detailed(&pool, &[], None, &[], None, &cfg);
+        let blind = select_beliefs_detailed(&profile_pool(), &[], None, &[], None, &cfg);
         assert_eq!(blind.best_relevance, None);
         assert_eq!(blind.topical.len(), blind.selected.len());
     }

@@ -84,18 +84,9 @@ pub fn challenge_line(stance: &str) -> String {
     )
 }
 
-/// `[Worth challenging]` for a *preference* bearing on the turn: one option
-/// that goes against their usual way, offered rather than imposed.
-pub fn contrary_preference_line(preference: &str) -> String {
-    format!(
-        "They usually prefer: \"{preference}\". Answer the way they prefer, and also name one \
-         option that goes against that habit, plainly labelled, with when it would serve them better."
-    )
-}
-
 /// `[Fresh angle]`: at most every [`NOVELTY_COOLDOWN_TURNS`], tied to the
-/// stance or preference that bears on the turn: one exploratory option
-/// beside the direct answer.
+/// stance that bears on the turn: one exploratory option beside the direct
+/// answer.
 pub fn fresh_angle_line(belief: &str) -> String {
     format!(
         "Alongside the direct answer, offer one genuinely different angle on \"{belief}\": an option \

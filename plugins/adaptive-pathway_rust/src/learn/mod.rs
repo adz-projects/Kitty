@@ -105,6 +105,8 @@ Provenance: direct_statement when they say it about themselves; inferred_pattern
 than once; single_observation when it shows once.
 Kind: preference (how they like things done or explained), stance (a view on a contested question), \
 context (a project, role or situation lasting weeks or more), trait (an enduring orientation or background).
+How they write is not how they want to be answered: a fact about their own prose (voice, tone, habits in \
+their drafts) is a trait, worded \"In their own writing, …\", never a preference about replies.
 
 Examples of the shape only. They are invented; never copy them:
 - Keep: \"Wants the recommendation first, then the reasoning\" (said \"just tell me what to do first\" about a garden plan).
