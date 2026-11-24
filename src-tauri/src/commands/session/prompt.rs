@@ -103,7 +103,14 @@ pub async fn send_prompt(
             .await
             .map_err(|e| {
                 tracing::warn!("tidy prepare for {session_id}: {e}");
-                "Could not read the chats to tidy.".to_string()
+                // An engine left running from before /tidy existed.
+                if e.contains("answered 404") {
+                    "Kitty's engine is older than this Kitty and has no /tidy yet. It updates \
+                     when it restarts: on its own once nothing is using it, or from the banner."
+                        .to_string()
+                } else {
+                    "Could not read the chats to tidy.".to_string()
+                }
             })?;
         documents.push(doc);
     }

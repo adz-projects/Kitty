@@ -53,6 +53,9 @@ pub struct EngineRestartState {
     pub restart_pending: bool,
     /// Who the daemon said is in the way, the last time Kitty asked.
     pub blocked_by: Vec<RestartBlocker>,
+    /// Set when the restart is to update the engine rather than apply a
+    /// setting: `(running, bundled)` versions.
+    pub engine_update: Option<(String, String)>,
 }
 
 /// What a restart attempt did.
@@ -88,6 +91,68 @@ fn emit(app: &AppHandle, state: EngineRestartState) {
     };
     if changed {
         let _ = app.emit("engine://restart-state", state);
+    }
+}
+
+/// The engine version this Kitty bundles (`build.rs`).
+pub const BUNDLED_ENGINE: &str = env!("KITTY_BUNDLED_ENGINE");
+
+/// Whether `running` is an older release than `bundled`, comparing the
+/// numeric parts of `MAJOR.MINOR.PATCH`. An unreadable version is never
+/// older: Kitty does not restart an engine on a guess.
+pub fn is_older(running: &str, bundled: &str) -> bool {
+    let parse = |v: &str| -> Option<Vec<u64>> {
+        let core = v.trim().split(['-', '+']).next()?;
+        let parts: Option<Vec<u64>> = core.split('.').map(|p| p.parse().ok()).collect();
+        parts.filter(|p| !p.is_empty())
+    };
+    match (parse(running), parse(bundled)) {
+        (Some(r), Some(b)) => r < b,
+        _ => false,
+    }
+}
+
+/// After attaching: if the running engine is older than the one this Kitty
+/// bundles (an engine left running across an upgrade), ask it to restart,
+/// the same way a changed setting does, so the update takes effect. At most
+/// once per launch: if another app restarts its own older engine in the
+/// race, Kitty does not keep asking.
+pub fn check_engine_version(app: &AppHandle) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    #[cfg(target_os = "android")]
+    {
+        let _ = (app, &ASKED);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let running = app
+            .state::<AppState>()
+            .bigtiny
+            .lock()
+            .unwrap()
+            .daemon_version
+            .clone();
+        let Some(running) = running else {
+            return;
+        };
+        if !is_older(&running, BUNDLED_ENGINE) || ASKED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::info!(
+            running,
+            bundled = BUNDLED_ENGINE,
+            "the running engine is older than Kitty's: asking it to restart"
+        );
+        emit(
+            app,
+            EngineRestartState {
+                reload_required: true,
+                engine_update: Some((running, BUNDLED_ENGINE.to_string())),
+                ..Default::default()
+            },
+        );
+        apply_if_pending(app);
     }
 }
 
@@ -192,6 +257,7 @@ pub async fn restart_now(app: &AppHandle, force: bool) -> Result<RestartOutcome,
                 reload_required: before.reload_required,
                 restart_pending: before.reload_required,
                 blocked_by: outcome.blocked_by.clone(),
+                engine_update: before.engine_update.clone(),
             },
         ),
         // The running daemon still doesn't match the saved config; keep
@@ -200,6 +266,7 @@ pub async fn restart_now(app: &AppHandle, force: bool) -> Result<RestartOutcome,
             app,
             EngineRestartState {
                 reload_required: before.reload_required,
+                engine_update: before.engine_update.clone(),
                 ..Default::default()
             },
         ),
@@ -327,6 +394,22 @@ async fn wait_for_exit(port: u16, instance_id: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_older_engine_is_restarted() {
+        assert!(is_older("2.9.1", "2.10.0"));
+        assert!(is_older("2.10.0", "2.10.1"));
+        assert!(!is_older("2.10.0", "2.10.0"));
+        assert!(!is_older("2.11.0", "2.10.0"));
+        assert!(!is_older("3.0.0", "2.10.0"));
+        assert!(is_older("2.10.0-dev", "2.10.1"));
+        assert!(!is_older("unknown", "2.10.0"));
+        assert!(!is_older("2.9.1", ""));
+        assert!(
+            !BUNDLED_ENGINE.is_empty(),
+            "build.rs found the engine's version"
+        );
+    }
 
     /// The daemon's answer decides: accepted, or blocked with who is in the
     /// way. A daemon that is not there at all is "unreachable", not an error:

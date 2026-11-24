@@ -34,6 +34,16 @@ export function restartMessage(state: EngineRestartState, android: boolean): str
   if (!state.reload_required && !state.restart_pending) return null;
   if (android) return 'A settings change takes effect the next time Kitty starts.';
   const others = unique(state.blocked_by);
+  if (state.engine_update) {
+    const [running, bundled] = state.engine_update;
+    const what = `Kitty’s engine is out of date (${running}; this Kitty comes with ${bundled})`;
+    if (others.length > 0) {
+      const verb = others.length === 1 ? 'is' : 'are';
+      return `${what}, but ${listNames(others)} ${verb} using it. It updates on its own once they’re done.`;
+    }
+    if (state.restart_pending) return `${what}. It updates after the current reply.`;
+    return `${what}. It updates when it restarts.`;
+  }
   if (others.length > 0) {
     const verb = others.length === 1 ? 'is' : 'are';
     return `A settings change needs Kitty’s engine to restart, but ${listNames(others)} ${verb} using it. It restarts on its own once they’re done.`;

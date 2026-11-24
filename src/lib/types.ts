@@ -636,6 +636,8 @@ export interface EngineRestartState {
   restart_pending: boolean;
   /** Who the engine said is in the way, the last time Kitty asked. */
   blocked_by: RestartBlocker[];
+  /** Set when the restart updates the engine: [running, bundled] versions. */
+  engine_update?: [string, string] | null;
 }
 
 /** Mirrors `lifecycle::engine_restart::RestartBlocker`. */

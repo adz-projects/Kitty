@@ -352,6 +352,7 @@ pub(crate) async fn attach_daemon(app: &AppHandle) -> Result<(), String> {
     match bigtiny_v2::locate(&snap, &tokenizer_path, Some(litert_lib_dir.as_str())).await {
         Ok(handle) => {
             install_handle(app, handle).await;
+            crate::lifecycle::engine_restart::check_engine_version(app);
             Ok(())
         }
         Err(e) => {
