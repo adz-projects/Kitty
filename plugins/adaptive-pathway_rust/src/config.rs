@@ -43,6 +43,12 @@ pub struct RecallConfig {
     /// turn).
     #[serde(default = "default_recall_min_cosine_identity")]
     pub min_cosine_identity: f64,
+    /// The bar a turn's **best** belief must clear (centered cosine) for the
+    /// block to be shown at all. The floors decide which beliefs may come
+    /// along; this decides whether the turn is about anything recall knows.
+    /// Below it nothing is injected (pinned beliefs excepted).
+    #[serde(default = "default_recall_inject_min")]
+    pub inject_min: f64,
     /// Minimum centered-cosine gap that triggers the **per-query gap cut**:
     /// after the floor, the surviving candidates are sorted by centered
     /// relevance and, when the largest gap between adjacent scores clears this,
@@ -70,6 +76,7 @@ impl Default for RecallConfig {
         Self {
             min_cosine: default_recall_min_cosine(),
             min_cosine_identity: default_recall_min_cosine_identity(),
+            inject_min: default_recall_inject_min(),
             gap_min: default_recall_gap_min(),
             ewma_alpha: default_recall_ewma_alpha(),
             ewma_slack: default_recall_ewma_slack(),
@@ -416,6 +423,11 @@ fn default_recall_min_cosine_identity() -> f64 {
     // so this is judgement, not measurement -- add identity cases to the eval
     // before tuning it.
     0.05
+}
+fn default_recall_inject_min() -> f64 {
+    // Twice the ordinary floor: a turn whose closest belief barely clears the
+    // floor is not about anything recall knows.
+    0.20
 }
 fn default_recall_gap_min() -> f64 {
     // Centered-cosine units; ~1/9 of the typical centered span — a real break

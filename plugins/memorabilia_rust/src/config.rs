@@ -168,6 +168,13 @@ pub struct Config {
     /// everything (soft-fail, core principle 9).
     #[serde(default = "default_recall_min_cosine")]
     pub recall_min_cosine: f64,
+    /// The bar a turn's **best** item must clear (centered cosine) for
+    /// anything to be injected. The floor decides which items may come
+    /// along; this decides whether the turn is about anything memory holds.
+    /// Not applied in the lexical-hash space, where there is no centered
+    /// relevance.
+    #[serde(default = "default_recall_inject_min")]
+    pub recall_inject_min: f64,
     /// Minimum centered-cosine gap (between consecutive sorted seed scores)
     /// that triggers the **per-query gap cut**: after the hard floor, the seed
     /// hits are sorted by centered relevance and, when the largest gap between
@@ -370,6 +377,7 @@ impl Default for Config {
             retrieval_min_seeds: default_retrieval_min_seeds(),
             activation_prune_threshold: default_activation_prune_threshold(),
             recall_min_cosine: default_recall_min_cosine(),
+            recall_inject_min: default_recall_inject_min(),
             recall_gap_min: default_recall_gap_min(),
             recall_ewma_alpha: default_recall_ewma_alpha(),
             recall_ewma_slack: default_recall_ewma_slack(),
@@ -552,6 +560,11 @@ fn default_recall_min_cosine() -> f64 {
     // one stray leak and both off-topic questions empty. 0.12 sits at the low
     // end of that plateau so harder real phrasings are not cut.
     0.12
+}
+fn default_recall_inject_min() -> f64 {
+    // Twice the floor: a turn whose closest fact barely clears the floor is
+    // not about anything memory holds.
+    0.24
 }
 fn default_recall_gap_min() -> f64 {
     // Centered-cosine units. ~1/9 of the typical centered span — a real

@@ -225,8 +225,38 @@ pub fn select_beliefs_relevant_with_cut(
     relevance: Option<&Relevance>,
     cfg: &Config,
 ) -> (Vec<SelectedBelief>, Option<f64>) {
+    let s = select_beliefs_detailed(candidates, query, query_domain, cooccurrence, relevance, cfg);
+    (s.selected, s.effective_cut)
+}
+
+/// One turn's selection with what the engine needs to decide whether to show
+/// it at all, and what to aim the contrary options at.
+#[derive(Debug, Clone, Default)]
+pub struct TurnSelection {
+    pub selected: Vec<SelectedBelief>,
+    /// See [`select_beliefs_relevant_with_cut`].
+    pub effective_cut: Option<f64>,
+    /// The highest centered relevance among the selected beliefs (`None`
+    /// with no query, where relevance is not measured).
+    pub best_relevance: Option<f64>,
+    /// Ids of selected beliefs relevant in their own right: pinned, or at
+    /// or above the topical floor. Identity beliefs admitted under their
+    /// gentler floor are not. With no query (nothing to measure) every
+    /// selected belief counts, as selection is then on weight alone.
+    pub topical: std::collections::HashSet<String>,
+}
+
+/// [`select_beliefs_relevant_with_cut`] returning a [`TurnSelection`].
+pub fn select_beliefs_detailed(
+    candidates: &[Belief],
+    query: &[f32],
+    query_domain: Option<&str>,
+    cooccurrence: &[Vec<usize>],
+    relevance: Option<&Relevance>,
+    cfg: &Config,
+) -> TurnSelection {
     if candidates.is_empty() {
-        return (vec![], None);
+        return TurnSelection::default();
     }
 
     // (idx, belief, effective_weight, blended_score, centered_relevance)
@@ -244,20 +274,23 @@ pub fn select_beliefs_relevant_with_cut(
     if has_query {
         let floor = cfg.recall.min_cosine;
         let floor_identity = cfg.recall.min_cosine_identity;
-        // Identity and the standing profile are judged against the gentler
-        // identity floor: they still have to bear on the turn, only less
-        // closely than a topical belief. Pinned beliefs alone are exempt.
-        let is_identity =
-            |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity || is_standing_profile(b);
+        // Identity beliefs are judged against the gentler identity floor
+        // (tuned for them). The standing profile meets the ordinary floor: a
+        // general preference must still bear on this turn to be shown.
+        // Pinned beliefs alone are exempt.
+        let is_identity_layer = |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity;
         let is_exempt = |b: &Belief| b.pinned;
         cand.retain(|(_, b, _, _, rel)| {
             is_exempt(b)
-                || if is_identity(b) {
+                || if is_identity_layer(b) {
                     *rel >= floor_identity
                 } else {
                     *rel >= floor
                 }
         });
+        // The gap cut below and the EWMA leave the whole profile alone.
+        let is_identity =
+            |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity || is_standing_profile(b);
 
         // Per-query gap cut over the general (non-exempt) survivors: keep only
         // the top relevance cluster for this turn, dropping a weak tail that
@@ -312,7 +345,10 @@ pub fn select_beliefs_relevant_with_cut(
         .filter(|(_, _, w, _, _)| *w > 0.0)
         .collect();
     if alive.is_empty() {
-        return (vec![], effective_cut);
+        return TurnSelection {
+            effective_cut,
+            ..Default::default()
+        };
     }
 
     let scores: Vec<f64> = alive.iter().map(|(_, _, _, s, _)| *s).collect();
@@ -391,8 +427,8 @@ pub fn select_beliefs_relevant_with_cut(
         let reserved = IDENTITY_RESERVED.min(identity_positions.len());
         let mut picked = dpp_sample_restricted(&kernel, &identity_positions, reserved, cfg.dpp.epsilon);
         // The general pool: everything not reserved, minus near-duplicates of
-        // the reserved picks, and minus profile beliefs that only cleared the
-        // gentler identity floor -- they may take a reserved slot, never a
+        // the reserved picks, and minus identity beliefs that only cleared
+        // their gentler floor -- they may take a reserved slot, never a
         // topical one.
         let floor = cfg.recall.min_cosine;
         let rest: Vec<usize> = (0..alive.len())
@@ -400,7 +436,7 @@ pub fn select_beliefs_relevant_with_cut(
                 let (_, b, _, _, rel) = &alive[p];
                 let topical_enough = !has_query
                     || b.pinned
-                    || !(b.layer == crate::store::beliefs::Layer::Identity || is_standing_profile(b))
+                    || b.layer != crate::store::beliefs::Layer::Identity
                     || *rel >= floor;
                 !picked.contains(&p)
                     && topical_enough
@@ -419,15 +455,30 @@ pub fn select_beliefs_relevant_with_cut(
     };
     idx.truncate(MAX_BELIEFS);
 
-    let selected = idx
+    let picked: Vec<&(usize, &Belief, f64, f64, f64)> =
+        idx.into_iter().filter_map(|k| alive.get(k)).collect();
+    let floor = cfg.recall.min_cosine;
+    let best_relevance = has_query
+        .then(|| picked.iter().map(|(_, _, _, _, rel)| *rel).fold(f64::NEG_INFINITY, f64::max))
+        .filter(|r| r.is_finite());
+    let topical = picked
+        .iter()
+        .filter(|(_, b, _, _, rel)| !has_query || b.pinned || *rel >= floor)
+        .map(|(_, b, _, _, _)| b.id.clone())
+        .collect();
+    let selected = picked
         .into_iter()
-        .filter_map(|k| alive.get(k))
         .map(|(_, b, w, _, _)| SelectedBelief {
             belief: (*b).clone(),
             effective_weight: *w,
         })
         .collect();
-    (selected, effective_cut)
+    TurnSelection {
+        selected,
+        effective_cut,
+        best_relevance,
+        topical,
+    }
 }
 
 /// The per-query gap-cut threshold over centered relevances: sort descending,
@@ -1088,27 +1139,56 @@ mod tests {
         b
     }
 
+    fn profile_pool() -> Vec<Belief> {
+        vec![
+            standing(vec![0.6, 0.8, 0.0]),
+            belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), vec![1.0, 0.0, 0.0]),
+            belief("z", "z-axis", 0.7, true, Layer::Context, Some("e"), vec![0.0, 0.0, 1.0]),
+            belief("neg", "neg-y", 0.7, true, Layer::Context, Some("f"), vec![0.0, -1.0, 0.0]),
+        ]
+    }
+
     #[test]
-    fn standing_profile_needs_modest_relevance_and_keeps_to_reserved_slots() {
-        let mut cfg = Config::default();
-        cfg.recall.min_cosine = 0.5;
-        let pool = |q: &[f32]| {
-            let cands = [
-                standing(vec![0.6, 0.8, 0.0]),
-                belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), vec![1.0, 0.0, 0.0]),
-                belief("z", "z-axis", 0.7, true, Layer::Context, Some("e"), vec![0.0, 0.0, 1.0]),
-                belief("neg", "neg-y", 0.7, true, Layer::Context, Some("f"), vec![0.0, -1.0, 0.0]),
-            ];
-            select_beliefs_relevant(&cands, q, None, &[], &cfg)
+    fn standing_profile_meets_the_ordinary_floor() {
+        // Against an e0 query the standing belief's centered relevance is
+        // about 0.38: shown under a 0.3 floor, not under 0.5. (The identity
+        // floor no longer lets a general preference ride along.)
+        let ids = |floor: f64, q: &[f32]| {
+            let mut cfg = Config::default();
+            cfg.recall.min_cosine = floor;
+            select_beliefs_relevant(&profile_pool(), q, None, &[], &cfg)
                 .into_iter()
                 .map(|s| s.belief.id)
                 .collect::<std::collections::HashSet<String>>()
         };
-        // Mildly related (above the identity floor, below the topical one):
-        // shown, through a reserved slot.
-        assert!(pool(&[1.0, 0.0, 0.0]).contains("stand"));
-        // Unrelated to the turn: not shown.
-        assert!(!pool(&[0.0, 0.0, 1.0]).contains("stand"));
+        assert!(ids(0.3, &[1.0, 0.0, 0.0]).contains("stand"));
+        assert!(!ids(0.5, &[1.0, 0.0, 0.0]).contains("stand"));
+        assert!(!ids(0.3, &[0.0, 0.0, 1.0]).contains("stand"), "unrelated: not shown");
+    }
+
+    #[test]
+    fn detailed_selection_reports_best_relevance_and_topical_beliefs() {
+        let mut cfg = Config::default();
+        cfg.recall.min_cosine = 0.3;
+        cfg.recall.min_cosine_identity = 0.0;
+        // An identity belief that clears only its own gentler floor.
+        let mut ident = belief("id", "identity", 0.8, true, Layer::Identity, None, vec![0.3, 0.1, 0.95]);
+        ident.support_count = 3;
+        let mut pool = profile_pool();
+        pool.push(ident);
+        let turn = select_beliefs_detailed(&pool, &[1.0, 0.0, 0.0], None, &[], None, &cfg);
+        let best = turn.best_relevance.expect("a query measures relevance");
+        assert!(best > 0.5, "the on-axis belief leads: {best}");
+        assert!(turn.topical.contains("on"));
+        assert!(turn.topical.contains("stand"));
+        if turn.selected.iter().any(|s| s.belief.id == "id") {
+            assert!(!turn.topical.contains("id"), "came along on the gentler floor only");
+        }
+
+        // No query: nothing measured, every selected belief counts.
+        let blind = select_beliefs_detailed(&pool, &[], None, &[], None, &cfg);
+        assert_eq!(blind.best_relevance, None);
+        assert_eq!(blind.topical.len(), blind.selected.len());
     }
 
     #[test]

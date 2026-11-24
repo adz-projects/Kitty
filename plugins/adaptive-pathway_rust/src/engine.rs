@@ -263,11 +263,11 @@ impl PathwayEngine {
         previous_user_message: Option<&str>,
         seeded: bool,
     ) -> Option<TurnRecall> {
-        let (mut selected, candidates, predicted_query) = self
+        let (mut selected, candidates, predicted_query, topical) = self
             .select_for_turn(session_id, user_message, previous_user_message)
             .await?;
         let signals = self
-            .turn_signals(session_id, user_message, &selected, &candidates, &predicted_query)
+            .turn_signals(session_id, user_message, &selected, &candidates, &predicted_query, &topical)
             .await;
         // Only a stance is a view that something the user read can dispute
         // (the Memorabilia counterpoint).
@@ -367,6 +367,7 @@ impl PathwayEngine {
         selected: &[crate::belief::SelectedBelief],
         candidates: &[crate::store::beliefs::Belief],
         predicted_query: &[f32],
+        topical: &std::collections::HashSet<String>,
     ) -> TurnSignals {
         // Display order's first belief (weight desc, id asc) -- the same one
         // `select_for_turn` records first in `last_recall_ids`, which
@@ -393,7 +394,7 @@ impl PathwayEngine {
             },
             self.tension_line(selected, candidates),
         );
-        let challenge = challenge_for(selected);
+        let challenge = challenge_for(selected, topical);
         // The exploratory option is tied to the same belief as the contrary
         // one, and steps aside for `[Check yourself]`.
         let fresh_angle = match (&challenge, &check) {
@@ -445,7 +446,12 @@ impl PathwayEngine {
         session_id: &str,
         user_message: &str,
         previous_user_message: Option<&str>,
-    ) -> Option<(Vec<crate::belief::SelectedBelief>, Vec<crate::store::beliefs::Belief>, Vec<f32>)> {
+    ) -> Option<(
+        Vec<crate::belief::SelectedBelief>,
+        Vec<crate::store::beliefs::Belief>,
+        Vec<f32>,
+        std::collections::HashSet<String>,
+    )> {
         // Independent reads, so together (the read pool serves them side by
         // side) rather than one after another on the turn's critical path.
         let (paused, candidates, suppressed) = tokio::join!(
@@ -538,7 +544,7 @@ impl PathwayEngine {
                 .min(max_floor);
         }
 
-        let (selected, cut) = crate::recall::select_beliefs_relevant_with_cut(
+        let turn = crate::recall::select_beliefs_detailed(
             &candidates,
             &predicted_query,
             query_domain.as_deref(),
@@ -546,6 +552,22 @@ impl PathwayEngine {
             relevance.as_ref(),
             &turn_cfg,
         );
+        let cut = turn.effective_cut;
+        // Show nothing unless the turn is about something recall knows: the
+        // best belief must clear `inject_min`, not just the floor. Pinned
+        // beliefs are shown regardless; a turn with no query (no relevance
+        // to measure) selects on weight alone, as before.
+        let pinned = turn.selected.iter().any(|s| s.belief.pinned);
+        let relevant_enough = !semantic
+            || pinned
+            || turn
+                .best_relevance
+                .is_some_and(|r| r >= self.cfg.recall.inject_min);
+        let (selected, topical) = if relevant_enough {
+            (turn.selected, turn.topical)
+        } else {
+            (Vec::new(), Default::default())
+        };
 
         // Log this turn's effective cut for tonight's fold (semantic turns
         // only). When an elevated EWMA floor dropped everything, log the base
@@ -585,7 +607,7 @@ impl PathwayEngine {
         if selected.is_empty() {
             None
         } else {
-            Some((selected, candidates, predicted_query))
+            Some((selected, candidates, predicted_query, topical))
         }
     }
 
@@ -904,15 +926,22 @@ impl PathwayEngine {
 }
 
 /// `[Worth challenging]`: the contrary option for the top selected belief
-/// (display order) that is a stance, else a preference. Selection already
-/// required it to bear on the turn. A stance gets the strongest case against
+/// (display order) that is a stance, else a preference, among those relevant
+/// to the turn in their own right (`topical`: pinned or past the topical
+/// floor; a profile belief that only came along on a looser match draws no
+/// counter-view). A stance gets the strongest case against
 /// it; a preference gets one option that goes against the habit. Context and
 /// traits are never challenged: they are facts about the person, not choices.
-fn challenge_for(selected: &[crate::belief::SelectedBelief]) -> Option<Challenge> {
+fn challenge_for(
+    selected: &[crate::belief::SelectedBelief],
+    topical: &std::collections::HashSet<String>,
+) -> Option<Challenge> {
     use crate::store::beliefs::BeliefKind;
     let top_of = |kind: BeliefKind| {
-        let mut of_kind: Vec<&crate::belief::SelectedBelief> =
-            selected.iter().filter(|s| s.belief.kind == kind).collect();
+        let mut of_kind: Vec<&crate::belief::SelectedBelief> = selected
+            .iter()
+            .filter(|s| s.belief.kind == kind && topical.contains(&s.belief.id))
+            .collect();
         of_kind.sort_by(|a, b| {
             b.effective_weight
                 .partial_cmp(&a.effective_weight)

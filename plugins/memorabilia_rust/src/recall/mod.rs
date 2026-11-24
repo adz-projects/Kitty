@@ -60,6 +60,16 @@ fn composite_relevance_key(relevance: Option<f64>, rrf: f64, confidence: f64) ->
     }
 }
 
+/// How far above the base floor the claim channel's floor sits until it has
+/// a self-tuned (EWMA) floor of its own.
+const CLAIM_COLD_LIFT: f64 = 0.08;
+
+/// Whether the best directly-relevant item reaches `bar`. Spread-only items
+/// (no relevance of their own) never carry a turn.
+fn clears_inject_bar(items: &[RankedItem], bar: f64) -> bool {
+    items.iter().filter_map(|i| i.relevance).any(|r| r >= bar)
+}
+
 /// RRF damping constant (standard Cormack et al. k = 60).
 const RRF_K: f64 = 60.0;
 
@@ -417,10 +427,11 @@ impl Engine {
         // An item line costs well over `INDEX_ITEM_MIN_TOKENS`, so no more
         // than this many can ever fit in the block.
         let max_items = (cap / INDEX_ITEM_MIN_TOKENS).max(1);
+        let semantic = tag != crate::config::HASH_EMBED_MODEL;
         let items = self
             .ranked_items_from(qvec, tag, Some(query), true, max_items)
             .await?;
-        if items.is_empty() {
+        if items.is_empty() || (semantic && !clears_inject_bar(&items, self.config.recall_inject_min)) {
             return Ok(None);
         }
         let (block, grounded, shown) = render_index_block(&items, cap);
@@ -737,9 +748,17 @@ impl Engine {
             self.claim_mean(&tag).await.unwrap_or(None)
         };
         let claim_mean = claim_mean.filter(|m| m.len() == qvec.len());
-        let claim_floor = self
-            .operational_floor(&claim_tag, claim_mean.is_some())
-            .await;
+        // Until the claim channel has a tuning history of its own, its floor
+        // sits `CLAIM_COLD_LIFT` above the base: short claims score more
+        // erratically than chunks, so an untuned floor let too many through.
+        let claim_floor = if claim_mean.is_some()
+            && cut_log::snapshot(&self.db, &claim_tag).await.is_none()
+        {
+            self.config.recall_min_cosine + CLAIM_COLD_LIFT
+        } else {
+            self.operational_floor(&claim_tag, claim_mean.is_some())
+                .await
+        };
         let claim_seeds = self
             .seed_from_claims(
                 &qvec,
@@ -1747,5 +1766,26 @@ mod tests {
         assert!(!mean_cache_fresh(10, 11));
         assert!(mean_cache_fresh(100, 120));
         assert!(!mean_cache_fresh(100, 130));
+    }
+
+    #[test]
+    fn the_inject_bar_needs_one_directly_relevant_item_past_it() {
+        let item = |rel: Option<f64>| RankedItem {
+            item_id: "p".into(),
+            claim: "c".into(),
+            confidence: 0.5,
+            importance: "medium".into(),
+            urgency: "low".into(),
+            is_disputed: false,
+            priority: 1.0,
+            relevance: rel,
+            citations: vec![],
+            supporting_chunk_ids: vec![],
+            disputed_by: None,
+            analogy: None,
+        };
+        assert!(clears_inject_bar(&[item(Some(0.13)), item(Some(0.30))], 0.24));
+        assert!(!clears_inject_bar(&[item(Some(0.13)), item(Some(0.20))], 0.24));
+        assert!(!clears_inject_bar(&[item(None)], 0.24), "spread-only never carries a turn");
     }
 }

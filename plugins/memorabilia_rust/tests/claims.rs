@@ -117,6 +117,7 @@ async fn a_superseded_claim_leaves_recall_but_stays_readable() {
     // not the floor, is under test here.
     let mut cfg = Config::default();
     cfg.recall_min_cosine = -1.0;
+    cfg.recall_inject_min = -1.0;
     cfg.recall_gap_min = 9.9;
     let e = engine(cfg, vec![
         ("citynews-2025", json!({"propositions": [claim(old)], "relations": []})),
