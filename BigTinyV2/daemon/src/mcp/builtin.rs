@@ -134,6 +134,17 @@ pub async fn connect(
             })
             .await
         }
+        "tidy" => {
+            // `/tidy`'s proposal and reading tools (`crate::tidy::server`),
+            // withheld from every chat that is not tidying.
+            MCPServerClient::connect_in_process(server_id, |stream| async move {
+                let server = crate::tidy::server::TidyServer::new(pool);
+                if let Err(e) = server.serve_in_process(stream).await {
+                    tracing::error!("tidy in-process server exited with error: {e}");
+                }
+            })
+            .await
+        }
         "kitty-tools" => {
             let config = kitty_tools::InProcessConfig::from_map(&env);
             MCPServerClient::connect_in_process(server_id, |stream| async move {
@@ -187,7 +198,7 @@ fn env_map(env: Option<&serde_json::Value>) -> HashMap<String, String> {
 
 /// Every registered built-in name, for callers that want to validate a
 /// configured name before attempting a connect.
-pub const BUILTIN_SERVERS: [&str; 7] = [
+pub const BUILTIN_SERVERS: [&str; 8] = [
     "kitty-tools",
     "kitty-web",
     "kitty-wasm",
@@ -195,6 +206,7 @@ pub const BUILTIN_SERVERS: [&str; 7] = [
     "memorabilia",
     "specialists",
     "research",
+    "tidy",
 ];
 
 /// Tool names owned by the `pathway` server, which need the executing

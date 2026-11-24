@@ -64,7 +64,7 @@ describe('slash command suggestions', () => {
   it('appear for a leading slash and narrow as the command is typed', () => {
     expect(options()).toEqual([]);
     type('/');
-    expect(options()).toEqual(['/deepresearch', '/critique', '/debate', '/compact']);
+    expect(options()).toEqual(['/deepresearch', '/critique', '/debate', '/tidy', '/compact']);
     type('/de');
     expect(options()).toEqual(['/deepresearch', '/debate']);
     type('hello');

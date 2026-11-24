@@ -16,8 +16,9 @@ const MAX_PENDING_AGE: Duration = Duration::from_secs(3600);
 /// Tools whose every call goes to a person, whatever the rules, patterns, app
 /// policy or a delegate's `tool_allow` say: the call *is* a question for the
 /// user. `submit_research_plan` asks them to approve, revise or reject a
-/// research plan (`crate::research`).
-pub const ALWAYS_ASK_TOOLS: &[&str] = &["submit_research_plan"];
+/// research plan (`crate::research`); `propose_tidy` a list of chats to
+/// delete (`crate::tidy`).
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["submit_research_plan", "propose_tidy"];
 
 /// How long an always-ask call waits for its answer. Longer than an ordinary
 /// approval: it is a deliberate checkpoint, not an interruption, and a plan

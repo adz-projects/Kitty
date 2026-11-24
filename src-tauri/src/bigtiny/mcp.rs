@@ -248,6 +248,7 @@ const REGISTERED_BUILTINS: &[&str] = &[
     "memorabilia",
     "specialists",
     "research",
+    "tidy",
     "kitty-wasm",
     "kitty-tools",
     "kitty-web",
@@ -524,6 +525,27 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
             headers: HashMap::new(),
             // Plan approval waits on the person, not on this call: the call
             // runs only after they answer. Ledger writes are quick.
+            timeout_s: Some(60),
+            enabled: true,
+        },
+    )
+    .await;
+
+    // `tidy` is `/tidy`'s server (`BigTinyV2/daemon/src/tidy/server.rs`):
+    // `propose_tidy` (always-ask) and `read_chats`. In-process and always on:
+    // the daemon withholds both from every chat that is not tidying.
+    upsert_builtin(
+        &client,
+        &mut report,
+        "tidy",
+        &McpServerSpec {
+            name: "tidy".to_string(),
+            transport: "in_process".to_string(),
+            command: Some("tidy".to_string()),
+            args: vec![],
+            url: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
             timeout_s: Some(60),
             enabled: true,
         },
@@ -944,7 +966,7 @@ mod tests {
     /// the daemon crate on desktop — it talks to it over HTTP. The Android
     /// target does link it, and asserts against the real thing below, so this
     /// mirror cannot rot silently in both places at once.
-    const DAEMON_BUILTIN_SERVERS: [&str; 7] = [
+    const DAEMON_BUILTIN_SERVERS: [&str; 8] = [
         "kitty-tools",
         "kitty-web",
         "kitty-wasm",
@@ -952,6 +974,7 @@ mod tests {
         "memorabilia",
         "specialists",
         "research",
+        "tidy",
     ];
 
     #[test]

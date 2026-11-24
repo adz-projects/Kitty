@@ -267,6 +267,17 @@ engine-managed) and why mixing them is a bug.
   coverage, and Stop. The engine posts a short note in the chat after each
   wave and after the critique. No local compute, and memorabilia is not
   involved.
+- **Tidy** (`bigtiny/tidy.rs`, `commands/tidy.rs`, `lib/tidy.ts`,
+  `TidyPrompt`; engine `BigTinyV2/daemon/src/tidy/`). Desktop only. A message
+  starting `/tidy [wishes]` makes Kitty grade every chat from its figures
+  (turns, time since the last message, files in its own chat folder, folder
+  bookmark, missing title) and tie the likely candidates to the chat under
+  refs (`c1`, …). Background chats go with their parent, and a schedule's
+  older runs form one entry. The model proposes through `propose_tidy` (an
+  always-ask tool), shown as a card with a checkbox per chat. It may read a
+  candidate's first and last exchange (`read_chats`) only after the user
+  allows it there, which the engine enforces. Approving deletes the checked
+  chats permanently, then the tidy chat itself.
 - **Scheduled tasks** (`commands/scheduled_tasks.rs` over `/api/schedules`,
   `components/settings/ScheduledTasks.tsx`) — instructions the engine runs
   later, once or on an interval, on a chosen provider card with its system

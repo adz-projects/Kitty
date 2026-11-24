@@ -21,6 +21,7 @@ pub mod research;
 pub mod schedules;
 pub mod search;
 pub mod specialists;
+pub mod tidy;
 
 use std::sync::Arc;
 
@@ -220,6 +221,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/chat/{id}/fork", post(chat::fork_session))
         .route("/api/chat/{id}/compact", post(chat::compact_session))
         .route("/api/chat/{id}/cancel", post(chat::cancel_session))
+        // Tidying the app's chats (`crate::tidy`): the client grades, the
+        // chat's model proposes, the user decides.
+        .route("/api/chat/{id}/tidy", get(tidy::get).post(tidy::start))
+        .route("/api/chat/{id}/tidy/readable", post(tidy::allow_reading))
+        .route("/api/apps/me/chats/stats", get(tidy::chat_stats))
         .route("/api/chat/{id}/approve", post(chat::approve_action))
         .route(
             "/api/providers",

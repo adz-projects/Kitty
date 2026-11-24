@@ -1,4 +1,5 @@
 import { DEFAULT_RESEARCH_TURNS, parseResearchCommand } from '@/lib/research';
+import { DEFAULT_TIDY_TEXT, parseTidyCommand } from '@/lib/tidy';
 import { useEffect, useRef, useState } from 'react';
 import { hasSomethingToSend, useChatStore } from '@/stores/chatStore';
 import { parseCritiqueCommand, parseDebateCommand } from '@/stores/chat/messageUtils';
@@ -49,7 +50,12 @@ export function Composer({
 }: {
   onSend: (
     text: string,
-    opts?: { debate?: boolean; critique?: boolean; research?: { maxTurns: number | null } }
+    opts?: {
+      debate?: boolean;
+      critique?: boolean;
+      research?: { maxTurns: number | null };
+      tidy?: boolean;
+    }
   ) => void;
   onStop: () => void;
   disabled: boolean;
@@ -74,7 +80,7 @@ export function Composer({
   // were dismissed for (Escape), so they stay closed until it changes.
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissedFor, setSlashDismissedFor] = useState<string | null>(null);
-  const slashSuggestions = slashDismissedFor === text ? [] : matchSlashCommands(text);
+  const slashSuggestions = slashDismissedFor === text ? [] : matchSlashCommands(text, isAndroid());
   const slashOpen = slashSuggestions.length > 0 && !readOnly;
   const slashActive = Math.min(slashIndex, Math.max(0, slashSuggestions.length - 1));
   useEscapeLayer(slashOpen, () => setSlashDismissedFor(text));
@@ -151,6 +157,14 @@ ${prefill}`
     const debate = parseDebateCommand(value);
     const critique = parseCritiqueCommand(value);
     const research = parseResearchCommand(value);
+    const tidy = isAndroid() ? null : parseTidyCommand(value);
+    if (tidy !== null) {
+      if (disabled || readOnly || sendBlocked) return;
+      onSend(tidy || DEFAULT_TIDY_TEXT, { tidy: true });
+      setText('');
+      resetTextareaHeight();
+      return;
+    }
     if (research !== null) {
       // `/deepresearch` alone has nothing to plan from: the hint says what to add.
       if (!research.brief || disabled || readOnly || sendBlocked) return;
@@ -241,6 +255,7 @@ ${prefill}`
   const debating = !slashOpen && parseDebateCommand(text) !== null;
   const critiquing = !slashOpen && parseCritiqueCommand(text) !== null;
   const researching = !slashOpen && parseResearchCommand(text) !== null;
+  const tidying = !slashOpen && !isAndroid() && parseTidyCommand(text) !== null;
 
   return (
     <div className="composer">
@@ -282,6 +297,12 @@ ${prefill}`
           Deep research: say what to research and what to produce. Add turns=N to set the budget
           (default {DEFAULT_RESEARCH_TURNS}: two research waves, a critique, the write-up). You
           approve the plan before it starts.
+        </div>
+      )}
+      {tidying && (
+        <div className="composer-hint" role="status">
+          Tidy: Kitty grades your chats and this chat's model proposes which to delete. Add what to
+          keep or clear if you like. You approve the list, and nothing is read without your say-so.
         </div>
       )}
       <button

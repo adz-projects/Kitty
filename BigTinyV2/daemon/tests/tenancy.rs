@@ -2657,3 +2657,112 @@ async fn the_app_pending_list_is_scoped_and_answers_empty() {
     let body = body_json(resp).await;
     assert_eq!(body["pending"], json!([]));
 }
+
+// ---------------------------------------------------------------------------
+// /tidy
+// ---------------------------------------------------------------------------
+
+async fn send_as(
+    state: Arc<AppState>,
+    app_id: &str,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(path);
+    let req = match body {
+        Some(b) => {
+            builder = builder.header("content-type", "application/json");
+            builder.body(Body::from(b.to_string())).unwrap()
+        }
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = router_as(state, app_id).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A tidy chat lists, and reads, only its own app's chats; another app can
+/// neither see the figures nor touch the tidy routes.
+#[tokio::test]
+async fn tidy_routes_are_scoped_to_their_app() {
+    let state = test_state().await;
+    let tidy = create_session(state.clone(), APP_A).await;
+    let mine = create_session(state.clone(), APP_A).await;
+    let theirs = create_session(state.clone(), APP_B).await;
+
+    let (status, stats) = send_as(
+        state.clone(),
+        APP_A,
+        Method::GET,
+        "/api/apps/me/chats/stats",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = stats["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&mine.as_str()) && !ids.contains(&theirs.as_str()),
+        "{ids:?}"
+    );
+
+    let start =
+        |id: &str| json!({"candidates": [{"ref": "c1", "session_ids": [id], "title": "t"}]});
+    // Another app's chat cannot be a candidate.
+    let (status, _) = send_as(
+        state.clone(),
+        APP_A,
+        Method::POST,
+        &format!("/api/chat/{tidy}/tidy"),
+        Some(start(&theirs)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send_as(
+        state.clone(),
+        APP_A,
+        Method::POST,
+        &format!("/api/chat/{tidy}/tidy"),
+        Some(start(&mine)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another app cannot read or change this tidy.
+    for (method, path, body) in [
+        (Method::GET, format!("/api/chat/{tidy}/tidy"), None),
+        (
+            Method::POST,
+            format!("/api/chat/{tidy}/tidy"),
+            Some(start(&theirs)),
+        ),
+        (
+            Method::POST,
+            format!("/api/chat/{tidy}/tidy/readable"),
+            Some(json!({"refs": ["c1"]})),
+        ),
+    ] {
+        let (status, _) = send_as(state.clone(), APP_B, method.clone(), &path, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    let (status, body) = send_as(
+        state.clone(),
+        APP_A,
+        Method::POST,
+        &format!("/api/chat/{tidy}/tidy/readable"),
+        Some(json!({"refs": ["c1"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["readable"], json!(["c1"]));
+}

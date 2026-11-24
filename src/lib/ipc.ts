@@ -2,6 +2,7 @@
 // frontend goes through these typed wrappers (CLAUDE.md rule 2).
 
 import type { ResearchDetail } from './research';
+import type { TidyState } from './tidy';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -197,7 +198,10 @@ export const ipc = {
     research?: { max_turns: number | null },
     /** `/critique`: `start` adds the editor's playbook; `continue` (the answer
         to its brief) arms the panel the lenses run on (`bigtiny::critique`). */
-    critique?: 'start' | 'continue'
+    critique?: 'start' | 'continue',
+    /** `/tidy`: Kitty grades the chats, ties the candidates to this chat, and
+        this turn proposes which to delete (`bigtiny::tidy`). */
+    tidy?: boolean
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
@@ -208,6 +212,7 @@ export const ipc = {
       debate: debate ?? null,
       research: research ?? null,
       critique: critique ?? null,
+      tidy: tidy ?? null,
     }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   /** Fresh (not client-cached) check of whether `session/prompt` is currently
@@ -491,6 +496,14 @@ export const ipc = {
   listResearch: (sessionId?: string) =>
     invoke<ResearchDetail[]>('list_research', { sessionId: sessionId ?? null }),
   cancelResearch: (researchId: string) => invoke<void>('cancel_research', { researchId }),
+  /** A tidy chat's candidates and which the model may read. */
+  getTidy: (sessionId: string) => invoke<TidyState>('get_tidy', { sessionId }),
+  /** Let the model read these candidates; the proposal goes back to it. */
+  tidyAllowReading: (sessionId: string, actionId: string, refs: string[]) =>
+    invoke<void>('tidy_allow_reading', { sessionId, actionId, refs }),
+  /** Delete these candidates' chats permanently, then the tidy chat. */
+  tidyApply: (sessionId: string, actionId: string, refs: string[]) =>
+    invoke<{ deleted: number; failed: number }>('tidy_apply', { sessionId, actionId, refs }),
   listAllowRules: () => invoke<AllowRule[]>('list_allow_rules'),
   /** The whole output of a tool call whose card was truncated. */
   fetchFullToolResult: (sessionId: string, toolCallId: string) =>
@@ -856,6 +869,14 @@ export const onResearchProgress = (
     status: string;
     detail: ResearchDetail | null;
   }>('research://progress', (e) => cb(e.payload));
+
+/** A tidy finished: its chats and the tidy chat itself are gone. */
+export const onTidyDone = (
+  cb: (e: { session_id: string; deleted: number; failed: number }) => void
+) =>
+  listen<{ session_id: string; deleted: number; failed: number }>('tidy://done', (e) =>
+    cb(e.payload)
+  );
 
 export const onApprovalResolved = (
   cb: (e: { action_id: string; session_id: string | null; timed_out: boolean }) => void

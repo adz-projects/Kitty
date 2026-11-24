@@ -150,8 +150,9 @@ fn lexical_normalize(path: &Path) -> String {
 /// failing to read the grants must not approve everything.
 /// Tools whose call is itself a question for the person, so Kitty never
 /// answers it: the engine's `hitl::manager::ALWAYS_ASK_TOOLS`. A deep research
-/// run's plan is approved, revised or rejected by the user and nobody else.
-pub const ALWAYS_ASK_TOOLS: &[&str] = &["submit_research_plan"];
+/// run's plan, and `/tidy`'s list of chats to delete, are approved, revised or
+/// rejected by the user and nobody else.
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["submit_research_plan", "propose_tidy"];
 
 pub fn is_always_ask(tool_name: &str) -> bool {
     ALWAYS_ASK_TOOLS.contains(&tool_name)

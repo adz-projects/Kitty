@@ -299,6 +299,19 @@ fn withhold_research_tools(tools: &mut Vec<ToolDefinition>, metadata: &Value) ->
     before - tools.len()
 }
 
+/// Withhold `/tidy`'s tools from every session that is not tidying: listing
+/// and reading the user's other chats is for a chat the user started a tidy
+/// in, and nothing else. Returns how many were withheld.
+fn withhold_tidy_tools(tools: &mut Vec<ToolDefinition>, metadata: &Value) -> usize {
+    use crate::tidy::server::TIDY_TOOLS;
+    if metadata.get(crate::tidy::META_TIDY).is_some() {
+        return 0;
+    }
+    let before = tools.len();
+    tools.retain(|t| !TIDY_TOOLS.contains(&t.name.as_str()));
+    before - tools.len()
+}
+
 /// Withhold the delegate tools from a chat whose user switched specialists
 /// off. Withheld rather than offered and refused: a small model that sees
 /// `call_specialist` will reach for it whatever the result says, and a refusal
@@ -2059,6 +2072,7 @@ impl AgentLoop {
         self.specialists_off = specialists_disabled(&metadata);
         withhold_debate_tool(&mut active_tools, &metadata);
         withhold_research_tools(&mut active_tools, &metadata);
+        withhold_tidy_tools(&mut active_tools, &metadata);
         let withheld = withhold_specialist_tools(&mut active_tools, &metadata);
         if withheld > 0 {
             tracing::debug!(session_id, withheld, "specialists are off for this chat");
@@ -6213,7 +6227,8 @@ Revise what you                          proposed accordingly and call {tool_nam
         // this is the only writer for those as well.
         let needs_session = crate::mcp::builtin::PATHWAY_TOOLS.contains(&tool_name.as_str())
             || crate::specialists::server::SESSION_SCOPED_TOOLS.contains(&tool_name.as_str())
-            || crate::research::server::RESEARCH_TOOLS.contains(&tool_name.as_str());
+            || crate::research::server::RESEARCH_TOOLS.contains(&tool_name.as_str())
+            || crate::tidy::server::TIDY_TOOLS.contains(&tool_name.as_str());
         let tool_args = if needs_session {
             let mut args = tool_args.clone();
             if let Some(obj) = args.as_object_mut() {

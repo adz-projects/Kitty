@@ -1620,6 +1620,46 @@ button:disabled {
   resize: vertical;
   font: inherit;
 }
+/* A /tidy list awaiting the user (TidyPrompt). */
+.tidy-body {
+  max-height: 26rem;
+  overflow: auto;
+  padding: 4px 8px;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+}
+.tidy-body h4 {
+  margin: 8px 0 4px;
+}
+.tidy-summary {
+  margin: 0;
+}
+.tidy-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tidy-row .check {
+  align-items: flex-start;
+}
+.tidy-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tidy-title {
+  font-weight: 600;
+}
+.tidy-facts,
+.tidy-note {
+  font-size: var(--fs-sm);
+}
+.tidy-note {
+  font-style: italic;
+}
 /* A deep research run's progress, above the composer (ResearchProgressCard). */
 .research-card {
   display: flex;

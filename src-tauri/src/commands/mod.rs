@@ -30,6 +30,7 @@ mod session;
 mod setup;
 mod setups;
 mod specialists;
+mod tidy;
 mod v1_import;
 mod window;
 
@@ -55,5 +56,6 @@ pub use session::*;
 pub use setup::*;
 pub use setups::*;
 pub use specialists::*;
+pub use tidy::*;
 pub use v1_import::*;
 pub use window::*;

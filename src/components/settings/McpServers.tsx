@@ -32,6 +32,7 @@ const HIDDEN_SERVER_NAMES = new Set([
   // manage here.
   'memorabilia',
   'research',
+  'tidy',
   'adaptive-pathway',
   'replacement-mcp',
   'wasm-math-mcp',

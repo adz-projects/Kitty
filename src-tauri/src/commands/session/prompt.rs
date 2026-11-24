@@ -40,6 +40,7 @@ pub async fn send_prompt(
     debate: Option<bool>,
     research: Option<crate::bigtiny::research::ResearchArgs>,
     critique: Option<String>,
+    tidy: Option<bool>,
 ) -> Result<(), String> {
     // `/debate`: a moderator brief rides as the turn's last document, and the
     // panel it names is armed in the engine for this turn only.
@@ -94,6 +95,17 @@ pub async fn send_prompt(
                 }
             })?;
         documents.push(crate::bigtiny::research::instructions_document(&started));
+    }
+    // `/tidy`: Kitty grades the chats, ties the candidates to this chat, and
+    // the list rides with the user's wishes so this turn proposes a tidy.
+    if tidy.unwrap_or(false) {
+        let doc = crate::bigtiny::tidy::prepare(&app, &session_id, &text)
+            .await
+            .map_err(|e| {
+                tracing::warn!("tidy prepare for {session_id}: {e}");
+                "Could not read the chats to tidy.".to_string()
+            })?;
+        documents.push(doc);
     }
     let text = crate::bigtiny::turn_text::compose(
         &text,

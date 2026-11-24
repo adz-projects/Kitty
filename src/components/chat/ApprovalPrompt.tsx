@@ -2,6 +2,8 @@ import type { PendingApproval } from '@/lib/types';
 import { useApprovalStore } from '@/stores/approvalStore';
 import { RESEARCH_PLAN_TOOL } from '@/lib/research';
 import { ResearchPlanPrompt } from './ResearchPlanPrompt';
+import { TIDY_TOOL } from '@/lib/tidy';
+import { TidyPrompt } from './TidyPrompt';
 
 /** A human-readable preview of the tool call's arguments: the command for a
     shell call, otherwise the arguments as JSON. */
@@ -34,6 +36,9 @@ export function ApprovalPrompt({
 }) {
   if (approval.tool_name === RESEARCH_PLAN_TOOL) {
     return <ResearchPlanPrompt approval={approval} inline={inline} />;
+  }
+  if (approval.tool_name === TIDY_TOOL) {
+    return <TidyPrompt approval={approval} inline={inline} />;
   }
   return <ToolApprovalPrompt approval={approval} inline={inline} />;
 }

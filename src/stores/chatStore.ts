@@ -20,6 +20,7 @@ import {
   onReasoningDelta,
   onSessionDeleted,
   onSessionsCleared,
+  onTidyDone,
   onSessionTitle,
   onSubagentStatus,
   onToolCall,
@@ -290,7 +291,12 @@ interface ChatState {
   /** `debate`: the turn was sent with `/debate` (`bigtiny::debate`). */
   send: (
     text: string,
-    opts?: { debate?: boolean; critique?: boolean; research?: { maxTurns: number | null } }
+    opts?: {
+      debate?: boolean;
+      critique?: boolean;
+      research?: { maxTurns: number | null };
+      tidy?: boolean;
+    }
   ) => Promise<void>;
   cancel: () => Promise<void>;
   /** Hard-reset a stuck turn the user chose to force-stop (Round-5): clears
@@ -858,7 +864,9 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
     research?: { maxTurns: number | null },
     /** `/critique`: `start` for the command's own turn, `continue` for the
         answer to its brief. */
-    critique?: 'start' | 'continue'
+    critique?: 'start' | 'continue',
+    /** `/tidy`: Kitty grades the chats and this turn proposes a tidy. */
+    tidy = false
   ): Promise<boolean> => {
     const trimmed = text;
     // Captured before ANY await — see the note above. This is also what makes
@@ -960,6 +968,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         ...(debate ? [{ name: 'Debate brief', kind: 'debate' as const }] : []),
         ...(critique === 'start' ? [{ name: 'Critique playbook', kind: 'critique' as const }] : []),
         ...(research ? [{ name: 'Deep research instructions', kind: 'document' as const }] : []),
+        ...(tidy ? [{ name: 'Tidy candidates', kind: 'document' as const }] : []),
       ];
 
       const userMsg: Message = {
@@ -1024,7 +1033,8 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         documents,
         debate,
         research ? { max_turns: research.maxTurns } : undefined,
-        critique
+        critique,
+        tidy
       );
       // A turn that carried attachments just widened the session's grant set
       // daemon-side. Re-read it now, before the model's first tool call, or
@@ -2063,11 +2073,17 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
 
     send: async (
       text: string,
-      opts?: { debate?: boolean; critique?: boolean; research?: { maxTurns: number | null } }
+      opts?: {
+        debate?: boolean;
+        critique?: boolean;
+        research?: { maxTurns: number | null };
+        tidy?: boolean;
+      }
     ) => {
       const trimmed = text.trim();
       const debate = opts?.debate ?? false;
       const research = opts?.research;
+      const tidy = opts?.tidy ?? false;
       // `/critique` starts one; the next message answers its brief and runs it.
       const critique: 'start' | 'continue' | undefined = opts?.critique
         ? 'start'
@@ -2090,7 +2106,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // and enqueue two prompts.
       sendInFlight = true;
       try {
-        await doSend(trimmed, undefined, debate, research, critique);
+        await doSend(trimmed, undefined, debate, research, critique, tidy);
       } finally {
         sendInFlight = false;
       }
@@ -2468,6 +2484,14 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // reload the session the same way Expand's handoff does.
       void onAdoptSession((info) => {
         void get().adoptSession(info);
+      });
+      // A tidy deleted its chats and then itself: the window that showed it
+      // (now blank, from the deletion just above) says what was done.
+      void onTidyDone((e) => {
+        if (get().sessionId !== null && get().sessionId !== e.session_id) return;
+        const n = e.deleted;
+        const failed = e.failed ? ` ${e.failed} could not be deleted.` : '';
+        set({ warning: `Tidied: deleted ${n} chat${n === 1 ? '' : 's'}.${failed}` });
       });
       // "Clear all chat history" (Settings → General) run from any window —
       // blank this window's chat too, if it had one open (same reset shape

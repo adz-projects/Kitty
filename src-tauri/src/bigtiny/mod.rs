@@ -23,5 +23,6 @@ pub mod research;
 pub mod sessions;
 pub mod specialists;
 pub mod stream;
+pub mod tidy;
 pub mod turn_text;
 pub mod vision;

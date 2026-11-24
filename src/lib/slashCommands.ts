@@ -13,6 +13,8 @@ export interface SlashCommand {
   description: string;
   /** Whether it takes text after it: completing it then adds a space. */
   takesText: boolean;
+  /** Offered on desktop only. */
+  desktopOnly?: boolean;
 }
 
 export const SLASH_COMMANDS: SlashCommand[] = [
@@ -35,6 +37,13 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     takesText: true,
   },
   {
+    name: 'tidy',
+    args: '[what to keep or clear]',
+    description: 'Suggest old chats to delete. You approve the list first.',
+    takesText: true,
+    desktopOnly: true,
+  },
+  {
     name: 'compact',
     args: '',
     description: "Fold this chat's older messages into memory to free up context.",
@@ -46,11 +55,11 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     the start of a command word, every command beginning with that word,
     case-insensitively. Nothing once a space is typed (the command's own hint
     takes over) or for text that is not a command at all. */
-export function matchSlashCommands(text: string): SlashCommand[] {
+export function matchSlashCommands(text: string, android = false): SlashCommand[] {
   const m = /^\/([A-Za-z]*)$/.exec(text);
   if (!m) return [];
   const typed = m[1].toLowerCase();
-  return SLASH_COMMANDS.filter((c) => c.name.startsWith(typed));
+  return SLASH_COMMANDS.filter((c) => c.name.startsWith(typed) && !(android && c.desktopOnly));
 }
 
 /** The composer text after choosing `command`. */

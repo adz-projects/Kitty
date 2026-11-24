@@ -25,6 +25,7 @@ pub mod research;
 pub mod scheduler;
 pub mod server;
 pub mod specialists;
+pub mod tidy;
 pub mod storage;
 
 use std::sync::Arc;
