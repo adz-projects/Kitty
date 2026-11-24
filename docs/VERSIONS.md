@@ -183,6 +183,12 @@ Daemon **2.9.1** (Kitty 1.2.1). No API change: a database repair writes the
 rebuilt file out self-contained before swapping it in, so salvaged rows are
 no longer left behind in its WAL (`plugins/db_recover.rs`).
 
+Daemon **2.9.2** (Kitty 1.2.2). No API change: memory injects only when the
+turn's best match clears a bar of twice the floor (pathway
+`recall.inject_min` 0.20, memorabilia `recall_inject_min` 0.24); the standing
+profile meets the ordinary floor; counter-views target only beliefs relevant
+in their own right; memorabilia's claim channel starts 0.08 above the floor.
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
