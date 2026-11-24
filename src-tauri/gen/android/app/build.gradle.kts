@@ -1,3 +1,6 @@
+import java.io.File
+import java.net.URI
+import java.security.MessageDigest
 import java.util.Properties
 
 plugins {
@@ -64,13 +67,15 @@ val fetchLiteRtLmWheel by tasks.registering {
     outputs.file(litertLmWheel)
     doLast {
         val out = litertLmWheel.get().asFile
-        fun sha256(f: java.io.File): String =
-            java.security.MessageDigest.getInstance("SHA-256")
+        // Imported names, not `java.security.…`: inside the Gradle Kotlin DSL a
+        // leading `java` resolves to the project's `java` extension.
+        fun sha256(f: File): String =
+            MessageDigest.getInstance("SHA-256")
                 .digest(f.readBytes())
                 .joinToString("") { "%02x".format(it) }
         if (out.exists() && sha256(out) == litertLmWheelSha256) return@doLast
         out.parentFile.mkdirs()
-        java.net.URI(litertLmWheelUrl).toURL().openStream().use { input ->
+        URI(litertLmWheelUrl).toURL().openStream().use { input ->
             out.outputStream().use { input.copyTo(it) }
         }
         val got = sha256(out)
