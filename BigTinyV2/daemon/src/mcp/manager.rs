@@ -691,6 +691,14 @@ impl MCPManager {
             .or_else(|| self.server_timeouts.get(&tool.server_id).map(|d| *d))
             .unwrap_or(DEFAULT_TOOL_TIMEOUT);
 
+        // Numbers and booleans sent as text ("200") are converted to the
+        // schema's types first; what the server receives is the converted
+        // form (`mcp::tools::coerce_tool_args`).
+        let coerced = crate::mcp::tools::coerce_tool_args(&tool, args);
+        if coerced.is_some() {
+            tracing::debug!(tool = tool_name, "converted text arguments to the schema's types");
+        }
+        let args = coerced.as_ref().unwrap_or(args);
         if let Err(msg) = validate_tool_args(&tool, args) {
             return error_result(
                 tool_name,

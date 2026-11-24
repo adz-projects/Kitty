@@ -246,6 +246,119 @@ pub fn validator_for(schema: &Value) -> Option<Arc<jsonschema::Validator>> {
 ///
 /// The malformed-schema branch must NOT use `jsonschema::validate`: it
 /// *panics* on a schema it can't compile, unwinding the whole turn task.
+/// The JSON types a schema node allows (`"type": "integer"` or
+/// `"type": ["integer", "null"]`, also through `anyOf`/`oneOf` branches).
+fn schema_types(schema: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match schema.get("type") {
+        Some(Value::String(t)) => out.push(t.clone()),
+        Some(Value::Array(ts)) => out.extend(ts.iter().filter_map(|t| t.as_str().map(String::from))),
+        _ => {}
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = schema.get(key) {
+            for b in branches {
+                out.extend(schema_types(b));
+            }
+        }
+    }
+    out
+}
+
+/// A scalar the model sent as text, converted to the type the schema asks
+/// for: `"200"` for an integer, `"0.5"` for a number, `"true"` for a
+/// boolean. `None` when the schema accepts a string anyway, or the text does
+/// not read cleanly as the wanted type.
+fn coerce_scalar(schema: &Value, text: &str) -> Option<Value> {
+    let types = schema_types(schema);
+    if types.is_empty() || types.iter().any(|t| t == "string") {
+        return None;
+    }
+    let t = text.trim();
+    if types.iter().any(|ty| ty == "integer") {
+        if let Ok(n) = t.parse::<i64>() {
+            return Some(Value::from(n));
+        }
+        // "200.0" is still a whole number.
+        if let Ok(f) = t.parse::<f64>() {
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e15 {
+                return Some(Value::from(f as i64));
+            }
+        }
+    }
+    if types.iter().any(|ty| ty == "number") {
+        if let Ok(f) = t.parse::<f64>() {
+            if f.is_finite() {
+                return serde_json::Number::from_f64(f).map(Value::Number);
+            }
+        }
+    }
+    if types.iter().any(|ty| ty == "boolean") {
+        match t.to_ascii_lowercase().as_str() {
+            "true" => return Some(Value::Bool(true)),
+            "false" => return Some(Value::Bool(false)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Coerce `value` toward `schema` in place: object properties and array
+/// items are walked, and a string where the schema wants a number, an
+/// integer or a boolean is converted when it reads cleanly as one. Returns
+/// whether anything changed.
+fn coerce_value(schema: &Value, value: &mut Value) -> bool {
+    match value {
+        Value::String(s) => match coerce_scalar(schema, s) {
+            Some(v) => {
+                *value = v;
+                true
+            }
+            None => false,
+        },
+        Value::Object(map) => {
+            let Some(Value::Object(props)) = schema.get("properties") else {
+                return false;
+            };
+            let mut changed = false;
+            for (key, v) in map.iter_mut() {
+                if let Some(sub) = props.get(key) {
+                    changed |= coerce_value(sub, v);
+                }
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let Some(item_schema) = schema.get("items") else {
+                return false;
+            };
+            let mut changed = false;
+            for v in items.iter_mut() {
+                changed |= coerce_value(item_schema, v);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// `args` with numbers and booleans the model sent as text converted to the
+/// types `tool`'s schema declares, or `None` when nothing needed converting.
+///
+/// Several open models (Qwen among them) quote every number: `"limit":
+/// "200"`. Strict validation refused every such call, and the model, never
+/// learning, could not page through a document at all. Converting first
+/// keeps validation strict for real mistakes ("abc" for an integer still
+/// fails) while accepting the common habit; the converted arguments are what
+/// the tool server receives, since its own parsing is just as strict.
+pub fn coerce_tool_args(tool: &ToolDefinition, args: &Value) -> Option<Value> {
+    if !args.is_object() || tool.input_schema.get("properties").is_none() {
+        return None;
+    }
+    let mut out = args.clone();
+    coerce_value(&tool.input_schema, &mut out).then_some(out)
+}
+
 /// Compile via `validator_for` and fail open on a compile error — the real
 /// gate is the connect-time compile check in `mcp::client::refresh_tools`,
 /// which refuses to register such a tool in the first place.
@@ -279,6 +392,50 @@ pub fn validate_tool_args(tool: &ToolDefinition, args: &Value) -> Result<(), Str
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn tool_with(schema: Value) -> ToolDefinition {
+        ToolDefinition {
+            name: "t".into(),
+            description: String::new(),
+            input_schema: schema,
+            server_id: "s".into(),
+        }
+    }
+
+    #[test]
+    fn numbers_and_booleans_sent_as_text_are_converted() {
+        let tool = tool_with(json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": ["integer", "null"]},
+                "offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "ratio": {"type": "number"},
+                "deep": {"type": "boolean"},
+                "pages": {"type": "array", "items": {"type": "integer"}},
+                "opts": {"type": "object", "properties": {"count": {"type": "integer"}}}
+            }
+        }));
+        let args = json!({
+            "path": "200", "limit": "200", "offset": " 10 ", "ratio": "0.5", "deep": "True",
+            "pages": ["1", 2], "opts": {"count": "5.0"}
+        });
+        let fixed = coerce_tool_args(&tool, &args).expect("something converted");
+        assert_eq!(
+            fixed,
+            json!({
+                "path": "200", "limit": 200, "offset": 10, "ratio": 0.5, "deep": true,
+                "pages": [1, 2], "opts": {"count": 5}
+            })
+        );
+        assert!(validate_tool_args(&tool, &fixed).is_ok());
+        // Real mistakes still fail validation.
+        let bad = json!({"limit": "lots"});
+        assert!(coerce_tool_args(&tool, &bad).is_none());
+        assert!(validate_tool_args(&tool, &bad).is_err());
+        // Nothing to convert: None, so the original goes through untouched.
+        assert!(coerce_tool_args(&tool, &json!({"limit": 3})).is_none());
+    }
 
     #[test]
     fn truncate_output_leaves_short_content_untouched() {
