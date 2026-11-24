@@ -197,6 +197,12 @@ near the best match; pathway shows only beliefs close to the turn's best,
 challenges stances only, and holds a task learned in another chat to the
 inject bar.
 
+Daemon **2.10.0** (Kitty 1.2.4). Additive, API version stays 2: `/tidy`'s
+routes (`GET /api/apps/me/chats/stats`, `GET`/`POST /api/chat/{id}/tidy`,
+`POST /api/chat/{id}/tidy/readable`) and the in-process `tidy` server
+(`propose_tidy`, always-ask; `read_chats`, only refs the user allowed), both
+withheld from chats that are not tidying.
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
