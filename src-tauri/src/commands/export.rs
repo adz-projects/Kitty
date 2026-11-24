@@ -86,10 +86,19 @@ pub(crate) fn build(
         match row.get("role").and_then(|r| r.as_str()).unwrap_or("") {
             "user" => {
                 out.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", text(row)));
+                // What memory added to this turn (the block the model saw,
+                // and the recall trace the Memory card shows), so a
+                // transcript can be judged with its memory in view.
+                let memory_trace = row
+                    .get("memory_trace")
+                    .and_then(|t| t.as_str())
+                    .and_then(|t| serde_json::from_str::<Value>(t).ok());
                 turns.push(json!({
                     "index": turns.len(),
                     "role": "user",
                     "created_at": row.get("created_at"),
+                    "memory_block": row.get("memory_block").filter(|b| !b.is_null()),
+                    "memory_trace": memory_trace,
                 }));
                 i += 1;
             }
@@ -294,7 +303,10 @@ mod tests {
             }),
             json!({"id": "t1", "role": "tool", "tool_call_id": "c1", "content": "hello"}),
             json!({"id": "a2", "role": "assistant", "content": "It says hello.", "provider_id": "p1", "model": "m1"}),
-            json!({"id": "u2", "role": "user", "content": "Thanks"}),
+            json!({"id": "u2", "role": "user", "content": "Thanks",
+                   "memory_block": "## Relevant memory
+- [p_1] x",
+                   "memory_trace": "{\"status\":\"injected\"}"}),
             json!({"id": "a3", "role": "assistant", "content": "You're welcome.", "provider_id": "p2", "model": "m2"}),
         ]
     }
@@ -323,6 +335,16 @@ mod tests {
         assert_eq!(assistants[0]["model"], "m1");
         assert_eq!(assistants[1]["model"], "m2");
         assert_eq!(e.meta["cwd"], "C:/chats/c1");
+        let users: Vec<&Value> = e.meta["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["role"] == "user")
+            .collect();
+        assert_eq!(users[1]["memory_block"], "## Relevant memory
+- [p_1] x");
+        assert_eq!(users[1]["memory_trace"]["status"], "injected");
+        assert!(users[0]["memory_block"].is_null());
     }
 
     #[test]

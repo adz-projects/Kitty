@@ -152,7 +152,15 @@ pub async fn fetch_exchange(
 pub fn render_recall_block(exchange: &[MessageRow], max_chars: usize) -> String {
     let mut lines = vec!["[Earlier context from this session]".to_string()];
     for row in exchange {
-        let content = row.content.as_deref().unwrap_or("");
+        // Only what was said: a tool-calling step has no text (it rendered as
+        // a bare "assistant:" line), and tool output is not conversation.
+        if row.role != "user" && row.role != "assistant" {
+            continue;
+        }
+        let content = row.content.as_deref().unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
         let content = truncate(content, max_chars);
         lines.push(format!("{}: {content}", row.role));
     }
@@ -249,6 +257,14 @@ pub async fn preflight_recall(
     if all_rows.is_empty() {
         return Ok(None);
     }
+    // Nothing said in the matched exchanges (only tool steps): no block.
+    let said = all_rows.iter().any(|r| {
+        (r.role == "user" || r.role == "assistant")
+            && r.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+    });
+    if !said {
+        return Ok(None);
+    }
     Ok(Some(render_recall_block(&all_rows, 4000)))
 }
 
@@ -341,6 +357,20 @@ mod tests {
         assert!(block.contains("user: hello"));
         assert!(block.contains("assistant: hi there"));
         assert!(block.contains("background context"));
+    }
+
+    #[test]
+    fn render_recall_block_skips_steps_with_no_text() {
+        let rows = vec![
+            row(1, "s1", "user", "hello"),
+            row(2, "s1", "assistant", ""),
+            row(3, "s1", "tool", "{\"status\": \"success\"}"),
+            row(4, "s1", "assistant", "  "),
+            row(5, "s1", "assistant", "hi there"),
+        ];
+        let block = render_recall_block(&rows, 200);
+        assert_eq!(block.matches("assistant:").count(), 1, "{block}");
+        assert!(!block.contains("tool:"));
     }
 
     #[test]

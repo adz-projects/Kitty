@@ -4954,10 +4954,27 @@ impl AgentLoop {
         }
         // The previous user message steers a follow-up's query (4.6).
         let previous = self.previous_user_message(session_id).await;
+        // Recall keys on what the message is about, not what it asks for.
+        // A message about nothing in particular ("summarize the attached")
+        // borrows the previous message's topic, else recalls nothing.
+        let previous_topic = previous
+            .as_deref()
+            .and_then(crate::agent::memorabilia_harvest::topic_query);
+        let Some(topic) = crate::agent::memorabilia_harvest::topic_query(user_message)
+            .or_else(|| previous_topic.clone())
+        else {
+            return MemorabiliaRecallInfo {
+                recalled: None,
+                status: "empty",
+            };
+        };
+        // Items this chat was already shown stay in the conversation where
+        // they were added; showing them again only repeats them.
+        let shown = self.memorabilia_items_shown_in_chat(session_id).await;
         match recall_within_budget(
             "memorabilia",
             session_id,
-            engine.recall_turn(user_message, previous.as_deref()),
+            engine.recall_turn_excluding(&topic, previous_topic.as_deref(), &shown),
         )
         .await
         {
@@ -4974,6 +4991,22 @@ impl AgentLoop {
                 status: "injected",
             },
         }
+    }
+
+    /// The Memorabilia item ids (`[p_…]`) in this chat's stored memory
+    /// blocks: what it has already been shown. Best-effort; empty on error.
+    async fn memorabilia_items_shown_in_chat(
+        &self,
+        session_id: &str,
+    ) -> std::collections::HashSet<String> {
+        let blocks: Vec<String> = sqlx::query_scalar(
+            "SELECT memory_block FROM messages WHERE session_id = ? AND memory_block IS NOT NULL",
+        )
+        .bind(session_id)
+        .fetch_all(self.context.pool())
+        .await
+        .unwrap_or_default();
+        blocks.iter().flat_map(|b| memorabilia_item_ids(b)).collect()
     }
 
     /// A documented counter-view to `stance` from this app's Memorabilia, as
@@ -5005,6 +5038,24 @@ impl AgentLoop {
             view.item_id,
         ))
     }
+}
+
+/// The Memorabilia item ids (`[p_<24 hex>]`) a rendered memory block names.
+fn memorabilia_item_ids(block: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = block;
+    while let Some(i) = rest.find("[p_") {
+        let tail = &rest[i + 1..];
+        let id: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if tail[id.len()..].starts_with(']') && id.len() == 26 {
+            out.push(id.clone());
+        }
+        rest = &tail[id.len().max(1)..];
+    }
+    out
 }
 
 /// The reinforcement event id for a counterpoint shown on a turn with no
@@ -7374,6 +7425,16 @@ mod specialists_toggle_tests {
             assert_eq!(withhold_specialist_tools(&mut tools, &meta), 0, "{meta}");
             assert_eq!(tools.len(), 2);
         }
+    }
+
+    #[test]
+    fn shown_item_ids_are_read_back_from_stored_blocks() {
+        let block = "## Relevant memory\nIndex:\n- [p_7cf53b5a0652802d7807bb9f] A — conf 0.34\n\
+                     - [p_dec788b1e5a5a44ca3f9c4fa] B\n[A documented counter-view]\n[p_short] x";
+        assert_eq!(
+            memorabilia_item_ids(block),
+            ["p_7cf53b5a0652802d7807bb9f", "p_dec788b1e5a5a44ca3f9c4fa"]
+        );
     }
 
     #[test]

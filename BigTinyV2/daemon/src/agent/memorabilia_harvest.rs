@@ -110,6 +110,60 @@ pub(crate) fn strip_turn_attachments(text: &str) -> String {
     text.trim().chars().take(500).collect()
 }
 
+/// Words that say what to *do* ("read", "summarize", "give me a paragraph")
+/// rather than what the message is about. Factual recall keys on the topic:
+/// "summarize these documents" matched a stored fact about LLMs summarizing
+/// documents, on the instruction words alone.
+const REQUEST_WORDS: &[&str] = &[
+    "a", "about", "again", "all", "also", "an", "and", "any", "are", "as", "at", "attached",
+    "attachment", "attachments", "be", "bit", "but", "by", "can", "check", "close", "closely",
+    "consider", "could", "did", "do", "doc", "docs", "document", "documents", "does", "draft",
+    "each", "enough", "every", "explain", "file", "files", "first", "for", "four", "from", "full",
+    "fully", "get", "give", "had", "has", "have", "help", "here", "how", "i", "i'd", "i'll", "i'm",
+    "if", "in", "into", "is", "it", "it's", "its", "just", "keep", "kind", "last", "less", "let",
+    "let's", "like", "list", "little", "look", "make", "many", "may", "me", "might", "more",
+    "much", "must", "my", "need", "no", "not", "now", "of", "ok", "okay", "on", "one", "or",
+    "our", "out", "over", "own", "page", "pages", "paragraph", "paragraphs", "please",
+    "possible", "read", "really", "reread", "second", "see", "sentence", "sentences", "should",
+    "show", "so", "some", "something", "sort", "summaries", "summarise", "summarize", "summary",
+    "tell", "than", "thank", "thanks", "that", "the", "their", "them", "then", "there", "these",
+    "they", "thing", "things", "think", "this", "those", "three", "through", "to", "too", "try",
+    "two", "up", "us", "use", "using", "very", "want", "was", "way", "we", "were", "what",
+    "when", "where", "which", "who", "whole", "why", "will", "with", "word", "words", "would",
+    "write", "yes", "you", "your",
+];
+
+/// The topic of a user message, for factual recall: the message with its
+/// request words and bare numbers removed. `None` when fewer than three
+/// words of substance remain ("Please read the attached documents and
+/// summarize each"), since such a message is about nothing memory could
+/// hold.
+pub(crate) fn topic_query(text: &str) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut substantive = 0usize;
+    for raw in text.split_whitespace() {
+        let word = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-');
+        if word.is_empty() {
+            continue;
+        }
+        let lower = word.to_lowercase();
+        if REQUEST_WORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        // Bare numbers and measures ("2500", "1-paragraph") say nothing
+        // about the topic; mixed tokens ("B550M", "gpt-4") do.
+        let letters = word.chars().filter(|c| c.is_alphabetic()).count();
+        if letters == 0 || (word.chars().any(|c| c.is_ascii_digit()) && word.contains('-') && REQUEST_WORDS.iter().any(|w| lower.ends_with(w))) {
+            continue;
+        }
+        if letters >= 3 {
+            substantive += 1;
+        }
+        kept.push(word);
+    }
+    (substantive >= 3).then(|| kept.join(" "))
+}
+
 /// Harvest and ingest this turn's documents. Called fire-and-forget from the
 /// agent loop's turn-end hook, after the pause check.
 pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) {
@@ -842,5 +896,23 @@ mod tests {
         let only_doc = format!("--- big.txt ---\n{}\n--- end of big.txt ---", "a".repeat(800));
         let out = strip_turn_attachments(&only_doc);
         assert_eq!(out.chars().count(), 500);
+    }
+
+    #[test]
+    fn topic_query_keeps_the_subject_and_drops_the_request() {
+        assert_eq!(
+            topic_query(
+                "Please read the four attached documents and give me a 1-paragraph summary of each. \
+                 Read them all the way through, please -- not just enough to summarize."
+            ),
+            None
+        );
+        let t = topic_query(
+            "I'd like to present a fuller picture of how AI companies speak to institutions vs. investors",
+        )
+        .unwrap();
+        assert!(t.contains("companies") && t.contains("institutions") && t.contains("investors"), "{t}");
+        assert!(!t.contains("like") && !t.contains("please"));
+        assert!(topic_query("What socket does the B550M use on the Gigabyte board?").is_some());
     }
 }
