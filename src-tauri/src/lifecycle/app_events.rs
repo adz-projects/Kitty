@@ -337,6 +337,10 @@ async fn screen_shell_command(app: &AppHandle, command: &str) -> Option<String> 
 /// desktop, when no Kitty window is showing at all, the overlay (where the
 /// approval dialog appears) - decision #7.
 fn bring_to_attention(app: &AppHandle, pending: &PendingApproval) {
+    #[cfg(desktop)]
+    if crate::overlay_runs::reveal_for_hitl(app, pending) {
+        return;
+    }
     let title = if pending.scheduled {
         "A scheduled task needs your approval"
     } else {
@@ -351,9 +355,11 @@ fn bring_to_attention(app: &AppHandle, pending: &PendingApproval) {
     );
     #[cfg(desktop)]
     if !crate::windows::any_kitty_window_visible(app) {
-        if let Err(e) = crate::windows::show_overlay(app) {
-            tracing::warn!("could not show the overlay for an approval: {e}");
-        }
+        let app2 = app.clone();
+        let sid = pending.session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::windows::focus_or_open_session(&app2, &sid).await;
+        });
     }
 }
 

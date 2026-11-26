@@ -41,10 +41,10 @@ pub struct Config {
     pub open_window_hotkey: Option<String>,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
-    /// Where the overlay was last left on each monitor, by monitor name,
-    /// when `remember_overlay_position` is on (#14).
-    #[serde(default)]
-    pub overlay_geometry: std::collections::HashMap<String, OverlayRect>,
+    // `overlay_geometry` and `remember_overlay_position` retired with the
+    // minimal Run-style overlay (fixed compact width, dynamic height); existing
+    // `config.json` files carrying them load fine via `#[serde(default)]` and
+    // drop the keys on the next save.
     /// Every chats base used before the current one. Chats created under an
     /// earlier base keep their folders there; this is what keeps them
     /// recognized as Kitty's own chat folders (and cleaned up with the chat)
@@ -71,8 +71,6 @@ pub struct Config {
     // ignored.
     /// Per-event notification preferences (surfaced in Settings in Phase 5).
     pub notifications: NotificationPrefs,
-    /// Remember overlay size/position between summons (Phase 6).
-    pub remember_overlay_position: bool,
     /// What became of a Kitty V1 install's data (#11): `imported` or
     /// `dismissed`. Unset while there is V1 data the user has not decided
     /// about, which is when the import is offered.
@@ -418,15 +416,6 @@ impl Default for SummarizerSettings {
     }
 }
 
-/// The overlay's outer rectangle, in physical pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct OverlayRect {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
 /// See `Config::token_management`. Field names/defaults mirror BigTiny's own
 /// `TokenManagementConfig` (`plugins/bigtiny/bigtiny/config.py`) so the two
 /// don't drift apart, but this is Kitty's independent copy — BigTiny's
@@ -471,13 +460,11 @@ impl Default for Config {
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
             open_window_hotkey: None,
             default_context_folder: None,
-            overlay_geometry: std::collections::HashMap::new(),
             chats_roots_history: Vec::new(),
             v1_import_state: None,
             setup_completed: false,
             theme: "light".to_string(),
             notifications: NotificationPrefs::default(),
-            remember_overlay_position: true,
             providers: Vec::new(),
             providers_schema: crate::config::providers::SCHEMA_MERGED,
             setups: Vec::new(),
@@ -1391,15 +1378,15 @@ mod tests {
     fn a_patch_changes_only_what_it_names() {
         let cfg = Config {
             hotkeys: vec!["Alt+Space".into()],
-            remember_overlay_position: false,
+            show_artifacts: false,
             ..Default::default()
         };
         let out = patched(
             &cfg,
-            &serde_json::json!({ "remember_overlay_position": true }),
+            &serde_json::json!({ "show_artifacts": true }),
         )
         .unwrap();
-        assert!(out.remember_overlay_position);
+        assert!(out.show_artifacts);
         assert_eq!(out.hotkeys, cfg.hotkeys, "untouched fields survive");
     }
 

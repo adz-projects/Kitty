@@ -22,6 +22,7 @@ mod log_capture;
 mod models;
 mod notifications;
 mod openrouter;
+mod overlay_runs;
 // Raw Win32 GDI desktop capture (BitBlt/GetDIBits) — the `windows` crate is a
 // `cfg(windows)`-only dependency, so this module cannot compile elsewhere.
 #[cfg(windows)]
@@ -170,6 +171,9 @@ pub fn run() {
             commands::set_config,
             commands::get_config_recovery_notice,
             commands::hide_overlay,
+            commands::set_overlay_height,
+            commands::submit_overlay_prompt,
+            commands::drain_overlay_run,
             commands::open_settings,
             commands::open_new_chat_window,
             #[cfg(windows)]

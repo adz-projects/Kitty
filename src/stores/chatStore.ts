@@ -33,6 +33,7 @@ import { isAndroid } from '@/lib/platform';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import { changedEntries, outputEntryOf, outputKey, toOutputRef } from '@/lib/outputs';
 import { listOutputs, snapshotOutputs, useArtifactsStore } from './artifactsStore';
+import { useApprovalStore } from './approvalStore';
 import type {
   NetworkTier,
   OutputSnapshotEntry,
@@ -339,6 +340,16 @@ interface ChatState {
         in-progress turn's not-yet-committed partial content. */
     messages?: Message[];
   }) => Promise<void>;
+  /** Adopt a background run started from the minimal overlay and atomically
+      drain its buffered events so zero tokens are lost or reordered. */
+  adoptOverlayRun: (info: {
+    session_id: string;
+    cwd: string;
+    thinking_effort?: ThinkingEffort | null;
+    is_default_folder?: boolean;
+    provider_id?: string | null;
+    model_id?: string | null;
+  }) => Promise<void>;
   /** Hand the current session off to the main window (the overlay's "Expand"
       button). Resets local session state afterward so reopening the overlay lands on
       a blank composer instead of the just-expanded conversation (Round-4
@@ -353,6 +364,11 @@ interface ChatState {
 }
 
 let bound = false;
+// While a newly opened full Kitty window is draining a background overlay run,
+// live `chat://*` events for that session are queued here and replayed right
+// after `drainOverlayRun` returns, guaranteeing zero dropped/reordered events.
+let overlayDrainTarget: string | null = null;
+let overlayDrainQueue: { event: string; payload: unknown }[] = [];
 // Timestamp of the most recent send() call, for the per-response duration
 // metric (Round-3 item 2) — module-level like `bound`/`msgSeq` below, since
 // there's only ever one in-flight prompt per active session.
@@ -1285,6 +1301,91 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       }
     },
 
+    adoptOverlayRun: async (info) => {
+      get().bindEvents();
+      clearStopGrace();
+      discardDeltas();
+      overlayDrainTarget = info.session_id;
+      overlayDrainQueue = [];
+      const epoch = get().sessionEpoch + 1;
+      set({
+        sessionId: info.session_id,
+        sessionEpoch: epoch,
+        spectating: null,
+        replaying: false,
+        cwd: info.cwd,
+        chatDir: info.cwd,
+        isDefaultFolder: info.is_default_folder ?? true,
+        thinkingEffort: info.thinking_effort ?? null,
+        creatingSession: false,
+        title: null,
+        messages: [],
+        droppedFiles: [],
+        attachments: [],
+        pendingImages: [],
+        pendingAttachments: [],
+        busy: true,
+        sessionProviderId: info.provider_id ?? null,
+        sessionModelId: info.model_id ?? null,
+        sessionConcluded: false,
+        concludedReason: null,
+        error: null,
+        errorType: null,
+        providerOffline: false,
+        warning: null,
+        compactionNotice: null,
+        stopPhase: null,
+        abandonedSession: null,
+        loopSuspected: false,
+        subagents: resetSubagents(),
+        backgroundSession: null,
+        backgroundTurnToast: null,
+      });
+      void ipc.bindWindowSession(info.session_id).catch(() => {});
+      void get().refreshSessionGrants();
+      void get().refreshProvider();
+      try {
+        const drained = await ipc.drainOverlayRun(info.session_id);
+        if (get().sessionId !== info.session_id || get().sessionEpoch !== epoch) {
+          if (overlayDrainTarget === info.session_id) {
+            overlayDrainTarget = null;
+            overlayDrainQueue = [];
+          }
+          return;
+        }
+        const queued = overlayDrainQueue;
+        overlayDrainTarget = null;
+        overlayDrainQueue = [];
+        if (drained.events.length === 0 && queued.length === 0) {
+          // Safety fallback: if the backend buffer expired before the window
+          // mounted, replay the persisted session from the engine rather than
+          // leaving a blank chat.
+          await get().loadSession(info.session_id, info.cwd);
+          void useApprovalStore.getState().refresh();
+          return;
+        }
+        runBatched(() => {
+          const combined = [...drained.events, ...queued];
+          for (const { event, payload } of combined) {
+            replayHandlers.get(event)?.(payload as never);
+          }
+          flushDeltas();
+          if (!drained.busy && get().busy) {
+            set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
+          }
+        });
+        void useApprovalStore.getState().refresh();
+      } catch (e) {
+        if (overlayDrainTarget === info.session_id) {
+          overlayDrainTarget = null;
+          overlayDrainQueue = [];
+        }
+        if (get().sessionId === info.session_id && get().sessionEpoch === epoch) {
+          set({ busy: false, error: String(e) });
+        }
+      }
+    },
+
     handOffToMain: async () => {
       const s = get();
       // Feature 5: Expand always opens a brand-new chat window (never
@@ -2144,6 +2245,14 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           return { messages: closed };
         });
 
+      const queueIfDraining = (event: string, payload: { session_id: string }) => {
+        if (overlayDrainTarget === payload.session_id) {
+          overlayDrainQueue.push({ event, payload });
+          return true;
+        }
+        return false;
+      };
+
       const handleMessageDelta = (e: { session_id: string; text: string }) => {
         if (forActive(e.session_id)) bufferDelta('text', e.text);
       };
@@ -2152,8 +2261,12 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       };
       replayHandlers.set('chat://message-delta', handleMessageDelta);
       replayHandlers.set('chat://reasoning-delta', handleReasoningDelta);
-      void onMessageDelta(handleMessageDelta);
-      void onReasoningDelta(handleReasoningDelta);
+      void onMessageDelta((e) => {
+        if (!queueIfDraining('chat://message-delta', e)) handleMessageDelta(e);
+      });
+      void onReasoningDelta((e) => {
+        if (!queueIfDraining('chat://reasoning-delta', e)) handleReasoningDelta(e);
+      });
       const handleUserMessage: Parameters<typeof onUserMessage>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas(); // keep a replayed user turn after any buffered agent text
@@ -2186,13 +2299,15 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         }
       };
       replayHandlers.set('chat://user-message', handleUserMessage);
-      void onUserMessage(handleUserMessage);
+      void onUserMessage((e) => {
+        if (!queueIfDraining('chat://user-message', e)) handleUserMessage(e);
+      });
       // Replay of a "Regenerate": the answer before it was replaced by the
       // one that follows, so collapse it and let the next answer open anew.
       // Something about how this reply is being produced (a failover, the
       // step limit): a line under the reply, and for a failover, the model
       // the reply is credited to.
-      void onChatNotice((e) => {
+      const handleChatNotice: Parameters<typeof onChatNotice>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas();
         const text = noticeText(e);
@@ -2221,6 +2336,10 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           });
           return { messages: closed };
         });
+      };
+      replayHandlers.set('chat://notice', handleChatNotice);
+      void onChatNotice((e) => {
+        if (!queueIfDraining('chat://notice', e)) handleChatNotice(e);
       });
       const handleSuperseded: Parameters<typeof onSuperseded>[0] = (e) => {
         if (!forActive(e.session_id)) return;
@@ -2234,7 +2353,9 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         });
       };
       replayHandlers.set('chat://superseded', handleSuperseded);
-      void onSuperseded(handleSuperseded);
+      void onSuperseded((e) => {
+        if (!queueIfDraining('chat://superseded', e)) handleSuperseded(e);
+      });
 
       const handleMemoryRecall: Parameters<typeof onMemoryRecall>[0] = (e) => {
         if (!forActive(e.session_id)) return;
@@ -2268,7 +2389,9 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       };
       replayHandlers.set('chat://memory-recall', handleMemoryRecall);
       if (typeof onMemoryRecall === 'function') {
-        void onMemoryRecall(handleMemoryRecall);
+        void onMemoryRecall((e) => {
+          if (!queueIfDraining('chat://memory-recall', e)) handleMemoryRecall(e);
+        });
       }
 
       const handleToolCall: Parameters<typeof onToolCall>[0] = (e) => {
@@ -2356,14 +2479,28 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         });
       };
       replayHandlers.set('chat://tool-call', handleToolCall);
-      void onToolCall(handleToolCall);
+      void onToolCall((e) => {
+        if (!queueIfDraining('chat://tool-call', e)) handleToolCall(e);
+      });
 
-      void onSessionTitle((e) => {
+      const handleSessionTitle: Parameters<typeof onSessionTitle>[0] = (e) => {
         if (forActive(e.session_id)) set({ title: e.title });
+      };
+      replayHandlers.set('chat://session-title', handleSessionTitle);
+      void onSessionTitle((e) => {
+        if (!queueIfDraining('chat://session-title', e)) handleSessionTitle(e);
       });
       // Renamed in another window (or titled as a branch) (#48).
-      void onSessionRenamed((e) => {
+      const handleSessionRenamed: Parameters<typeof onSessionRenamed>[0] = (e) => {
         if (get().sessionId === e.sessionId) set({ title: e.title });
+      };
+      replayHandlers.set('chat://session-renamed', handleSessionRenamed);
+      void onSessionRenamed((e) => {
+        if (overlayDrainTarget === e.sessionId) {
+          overlayDrainQueue.push({ event: 'chat://session-renamed', payload: e });
+          return;
+        }
+        handleSessionRenamed(e);
       });
 
       void onProviderHealth((h) => {
@@ -2483,6 +2620,17 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
       // window as the fallback target (`windows::focus_or_open_session`);
       // reload the session the same way Expand's handoff does.
       void onAdoptSession((info) => {
+        if ((info as { overlay_run?: boolean }).overlay_run === true) {
+          void get().adoptOverlayRun({
+            session_id: info.session_id,
+            cwd: info.cwd,
+            thinking_effort: info.thinking_effort ?? null,
+            is_default_folder: info.is_default_folder ?? true,
+            provider_id: info.provider_id ?? null,
+            model_id: info.model_id ?? null,
+          });
+          return;
+        }
         void get().adoptSession(info);
       });
       // A tidy deleted its chats and then itself: the window that showed it
@@ -2537,7 +2685,7 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
         if (e.kind === 'text') get().addPastedText(e.text, 'Clipboard');
         else get().addPendingImage(e.mime, e.data_url);
       });
-      void onComplete((e) => {
+      const handleComplete: Parameters<typeof onComplete>[0] = (e) => {
         // WS8: a backgrounded turn (one this window abandoned via New Chat /
         // switching sessions, which we deliberately keep running) finished
         // while we moved on — drop the "still running" indicator and surface a
@@ -2585,8 +2733,13 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           };
         });
         void finishTurnOutputs(e.session_id);
+      };
+      replayHandlers.set('chat://complete', handleComplete);
+      void onComplete((e) => {
+        if (!queueIfDraining('chat://complete', e)) handleComplete(e);
       });
-      void onChatError((e) => {
+
+      const handleChatError: Parameters<typeof onChatError>[0] = (e) => {
         // Same backgrounded-turn handling as onComplete — a backgrounded turn
         // that FAILED should still surface so the user knows their abandoned
         // chat didn't quietly succeed.
@@ -2620,23 +2773,38 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
               : s.concludedReason,
         }));
         void finishTurnOutputs(e.session_id);
+      };
+      replayHandlers.set('chat://error', handleChatError);
+      void onChatError((e) => {
+        if (!queueIfDraining('chat://error', e)) handleChatError(e);
       });
+
       // Reuses `compactionNotice` rather than adding a second banner: this is
       // a context-management notice like the compaction one, and it is
       // immediately followed by a compaction pass. One banner, one dismiss,
       // and it is already cleared everywhere a session changes.
-      void onContextBudget((e) => {
+      const handleContextBudget: Parameters<typeof onContextBudget>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         set({
           compactionNotice:
             e.message || 'That turn ended early — the model was close to its context limit.',
         });
+      };
+      replayHandlers.set('chat://context-budget', handleContextBudget);
+      void onContextBudget((e) => {
+        if (!queueIfDraining('chat://context-budget', e)) handleContextBudget(e);
       });
-      void onSubagentStatus((e) => {
+
+      const handleSubagentStatus: Parameters<typeof onSubagentStatus>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         applySubagentStatus(e);
+      };
+      replayHandlers.set('chat://subagent-status', handleSubagentStatus);
+      void onSubagentStatus((e) => {
+        if (!queueIfDraining('chat://subagent-status', e)) handleSubagentStatus(e);
       });
-      void onCompaction((e) => {
+
+      const handleCompaction: Parameters<typeof onCompaction>[0] = (e) => {
         if (!forActive(e.session_id)) return;
         const state = e.memory_slots?.current_state;
         set((s) => ({
@@ -2648,6 +2816,10 @@ export const useChatStore = create<ChatState>((rawSet, rawGet) => {
           sessionConcluded: s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
           concludedReason: s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
         }));
+      };
+      replayHandlers.set('chat://compaction', handleCompaction);
+      void onCompaction((e) => {
+        if (!queueIfDraining('chat://compaction', e)) handleCompaction(e);
       });
     },
   };

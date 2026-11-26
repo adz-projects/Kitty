@@ -87,6 +87,18 @@ export function ChatWorkspace({
             );
           return;
         }
+        if (info.overlay_run === true) {
+          await useChatStore.getState().adoptOverlayRun({
+            session_id: info.session_id,
+            cwd: typeof info.cwd === 'string' ? info.cwd : '',
+            thinking_effort: info.thinking_effort ?? null,
+            is_default_folder:
+              typeof info.is_default_folder === 'boolean' ? info.is_default_folder : true,
+            provider_id: typeof info.provider_id === 'string' ? info.provider_id : null,
+            model_id: typeof info.model_id === 'string' ? info.model_id : null,
+          });
+          return;
+        }
         // The Expand path always hands over a complete snapshot; the cast is
         // narrowing `Partial` back to that, not inventing fields.
         const adopt = useChatStore.getState().adoptSession;

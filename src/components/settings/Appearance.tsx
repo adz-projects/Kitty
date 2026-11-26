@@ -4,8 +4,7 @@ import { SYSTEM_THEME } from '@/lib/theme';
 import { useConfigDraft } from './useConfigDraft';
 import { isAndroid } from '@/lib/platform';
 
-/** Appearance: theme (built-in + user CSS), and — desktop only — the
-    "remember overlay size & position" toggle. */
+/** Appearance: theme (built-in + user CSS). */
 export function Appearance() {
   const { draft, update, save, saved, error } = useConfigDraft();
   const [themes, setThemes] = useState<{ builtins: string[]; user: string[] }>({
@@ -66,19 +65,6 @@ export function Appearance() {
           </small>
         )}
       </label>
-
-      {/* Desktop-only — there is no overlay window on Android to remember
-          anything about. */}
-      {!isAndroid() && (
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.remember_overlay_position}
-            onChange={(e) => update({ remember_overlay_position: e.target.checked })}
-          />
-          <span>Remember overlay size</span>
-        </label>
-      )}
 
       <div className="row">
         <button className="primary" onClick={() => void save()}>

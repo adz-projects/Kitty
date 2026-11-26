@@ -55,7 +55,19 @@ fn chat_window_focused(app: &AppHandle) -> bool {
             .and_then(|w| w.is_focused().ok())
             .unwrap_or(false)
     };
-    focused(windows::OVERLAY) || focused(windows::HUB)
+    if focused(windows::HUB) {
+        return true;
+    }
+    let labels: Vec<String> = app
+        .state::<AppState>()
+        .chat_windows
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|l| l.as_str() != windows::OVERLAY)
+        .cloned()
+        .collect();
+    labels.into_iter().any(|l| focused(&l))
 }
 
 /// Whether the window relevant to `session_id` (if any is currently bound to
@@ -299,15 +311,6 @@ impl TrayState {
         }
     }
 
-    fn tooltip(self) -> &'static str {
-        match self {
-            Self::Degraded => "Kitty — engine not running",
-            Self::Approval => "Kitty — approval needed",
-            Self::Working => "Kitty — working",
-            Self::Idle => "Kitty",
-        }
-    }
-
     /// The badge colour drawn on the app icon, as RGBA.
     #[cfg_attr(not(desktop), allow(dead_code))]
     fn badge(self) -> Option<[u8; 4]> {
@@ -320,6 +323,26 @@ impl TrayState {
     }
 }
 
+/// Format the tray hover tooltip, prioritizing urgent states and surfacing
+/// background overlay thinking runs while nothing is onscreen.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub(crate) fn tray_tooltip(state: TrayState, thinking: &[String]) -> String {
+    match state {
+        TrayState::Degraded => "Kitty — engine not running".to_string(),
+        TrayState::Approval => "Kitty — approval needed".to_string(),
+        TrayState::Working => {
+            if thinking.len() == 1 {
+                format!("Kitty — thinking: {}", thinking[0])
+            } else if thinking.len() > 1 {
+                format!("Kitty — thinking ({} background requests)", thinking.len())
+            } else {
+                "Kitty — working".to_string()
+            }
+        }
+        TrayState::Idle => "Kitty".to_string(),
+    }
+}
+
 /// Recompute the tray from what Kitty is doing and show it. Called wherever
 /// one of the inputs changes: a turn starts or ends, an approval arrives or
 /// is answered, the engine's status changes. On Android there is no tray.
@@ -327,25 +350,33 @@ pub fn refresh_tray(app: &AppHandle) {
     #[cfg(desktop)]
     {
         let state = app.state::<AppState>();
+        let bg_thinking = crate::overlay_runs::unrevealed_previews(app);
         let tray_state = TrayState::from(
             *state.stack_status.lock().unwrap() == crate::state::StackStatus::BackendDown,
             !state.pending_approvals.lock().unwrap().is_empty(),
-            !state.in_flight_sessions.lock().unwrap().is_empty(),
+            !state.in_flight_sessions.lock().unwrap().is_empty() || !bg_thinking.is_empty(),
         );
-        // Unchanged since the last refresh (the common case: every turn start
-        // and end): nothing to redraw.
-        static LAST: std::sync::Mutex<Option<TrayState>> = std::sync::Mutex::new(None);
-        {
+        let tooltip = tray_tooltip(tray_state, &bg_thinking);
+        // Cache `(TrayState, tooltip)` separately so icon redraws only happen
+        // on state transitions while tooltip previews stay fresh.
+        static LAST: std::sync::Mutex<Option<(TrayState, String)>> = std::sync::Mutex::new(None);
+        let prev_state = {
             let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
-            if *last == Some(tray_state) {
-                return;
+            if let Some((prev_st, prev_tip)) = last.as_ref() {
+                if *prev_st == tray_state && *prev_tip == tooltip {
+                    return;
+                }
             }
-            *last = Some(tray_state);
-        }
+            let old_state = last.as_ref().map(|(st, _)| *st);
+            *last = Some((tray_state, tooltip.clone()));
+            old_state
+        };
         if let Some(tray) = app.tray_by_id("main-tray") {
-            let _ = tray.set_tooltip(Some(tray_state.tooltip()));
-            if let Some(icon) = tray_icon(app, tray_state) {
-                let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_tooltip(Some(&tooltip));
+            if prev_state != Some(tray_state) {
+                if let Some(icon) = tray_icon(app, tray_state) {
+                    let _ = tray.set_icon(Some(icon));
+                }
             }
         }
     }
@@ -419,5 +450,33 @@ mod tests {
         let at = |x: usize, y: usize| &px[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
         assert_eq!(at(0, 0), [0, 0, 0, 0], "top-left untouched");
         assert_eq!(at(26, 26), [1, 2, 3, 255], "badge centre coloured");
+    }
+
+    #[test]
+    fn tray_tooltip_shows_background_thinking_previews_and_respects_urgency() {
+        assert_eq!(tray_tooltip(TrayState::Idle, &[]), "Kitty");
+        assert_eq!(
+            tray_tooltip(TrayState::Working, &[]),
+            "Kitty — working"
+        );
+        assert_eq!(
+            tray_tooltip(TrayState::Working, &["florists in LA".to_string()]),
+            "Kitty — thinking: florists in LA"
+        );
+        assert_eq!(
+            tray_tooltip(
+                TrayState::Working,
+                &["a".to_string(), "b".to_string()]
+            ),
+            "Kitty — thinking (2 background requests)"
+        );
+        assert_eq!(
+            tray_tooltip(TrayState::Approval, &["a".to_string()]),
+            "Kitty — approval needed"
+        );
+        assert_eq!(
+            tray_tooltip(TrayState::Degraded, &["a".to_string()]),
+            "Kitty — engine not running"
+        );
     }
 }

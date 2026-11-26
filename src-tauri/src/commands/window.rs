@@ -14,6 +14,34 @@ pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
     windows::hide_overlay(&app).map_err(|e| e.to_string())
 }
 
+/// Resize the minimal overlay height dynamically while keeping its bottom edge
+/// anchored above the taskbar.
+#[tauri::command]
+pub fn set_overlay_height(app: AppHandle, height: f64) -> Result<(), String> {
+    windows::resize_overlay_height(&app, height).map_err(|e| e.to_string())
+}
+
+/// Hide the minimal overlay immediately and process the prompt in the
+/// background, opening a new full Kitty window once output begins or HITL
+/// requires input.
+#[tauri::command]
+pub async fn submit_overlay_prompt(
+    app: AppHandle,
+    request: crate::overlay_runs::OverlayPromptRequest,
+) -> Result<(), String> {
+    crate::overlay_runs::submit_overlay_prompt(app, request).await
+}
+
+/// One-shot drain of buffered `chat://*` events for a newly spawned full Kitty
+/// window started from an overlay run.
+#[tauri::command]
+pub fn drain_overlay_run(
+    app: AppHandle,
+    session_id: String,
+) -> Result<crate::overlay_runs::OverlayDrainResult, String> {
+    Ok(crate::overlay_runs::drain_run(&app, &session_id))
+}
+
 /// Open settings, optionally deep-linked to a section + highlighted element.
 /// Async so window creation dispatches to the main thread (a sync command would
 /// deadlock: it holds the main thread while `build()` needs it).

@@ -463,7 +463,6 @@ mod tests {
         let a = Config::default();
         let b = Config {
             theme: "dark".into(),
-            remember_overlay_position: true,
             show_artifacts: false,
             ..Config::default()
         };

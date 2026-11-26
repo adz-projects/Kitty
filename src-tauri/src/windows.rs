@@ -13,7 +13,7 @@
 //!   route: it needs its own decorationless fullscreen surface, for the same
 //!   reason the overlay does.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -21,10 +21,10 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 
 use crate::state::AppState;
 
-/// Overlay window size (physical px). One source of truth for creation and the
-/// slide-animation fallbacks (Round-5 Batch 7: height cut ~33%, from 576→386).
-const OVERLAY_W: u32 = 570;
-const OVERLAY_H: u32 = 386;
+/// Overlay window size (logical px). Compact Windows-"Run"-style launcher bar;
+/// height grows upward dynamically for multiline prompts and upward popovers.
+const OVERLAY_W: u32 = 540;
+const OVERLAY_H: u32 = 124;
 
 /// Slide-animation tuning (Round-3 follow-up: overlay rises from/sinks into the
 /// taskbar rather than snapping visible/hidden).
@@ -151,7 +151,8 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let win = WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Kitty")
         .inner_size(f64::from(OVERLAY_W), f64::from(OVERLAY_H))
-        .min_inner_size(360.0, 240.0)
+        .min_inner_size(360.0, 96.0)
+        .resizable(false)
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
@@ -160,112 +161,9 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .build()?;
     crate::context_menu::install(&win);
     place_overlay_bottom_right(&win);
-    #[cfg(desktop)]
-    {
-        let app2 = app.clone();
-        win.on_window_event(move |event| {
-            if matches!(
-                event,
-                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
-            ) {
-                schedule_geometry_save(&app2);
-            }
-        });
-    }
     #[cfg(debug_assertions)]
     spawn_load_watchdog(app, win.clone(), OVERLAY.to_string());
     Ok(win)
-}
-
-/// Bumped on every overlay move/resize; a save runs only if no newer one
-/// arrived in the meantime.
-#[cfg(desktop)]
-static GEOMETRY_GEN: AtomicU64 = AtomicU64::new(0);
-
-/// Remember where the user left the overlay, on its monitor (#14): 500 ms
-/// after it stops moving, so a drag saves once, not per pixel. The slide-in
-/// animation's own moves end where it was going anyway.
-#[cfg(desktop)]
-fn schedule_geometry_save(app: &AppHandle) {
-    let gen = GEOMETRY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if GEOMETRY_GEN.load(Ordering::SeqCst) != gen {
-            return;
-        }
-        let Some(win) = app.get_webview_window(OVERLAY) else {
-            return;
-        };
-        if !win.is_visible().unwrap_or(false) {
-            return;
-        }
-        // Inner size, because that is what `set_size` restores. Saving the
-        // outer size grew the overlay by its frame margin on every show.
-        let (Ok(pos), Ok(size), Ok(Some(monitor))) = (
-            win.outer_position(),
-            win.inner_size(),
-            win.current_monitor(),
-        ) else {
-            return;
-        };
-        let Some(name) = monitor.name().cloned() else {
-            return;
-        };
-        let rect = crate::config::OverlayRect {
-            x: pos.x,
-            y: pos.y,
-            width: size.width,
-            height: size.height,
-        };
-        let state = app.state::<crate::state::AppState>();
-        let mut cfg = state.config.lock().unwrap();
-        if !cfg.remember_overlay_position || cfg.overlay_geometry.get(&name) == Some(&rect) {
-            return;
-        }
-        cfg.overlay_geometry.insert(name, rect);
-        if let Err(e) = crate::config::save(&cfg) {
-            tracing::warn!("could not save the overlay position: {e}");
-        }
-    });
-}
-
-/// Restore the overlay's remembered size on this monitor, if remembering is
-/// on. Only the size: the overlay always opens at the lower right of the work
-/// area, wherever it was dragged last time.
-#[cfg(desktop)]
-fn restore_overlay_size(win: &WebviewWindow) {
-    let app = win.app_handle();
-    let saved = {
-        let state = app.state::<crate::state::AppState>();
-        let cfg = state.config.lock().unwrap();
-        if !cfg.remember_overlay_position {
-            return;
-        }
-        cfg.overlay_geometry.clone()
-    };
-    let Ok(monitors) = win.available_monitors() else {
-        return;
-    };
-    let Some(rect) = monitors
-        .iter()
-        .filter_map(|m| m.name())
-        .find_map(|name| saved.get(name))
-    else {
-        return;
-    };
-    // A saved size more than half again the default is taken as the old
-    // outer-size creep (or a stray resize) and the default is restored.
-    let scale = win.scale_factor().unwrap_or(1.0);
-    let too_big = |saved: u32, default: u32| f64::from(saved) > f64::from(default) * 1.5 * scale;
-    if too_big(rect.width, OVERLAY_W) || too_big(rect.height, OVERLAY_H) {
-        let _ = win.set_size(tauri::LogicalSize::new(
-            f64::from(OVERLAY_W),
-            f64::from(OVERLAY_H),
-        ));
-    } else {
-        let _ = win.set_size(tauri::PhysicalSize::new(rect.width, rect.height));
-    }
 }
 
 /// The overlay's resting (x, y) — lower-right of the primary monitor's *work
@@ -312,26 +210,31 @@ fn place_overlay_bottom_right(win: &WebviewWindow) {
     }
 }
 
+/// True while `animate_overlay_in`'s slide-up tween is actively moving the
+/// window from below the taskbar to its resting spot.
+static OVERLAY_ANIMATING: AtomicBool = AtomicBool::new(false);
+
 /// Slide the overlay up from just below the work-area's bottom edge (as if
 /// rising out of the taskbar) to its resting position, then focus it. Falls
 /// back to a plain show if the work-area geometry can't be read.
 fn animate_overlay_in(win: &WebviewWindow) {
-    // Size first: the lower-right position is worked out from it.
-    #[cfg(desktop)]
-    restore_overlay_size(win);
     let target = overlay_target_position(win);
     let Some((x, target_y)) = target else {
+        OVERLAY_ANIMATING.store(false, Ordering::SeqCst);
         let _ = win.show();
         let _ = win.set_focus();
+        let _ = win.emit("overlay://shown", ());
         return;
     };
     let outer = win
         .outer_size()
         .unwrap_or(tauri::PhysicalSize::new(OVERLAY_W, OVERLAY_H));
     let start_y = target_y + outer.height as i32;
+    OVERLAY_ANIMATING.store(true, Ordering::SeqCst);
     let _ = win.set_position(tauri::PhysicalPosition::new(x, start_y));
     let _ = win.show();
     let _ = win.set_focus();
+    let _ = win.emit("overlay://shown", ());
     let gen = ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let win = win.clone();
     tauri::async_runtime::spawn(async move {
@@ -345,9 +248,49 @@ fn animate_overlay_in(win: &WebviewWindow) {
             tokio::time::sleep(Duration::from_millis(ANIM_STEP_MS)).await;
         }
         if ANIM_GEN.load(Ordering::SeqCst) == gen {
-            let _ = win.set_position(tauri::PhysicalPosition::new(x, target_y));
+            OVERLAY_ANIMATING.store(false, Ordering::SeqCst);
+            if let Some((rx, ry)) = overlay_target_position(&win) {
+                let _ = win.set_position(tauri::PhysicalPosition::new(rx, ry));
+            }
         }
     });
+}
+
+/// Resize the minimal overlay height dynamically (e.g. multiline input or
+/// upward-opening popovers) while anchoring its current bottom edge in place
+/// so a user-dragged overlay never teleports back to the primary monitor.
+#[cfg(desktop)]
+pub fn resize_overlay_height(app: &AppHandle, logical_height: f64) -> tauri::Result<()> {
+    let Some(win) = app.get_webview_window(OVERLAY) else {
+        return Ok(());
+    };
+    let visible = win.is_visible().unwrap_or(false);
+    let was_animating = OVERLAY_ANIMATING.swap(false, Ordering::SeqCst);
+    let old_geom = if visible && !was_animating {
+        win.outer_position().ok().zip(win.outer_size().ok())
+    } else {
+        None
+    };
+    let clamped = logical_height.clamp(96.0, 480.0);
+    win.set_size(tauri::LogicalSize::new(f64::from(OVERLAY_W), clamped))?;
+    if visible {
+        ANIM_GEN.fetch_add(1, Ordering::SeqCst);
+        if let Some((old_pos, old_size)) = old_geom {
+            if let Ok(new_size) = win.outer_size() {
+                let bottom = old_pos.y + old_size.height as i32;
+                let new_y = bottom - new_size.height as i32;
+                let _ = win.set_position(tauri::PhysicalPosition::new(old_pos.x, new_y));
+            }
+        } else {
+            place_overlay_bottom_right(&win);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+pub fn resize_overlay_height(_app: &AppHandle, _logical_height: f64) -> tauri::Result<()> {
+    Ok(())
 }
 
 /// Hide the overlay immediately — no slide (owner: closing should disappear,
@@ -356,6 +299,7 @@ fn animate_overlay_in(win: &WebviewWindow) {
 /// in-flight `animate_overlay_in` tween (e.g. a rapid re-toggle) cancels
 /// itself instead of fighting this immediate hide over `set_position`.
 fn animate_overlay_out(win: &WebviewWindow) {
+    OVERLAY_ANIMATING.store(false, Ordering::SeqCst);
     ANIM_GEN.fetch_add(1, Ordering::SeqCst);
     let _ = win.hide();
 }
@@ -448,7 +392,7 @@ pub fn window_label_for_session(app: &AppHandle, session_id: &str) -> Option<Str
 // so they're marked per-function rather than blanket-allowed.
 #[cfg_attr(not(desktop), allow(dead_code))]
 fn any_open_chat_window(app: &AppHandle) -> Option<String> {
-    let mut candidates: Vec<String> = vec![OVERLAY.to_string(), HUB.to_string()];
+    let mut candidates: Vec<String> = vec![HUB.to_string()];
     {
         let state = app.state::<AppState>();
         let map = state.chat_windows.lock().unwrap();
@@ -483,39 +427,45 @@ fn any_open_chat_window(app: &AppHandle) -> Option<String> {
 /// correct replay rather than a half-populated snapshot.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
-    let cwd = match crate::bigtiny::sessions::list(app)
-        .await
-        .ok()
-        .and_then(|rows| find_cwd(rows, session_id))
+    let payload = if let Some(handoff) =
+        crate::overlay_runs::handoff_for_unhanded_run(app, session_id)
     {
-        Some(cwd) => cwd,
-        None => {
-            // `sessions::list` is capped at the 200 most recent sessions —
-            // an older chat falls off that window and used to resolve to
-            // `cwd: ""`. Read that one session's row instead (the engine caps
-            // a list page at 500, so asking for a longer list did not help).
-            match crate::bigtiny::client::ensure_client(app) {
-                Ok(client) => crate::bigtiny::sessions::session_row(&client, session_id)
-                    .await
-                    .map(|row| crate::bigtiny::sessions::translate_session_row(&row))
-                    .and_then(|row| find_cwd(vec![row], session_id))
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
+        handoff
+    } else {
+        let cwd = match crate::bigtiny::sessions::list(app)
+            .await
+            .ok()
+            .and_then(|rows| find_cwd(rows, session_id))
+        {
+            Some(cwd) => cwd,
+            None => {
+                // `sessions::list` is capped at the 200 most recent sessions —
+                // an older chat falls off that window and used to resolve to
+                // `cwd: ""`. Read that one session's row instead (the engine caps
+                // a list page at 500, so asking for a longer list did not help).
+                match crate::bigtiny::client::ensure_client(app) {
+                    Ok(client) => crate::bigtiny::sessions::session_row(&client, session_id)
+                        .await
+                        .map(|row| crate::bigtiny::sessions::translate_session_row(&row))
+                        .and_then(|row| find_cwd(vec![row], session_id))
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                }
             }
-        }
-    };
+        };
 
-    // Derive the effort control for the active provider so the re-adopted
-    // session shows (or hides) the dropdown correctly, rather than the old
-    // hardcoded null that always hid it.
-    let thinking_effort = crate::bigtiny::effort::thinking_effort_for(app, session_id);
-    let is_default_folder = crate::commands::is_default_folder(app, &cwd);
-    let payload = json!({
-        "session_id": session_id,
-        "cwd": cwd,
-        "thinking_effort": thinking_effort,
-        "is_default_folder": is_default_folder,
-    });
+        // Derive the effort control for the active provider so the re-adopted
+        // session shows (or hides) the dropdown correctly, rather than the old
+        // hardcoded null that always hid it.
+        let thinking_effort = crate::bigtiny::effort::thinking_effort_for(app, session_id);
+        let is_default_folder = crate::commands::is_default_folder(app, &cwd);
+        json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "thinking_effort": thinking_effort,
+            "is_default_folder": is_default_folder,
+        })
+    };
 
     if let Some(label) = any_open_chat_window(app) {
         let _ = app.emit_to(&label, "chat://adopt-session", payload);

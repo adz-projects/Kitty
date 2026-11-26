@@ -19,7 +19,6 @@ export interface Config {
   setup_completed: boolean;
   theme: string;
   notifications: NotificationPrefs;
-  remember_overlay_position: boolean;
   providers: ProviderProfile[];
   active_provider_id: string | null;
   /** The default was retired (the "On this device" type): ask for another. */
@@ -1126,6 +1125,20 @@ export interface OutputSnapshotEntry {
   size: number;
   modified: number;
   is_dir: boolean;
+}
+
+export interface OverlayPromptRequest {
+  text: string;
+  images?: { mime: string; data_url: string }[];
+  attached_paths?: string[];
+  documents?: { label: string; content: string; pinned?: boolean }[];
+  provider_id?: string | null;
+  thinking_effort?: string | null;
+}
+
+export interface OverlayDrainResult {
+  events: { event: string; payload: unknown }[];
+  busy: boolean;
 }
 
 /** Parsed from a raw ACP `session/list` entry. */

@@ -53,6 +53,7 @@ pub use scheduled_tasks::*;
 #[cfg(windows)]
 pub use screenshot::*;
 pub use session::*;
+pub(crate) use session::fresh_chat_folder;
 pub use setup::*;
 pub use setups::*;
 pub use specialists::*;

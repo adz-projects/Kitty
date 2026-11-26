@@ -245,94 +245,146 @@ button:disabled {
   gap: 8px;
 }
 
-/* --- Overlay window: a floating, centered card over a transparent backdrop --- */
+/* --- Overlay window: lower-right Windows-"Run"-style launcher card --- */
 .overlay-root {
   display: flex;
-  align-items: flex-start;
+  align-items: flex-end;
   justify-content: center;
   height: 100%;
-  /* No transparent margin around the card: it fills the window, framed by
-     its own border. (A drop shadow would need that margin to draw in.) */
   padding: 0;
 }
 
-.overlay-card {
+.overlay-run-card {
   width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px 10px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
   opacity: var(--overlay-opacity);
 }
 
-.overlay-titlebar {
+.overlay-run-textarea {
+  width: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-base);
+  line-height: 1.45;
+  padding: 2px 2px 4px;
+  max-height: 160px;
+  overflow-y: hidden;
+}
+
+.overlay-run-textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.overlay-run-attachments {
+  padding: 0 2px;
+}
+
+.overlay-run-notice {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  /* Round-5 Batch 7 slimmed this down for more chat room, but the bar's own
-     height is just its tallest button plus this padding — with the buttons
-     themselves now tightened up (see `.overlay-titlebar button`), a touch
-     more padding here reads as real margin around them instead of the
-     buttons nearly filling the whole bar. */
-  padding: 5px 10px;
-  border-bottom: 1px solid var(--border);
+  gap: 8px;
+  font-size: var(--fs-sm);
+  color: var(--warn);
+  padding: 2px 2px 0;
+}
+
+.overlay-run-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
   -webkit-user-select: none;
   user-select: none;
 }
-.overlay-titlebar button {
-  padding: 2px 8px;
-  font-size: var(--fs-sm);
-  /* Buttons were inheriting the body's 1.5 line-height, which on top of the
-     padding left them nearly as tall as the titlebar itself — barely any
-     margin above/below. A tight line-height lets the icon's own size (not
-     an oversized text line box) drive the button's height instead. */
-  line-height: 1;
-}
 
-/* The overlay's title bar holds everything above the conversation: the model
-   and effort pickers on the left, then new chat, settings, the chat picker,
-   expand and hide. The gap between the two groups
-   is the drag area, so the controls stay compact rather than stretching. */
-.overlay-titlebar {
-  gap: 8px;
-}
-.overlay-header-slot {
+.overlay-run-controls {
   display: flex;
-  min-width: 0;
-  flex: 0 1 auto;
-}
-.overlay-header-slot .chat-header {
-  padding-bottom: 0;
+  align-items: center;
   gap: 6px;
   min-width: 0;
 }
-.overlay-header-slot .provider-badge-label {
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+
+.overlay-run-spacer {
+  flex: 1;
+  min-width: 12px;
+  align-self: stretch;
 }
-.overlay-titlebar-buttons {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: 4px;
+
+.overlay-run-control-wrap {
+  position: relative;
+  display: inline-flex;
 }
-/* Every button and pill in the bar is the same height, centred on one line. */
-.overlay-titlebar button,
-.overlay-titlebar .status-badge {
+
+.overlay-run-attach {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-sizing: border-box;
-  height: 26px;
-  padding-top: 0;
-  padding-bottom: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.overlay-run-attach:hover {
+  color: var(--text);
+}
+
+.overlay-run-footer .status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 9px;
   line-height: 1;
 }
 
-.overlay-body {
-  padding: 16px;
+.overlay-run-footer .provider-badge-label {
+  max-width: 160px;
+}
+
+.overlay-run-send {
+  height: 28px;
+  padding: 0 14px;
+  line-height: 1;
+  font-size: var(--fs-md);
+  font-weight: 500;
+}
+
+.overlay-run-popover {
+  top: auto;
+  right: auto;
+  bottom: calc(100% + 6px);
+  left: 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.overlay-run-degraded {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: var(--fs-md);
+}
+
+.overlay-run-degraded-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 /* --- Full / settings / wizard windows: solid surface, full height --- */

@@ -127,6 +127,13 @@ pub struct AppState {
     /// The BigTiny daemon child we spawn, plus its port + secret (sent as
     /// `X-API-Key`).
     pub bigtiny: Mutex<DaemonHandle>,
+    /// Minimal-overlay background runs waiting for first visible output, HITL,
+    /// or completion before opening a new full Kitty window (`overlay_runs`).
+    pub overlay_runs: Mutex<HashMap<String, crate::overlay_runs::OverlayRunState>>,
+    /// Recent overlay submissions kept for rapid-repeat semantic dedup.
+    pub recent_overlay_prompts: Mutex<Vec<crate::overlay_runs::RecentOverlayPrompt>>,
+    /// Serializes rapid-repeat dedup check + record across async embedding calls.
+    pub overlay_dedup_gate: tokio::sync::Mutex<()>,
     /// Tool approvals waiting on a person, by the daemon's action id, for
     /// every session Kitty owns (`approvals`, `lifecycle::app_events`).
     pub pending_approvals: Mutex<HashMap<String, crate::approvals::PendingApproval>>,
@@ -258,6 +265,9 @@ impl AppState {
             route_targets: Mutex::new(HashMap::new()),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
             bigtiny: Mutex::new(DaemonHandle::default()),
+            overlay_runs: Mutex::new(HashMap::new()),
+            recent_overlay_prompts: Mutex::new(Vec::new()),
+            overlay_dedup_gate: tokio::sync::Mutex::new(()),
             pending_approvals: Mutex::new(HashMap::new()),
             app_events_started: AtomicBool::new(false),
             in_flight_sessions: Mutex::new(HashSet::new()),

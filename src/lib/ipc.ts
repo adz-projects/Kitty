@@ -50,6 +50,8 @@ import type {
   DebateSeat,
   LearningModelSetting,
   OpenRouterCredits,
+  OverlayDrainResult,
+  OverlayPromptRequest,
   PathInfo,
   StagedAttachment,
   ProviderProfile,
@@ -115,6 +117,11 @@ export const ipc = {
   dismissV1Import: () => invoke<void>('dismiss_v1_import'),
   getConfigRecoveryNotice: () => invoke<string | null>('get_config_recovery_notice'),
   hideOverlay: () => invoke<void>('hide_overlay'),
+  setOverlayHeight: (height: number) => invoke<void>('set_overlay_height', { height }),
+  submitOverlayPrompt: (request: OverlayPromptRequest) =>
+    invoke<void>('submit_overlay_prompt', { request }),
+  drainOverlayRun: (sessionId: string) =>
+    invoke<OverlayDrainResult>('drain_overlay_run', { sessionId }),
   openSettings: (section?: string, highlight?: string) =>
     invoke<void>('open_settings', { section: section ?? null, highlight: highlight ?? null }),
   /** Feature 5 — always creates a brand-new chat window (never reuses one),
@@ -977,8 +984,13 @@ export const onProviderActivated = (cb: (p: ProviderActivatedPayload) => void) =
     there reads `booted_windows`, since the watchdog itself is compiled out. */
 export const windowReady = (): Promise<void> => invoke<void>('window_ready');
 
-/** Tray "New Session" → overlay starts a fresh session. */
-export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());
+/** Pre-stream overlay submission failed after hiding the overlay; restores the
+    user's prompt text and displays the error notice. */
+export const onOverlaySubmitFailed = (cb: (p: { text: string; error: string }) => void) =>
+  listen<{ text: string; error: string }>('overlay://submit-failed', (e) => cb(e.payload));
+
+/** Overlay window was just shown/focused via hotkey or tray. */
+export const onOverlayShown = (cb: () => void) => listen('overlay://shown', () => cb());
 
 /** A right-click in THIS window (the WebView2 bridge, `context_menu.rs`):
     only this window's. */

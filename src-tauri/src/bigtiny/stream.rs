@@ -287,6 +287,7 @@ impl Drop for InFlight {
             .lock()
             .unwrap()
             .remove(&self.session_id);
+        crate::overlay_runs::on_turn_finished(&self.app, &self.session_id);
         notifications::refresh_tray(&self.app);
     }
 }
@@ -408,12 +409,16 @@ pub async fn send_prompt(
                 if let Some(timing) = timing {
                     result["timing"] = timing;
                 }
-                let _ = app_bg.emit(
+                let was_unrevealed = crate::overlay_runs::is_unrevealed(&app_bg, &session_id);
+                crate::overlay_runs::emit_or_buffer(
+                    &app_bg,
+                    &session_id,
                     "chat://complete",
                     json!({ "session_id": session_id, "result": result }),
                 );
-                // A turn the user stopped did not "finish".
-                if !cancelled {
+                // A turn the user stopped did not "finish"; an overlay turn that
+                // just revealed its new Kitty window shouldn't also fire a toast.
+                if !cancelled && !was_unrevealed {
                     notifications::notify_if_hidden(
                         &app_bg,
                         notifications::Event::TaskComplete,
@@ -434,17 +439,22 @@ pub async fn send_prompt(
                 if error_type.as_deref() == Some("effort_rejected") {
                     crate::bigtiny::effort::on_effort_rejected(&app_bg, &session_id);
                 }
-                let _ = app_bg.emit(
+                let was_unrevealed = crate::overlay_runs::is_unrevealed(&app_bg, &session_id);
+                crate::overlay_runs::emit_or_buffer(
+                    &app_bg,
+                    &session_id,
                     "chat://error",
                     json!({ "session_id": session_id, "message": &message, "error_type": error_type }),
                 );
-                notifications::notify_if_hidden(
-                    &app_bg,
-                    notifications::Event::TaskFailed,
-                    "Kitty ran into a problem",
-                    &message,
-                    Some(&session_id),
-                );
+                if !was_unrevealed {
+                    notifications::notify_if_hidden(
+                        &app_bg,
+                        notifications::Event::TaskFailed,
+                        "Kitty ran into a problem",
+                        &message,
+                        Some(&session_id),
+                    );
+                }
                 providers::emit_health_from_send_result(
                     &app_bg,
                     card.as_ref(),
@@ -460,17 +470,22 @@ pub async fn send_prompt(
                 message,
                 error_type,
             }) => {
-                let _ = app_bg.emit(
+                let was_unrevealed = crate::overlay_runs::is_unrevealed(&app_bg, &session_id);
+                crate::overlay_runs::emit_or_buffer(
+                    &app_bg,
+                    &session_id,
                     "chat://error",
                     json!({ "session_id": session_id, "message": &message, "error_type": error_type }),
                 );
-                notifications::notify_if_hidden(
-                    &app_bg,
-                    notifications::Event::TaskFailed,
-                    "Kitty ran into a problem",
-                    &message,
-                    Some(&session_id),
-                );
+                if !was_unrevealed {
+                    notifications::notify_if_hidden(
+                        &app_bg,
+                        notifications::Event::TaskFailed,
+                        "Kitty ran into a problem",
+                        &message,
+                        Some(&session_id),
+                    );
+                }
             }
         }
         drop(_in_flight);
@@ -536,7 +551,9 @@ async fn check_compaction(app: &AppHandle, session_id: &str) -> bool {
     };
     match previous {
         Some(previous) if rowid > previous => {
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://compaction",
                 json!({
                     "session_id": session_id,
@@ -619,7 +636,9 @@ fn poll_session_title(app: AppHandle, session_id: String) {
                 .lock()
                 .unwrap()
                 .insert(session_id.clone());
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                &app,
+                &session_id,
                 "chat://session-title",
                 json!({ "session_id": session_id, "title": title }),
             );
@@ -733,6 +752,7 @@ async fn consume_stream(
     let mut bytes = resp.bytes_stream();
     let mut deltas = DeltaBatcher::default();
     let mut saw_last = false;
+    let mut unrevealed = crate::overlay_runs::is_unrevealed(app, session_id);
     'outer: loop {
         let chunk = match tokio::time::timeout(idle, bytes.next()).await {
             Ok(Some(item)) => {
@@ -776,10 +796,16 @@ async fn consume_stream(
             }
         }
         // Time-based release of whatever text accumulated across this chunk's
-        // frames. Checked per chunk rather than per frame so a burst of tokens
-        // in one chunk still goes out as a single event.
-        if deltas.due() {
+        // frames, or immediate per-chunk release for an unrevealed overlay
+        // run's first visible answer text (without per-token locking).
+        let unrevealed_visible = unrevealed
+            && !deltas.text.is_empty()
+            && (!deltas.text.contains("<think>") || deltas.text.contains("</think>"));
+        if deltas.due() || unrevealed_visible {
             deltas.flush(app, session_id);
+            if unrevealed {
+                unrevealed = crate::overlay_runs::is_unrevealed(app, session_id);
+            }
         }
     }
     // The stream can also end via `Ok(None)` (daemon closed cleanly) without an
@@ -846,14 +872,18 @@ impl DeltaBatcher {
 
     fn flush(&mut self, app: &AppHandle, session_id: &str) {
         if !self.text.is_empty() {
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://message-delta",
                 json!({ "session_id": session_id, "text": self.text }),
             );
             self.text.clear();
         }
         if !self.reasoning.is_empty() {
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://reasoning-delta",
                 json!({ "session_id": session_id, "text": self.reasoning }),
             );
@@ -905,7 +935,9 @@ fn handle_event(
         }
         "memory_recall" => {
             if let Some(recall) = event.get("memory_recall").filter(|v| !v.is_null()) {
-                let _ = app.emit(
+                crate::overlay_runs::emit_or_buffer(
+                    app,
+                    session_id,
                     "chat://memory-recall",
                     json!({
                         "session_id": session_id,
@@ -921,7 +953,9 @@ fn handle_event(
                 open_tools,
                 last_tool,
             );
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://tool-call",
                 json!({
                     "session_id": session_id,
@@ -941,7 +975,9 @@ fn handle_event(
             // The step budget ran out: not a tool the user watched start, but
             // the reason this turn stopped where it did, which they are owed.
             if tool_name == "__budget__" {
-                let _ = app.emit(
+                crate::overlay_runs::emit_or_buffer(
+                    app,
+                    session_id,
                     "chat://notice",
                     json!({
                         "session_id": session_id,
@@ -958,7 +994,9 @@ fn handle_event(
             // (a dismissible banner, like the compaction notice) rather than
             // rendered as a tool card for a tool nobody called.
             if tool_name == "__context_budget__" {
-                let _ = app.emit(
+                crate::overlay_runs::emit_or_buffer(
+                    app,
+                    session_id,
                     "chat://context-budget",
                     json!({
                         "session_id": session_id,
@@ -977,7 +1015,9 @@ fn handle_event(
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or_else(|| tool_result_is_error(result_text));
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://tool-call",
                 json!({
                     "session_id": session_id,
@@ -998,7 +1038,9 @@ fn handle_event(
             // deliberate daemon-side — the child id is what lets the UI offer a
             // click-through into the delegate's own transcript, the escape
             // hatch for when its structured report was not enough.
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://subagent-status",
                 json!({
                     "session_id": session_id,
@@ -1028,7 +1070,9 @@ fn handle_event(
                     .lock()
                     .unwrap()
                     .insert(session_id.to_string());
-                let _ = app.emit(
+                crate::overlay_runs::emit_or_buffer(
+                    app,
+                    session_id,
                     "chat://session-title",
                     json!({ "session_id": session_id, "title": title }),
                 );
@@ -1117,7 +1161,9 @@ fn handle_event(
             // after this stream has already closed (see
             // `poll_compaction_status`, the reliable delivery path) — but
             // cheap to forward directly on the lucky case it's still open.
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://compaction",
                 json!({ "session_id": session_id, "content": content }),
             );
@@ -1127,7 +1173,9 @@ fn handle_event(
             // unavailable, cannot call tools, or failed mid-turn. Said out
             // loud rather than silently, and the chat's model info follows.
             let text = |k: &str| event.get(k).and_then(|v| v.as_str());
-            let _ = app.emit(
+            crate::overlay_runs::emit_or_buffer(
+                app,
+                session_id,
                 "chat://notice",
                 json!({
                     "session_id": session_id,
