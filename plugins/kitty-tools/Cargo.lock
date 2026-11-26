@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-tools"
-version = "1.2.5"
+version = "1.2.6"
 dependencies = [
  "anyhow",
  "base64",

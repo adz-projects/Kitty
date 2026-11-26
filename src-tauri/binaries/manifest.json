@@ -1,6 +1,6 @@
 {
-  "bigtiny": "9fa3a992725270292cd3ae47f10ba4571cc7f114a2050ed387f6f6ed1ff9f3d4",
-  "kitty-tools": "dc3a6750f1fde65f56e2850dafd82872c84d052677cfb232916e20fdffff9ece",
-  "kitty-wasm": "afb0cbe4b759b36085f97b725e848cc1511f48d4f3fe6cd4cc01c8fa56e889a3",
-  "kitty-web": "5d98118ae4675d2cc70e1e44ca502dbfc48c2442e8369ca9d05913985db24b66"
+  "bigtiny": "c283a757e0ecccbf14b3fb186fb7b49581676f6a0c7b4e8c081d7251977d8781",
+  "kitty-tools": "5b194fff7acc68f5a5ba7dd542a12e9ad1df44cdfd575a91cd5cbecae625bc4c",
+  "kitty-wasm": "cffcbbf0e4b339e2ba1289b908e4f888718255faaa4219f55bf0d3b73974963d",
+  "kitty-web": "69caf46376f28c9ff2a19960ce2e411adf6d8718c3ebe633aeb76479045200b7"
 }
