@@ -171,7 +171,7 @@ pub fn run() {
             commands::set_config,
             commands::get_config_recovery_notice,
             commands::hide_overlay,
-            commands::set_overlay_height,
+            commands::set_overlay_hit_rects,
             commands::submit_overlay_prompt,
             commands::drain_overlay_run,
             commands::open_settings,

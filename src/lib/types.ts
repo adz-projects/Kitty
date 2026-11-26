@@ -16,6 +16,8 @@ export interface Config {
   clipboard_hotkey: string | null;
   open_window_hotkey: string | null;
   default_context_folder: string | null;
+  recent_working_dirs?: string[];
+  overlay_prompt_history?: string[];
   setup_completed: boolean;
   theme: string;
   notifications: NotificationPrefs;
@@ -1134,6 +1136,19 @@ export interface OverlayPromptRequest {
   documents?: { label: string; content: string; pinned?: boolean }[];
   provider_id?: string | null;
   thinking_effort?: string | null;
+  cwd?: string | null;
+  debate?: boolean | null;
+  research?: { max_turns: number | null } | null;
+  critique?: 'start' | 'continue' | null;
+  tidy?: boolean | null;
+  raw_prompt?: string | null;
+}
+
+export interface OverlayHitRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface OverlayDrainResult {

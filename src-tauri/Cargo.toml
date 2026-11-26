@@ -68,6 +68,8 @@ windows = { version = "0.58", features = [
     # dedicated screen-capture crate (Kitty is Windows-only, so a
     # cross-platform crate's abstraction buys nothing here).
     "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_SystemInformation",
 ] }
 # The WebView2 context-menu bridge (`context_menu.rs`): the same versions
 # wry uses, so the COM interfaces are the ones Tauri's webview hands over.

@@ -350,27 +350,35 @@ pub fn refresh_tray(app: &AppHandle) {
     #[cfg(desktop)]
     {
         let state = app.state::<AppState>();
-        let bg_thinking = crate::overlay_runs::unrevealed_previews(app);
+        let bg_runs = crate::overlay_runs::unrevealed_tray_runs(app);
+        let bg_thinking: Vec<String> = bg_runs.iter().map(|(_, p)| p.clone()).collect();
         let tray_state = TrayState::from(
             *state.stack_status.lock().unwrap() == crate::state::StackStatus::BackendDown,
             !state.pending_approvals.lock().unwrap().is_empty(),
             !state.in_flight_sessions.lock().unwrap().is_empty() || !bg_thinking.is_empty(),
         );
         let tooltip = tray_tooltip(tray_state, &bg_thinking);
-        // Cache `(TrayState, tooltip)` separately so icon redraws only happen
-        // on state transitions while tooltip previews stay fresh.
-        static LAST: std::sync::Mutex<Option<(TrayState, String)>> = std::sync::Mutex::new(None);
-        let prev_state = {
+        // Cache `(TrayState, tooltip, bg_runs)` separately so icon redraws and
+        // menu rebuilds only happen on actual transitions while previews stay fresh.
+        #[allow(clippy::type_complexity)]
+        static LAST: std::sync::Mutex<Option<(TrayState, String, Vec<(String, String)>)>> =
+            std::sync::Mutex::new(None);
+        let (prev_state, menu_changed) = {
             let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((prev_st, prev_tip)) = last.as_ref() {
-                if *prev_st == tray_state && *prev_tip == tooltip {
+            if let Some((prev_st, prev_tip, prev_bg)) = last.as_ref() {
+                if *prev_st == tray_state && *prev_tip == tooltip && *prev_bg == bg_runs {
                     return;
                 }
             }
-            let old_state = last.as_ref().map(|(st, _)| *st);
-            *last = Some((tray_state, tooltip.clone()));
-            old_state
+            let old_state = last.as_ref().map(|(st, _, _)| *st);
+            let old_bg = last.as_ref().map(|(_, _, bg)| bg.as_slice()).unwrap_or(&[]);
+            let menu_changed = old_bg != bg_runs.as_slice();
+            *last = Some((tray_state, tooltip.clone(), bg_runs.clone()));
+            (old_state, menu_changed)
         };
+        if menu_changed {
+            crate::tray::update_menu(app, &bg_runs);
+        }
         if let Some(tray) = app.tray_by_id("main-tray") {
             let _ = tray.set_tooltip(Some(&tooltip));
             if prev_state != Some(tray_state) {

@@ -81,7 +81,11 @@ pub async fn set_session_context_dir(
     session_id: String,
     cwd: String,
 ) -> Result<(), String> {
-    crate::bigtiny::sessions::update_cwd(&app, &session_id, &cwd).await
+    crate::bigtiny::sessions::update_cwd(&app, &session_id, &cwd).await?;
+    if !crate::commands::is_default_folder(&app, &cwd) {
+        crate::config::record_recent_working_dir(&app, &cwd);
+    }
+    Ok(())
 }
 
 /// "Return to thought partner" — repoint the session back to a fresh private

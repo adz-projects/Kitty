@@ -261,6 +261,7 @@ body:has(.overlay-root) {
 }
 
 .overlay-run-card {
+  position: relative;
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -357,8 +358,64 @@ body:has(.overlay-root) {
   line-height: 1;
 }
 
+.overlay-run-cwd {
+  max-width: none;
+}
+
+.overlay-run-cwd:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.overlay-run-cwd-label {
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overlay-run-footer .overlay-run-cwd-active {
+  padding: 0;
+  gap: 0;
+}
+
+.overlay-run-cwd-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  padding: 0 4px 0 9px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+.overlay-run-cwd-body:hover {
+  background: transparent;
+}
+
+.overlay-run-cwd-reset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 7px 0 3px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-base);
+  line-height: 1;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.overlay-run-cwd-reset:hover {
+  background: transparent;
+  color: var(--text);
+}
+
 /* Override the `@media (max-width: 700px)` 90px mobile cap (the desktop
-   overlay is 540px wide) and size the label to fit ~"Qwen: DeepSeek V4 4.1 1017". */
+   overlay is 580px wide) and size the label to fit ~"Qwen: DeepSeek V4 4.1 1017". */
 .overlay-run-footer .provider-badge {
   max-width: none;
 }
@@ -388,6 +445,114 @@ body:has(.overlay-root) {
 .overlay-root .mode-popover.overlay-run-popover.provider-popover {
   min-width: 240px;
   max-width: 380px;
+}
+
+.overlay-root .mode-popover.overlay-run-popover.cwd-popover {
+  min-width: 220px;
+  max-width: 340px;
+}
+
+.overlay-root .mode-popover.overlay-run-popover.attach-popover {
+  min-width: 210px;
+  max-width: 280px;
+}
+
+.overlay-model-filter {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 4px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+.overlay-model-filter:focus {
+  border-color: var(--accent);
+}
+
+.overlay-model-empty {
+  padding: 6px 8px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+
+.overlay-root .mode-popover button.highlighted {
+  background: var(--surface-2);
+}
+
+.overlay-popover-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  font-size: var(--fs-sm);
+}
+
+.overlay-popover-row-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overlay-menu-shortcut {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.overlay-cwd-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+}
+
+.overlay-cwd-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+}
+
+.overlay-cwd-path {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.overlay-run-card .slash-menu,
+.overlay-run-card .composer-hint {
+  z-index: 12;
+  opacity: var(--overlay-opacity);
+}
+
+.overlay-run-attachments .chip-action {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.overlay-run-attachments .chip-action:hover {
+  border-color: var(--accent);
+  color: var(--text);
 }
 
 .overlay-root .effort-popover .effort-option {

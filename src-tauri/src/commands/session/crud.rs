@@ -84,6 +84,9 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     };
     let info =
         crate::bigtiny::sessions::create(&app, cwd, provider.clone(), model, provider).await?;
+    if !info.is_default_folder {
+        crate::config::record_recent_working_dir(&app, &info.cwd);
+    }
     let persona = card
         .as_ref()
         .map(crate::config::providers::system_prompt_for)

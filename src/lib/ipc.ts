@@ -51,6 +51,7 @@ import type {
   LearningModelSetting,
   OpenRouterCredits,
   OverlayDrainResult,
+  OverlayHitRect,
   OverlayPromptRequest,
   PathInfo,
   StagedAttachment,
@@ -117,7 +118,7 @@ export const ipc = {
   dismissV1Import: () => invoke<void>('dismiss_v1_import'),
   getConfigRecoveryNotice: () => invoke<string | null>('get_config_recovery_notice'),
   hideOverlay: () => invoke<void>('hide_overlay'),
-  setOverlayHeight: (height: number) => invoke<void>('set_overlay_height', { height }),
+  setOverlayHitRects: (rects: OverlayHitRect[]) => invoke<void>('set_overlay_hit_rects', { rects }),
   submitOverlayPrompt: (request: OverlayPromptRequest) =>
     invoke<void>('submit_overlay_prompt', { request }),
   drainOverlayRun: (sessionId: string) =>

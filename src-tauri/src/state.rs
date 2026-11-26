@@ -134,6 +134,10 @@ pub struct AppState {
     pub recent_overlay_prompts: Mutex<Vec<crate::overlay_runs::RecentOverlayPrompt>>,
     /// Serializes rapid-repeat dedup check + record across async embedding calls.
     pub overlay_dedup_gate: tokio::sync::Mutex<()>,
+    /// Interactive logical-pixel rectangles currently visible inside the
+    /// fixed-height transparent overlay (`card`, open popovers, context menu).
+    /// Regions outside these rects pass cursor events through to windows below.
+    pub overlay_hit_rects: Mutex<Vec<crate::windows::OverlayHitRect>>,
     /// Tool approvals waiting on a person, by the daemon's action id, for
     /// every session Kitty owns (`approvals`, `lifecycle::app_events`).
     pub pending_approvals: Mutex<HashMap<String, crate::approvals::PendingApproval>>,
@@ -268,6 +272,7 @@ impl AppState {
             overlay_runs: Mutex::new(HashMap::new()),
             recent_overlay_prompts: Mutex::new(Vec::new()),
             overlay_dedup_gate: tokio::sync::Mutex::new(()),
+            overlay_hit_rects: Mutex::new(Vec::new()),
             pending_approvals: Mutex::new(HashMap::new()),
             app_events_started: AtomicBool::new(false),
             in_flight_sessions: Mutex::new(HashSet::new()),

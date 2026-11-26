@@ -14,11 +14,16 @@ pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
     windows::hide_overlay(&app).map_err(|e| e.to_string())
 }
 
-/// Resize the minimal overlay height dynamically while keeping its bottom edge
-/// anchored above the taskbar.
+/// Update the interactive logical-pixel rectangles inside the fixed-height
+/// transparent overlay so cursor events outside them pass through to windows
+/// underneath.
 #[tauri::command]
-pub fn set_overlay_height(app: AppHandle, height: f64) -> Result<(), String> {
-    windows::resize_overlay_height(&app, height).map_err(|e| e.to_string())
+pub fn set_overlay_hit_rects(
+    app: AppHandle,
+    rects: Vec<windows::OverlayHitRect>,
+) -> Result<(), String> {
+    windows::set_overlay_hit_rects(&app, rects);
+    Ok(())
 }
 
 /// Hide the minimal overlay immediately and process the prompt in the

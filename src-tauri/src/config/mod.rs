@@ -41,6 +41,12 @@ pub struct Config {
     pub open_window_hotkey: Option<String>,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
+    /// Most-recently-used explicit working directories (newest first).
+    #[serde(default)]
+    pub recent_working_dirs: Vec<String>,
+    /// Most-recently-submitted overlay prompt texts (newest first).
+    #[serde(default)]
+    pub overlay_prompt_history: Vec<String>,
     // `overlay_geometry` and `remember_overlay_position` retired with the
     // minimal Run-style overlay (fixed compact width, dynamic height); existing
     // `config.json` files carrying them load fine via `#[serde(default)]` and
@@ -460,6 +466,8 @@ impl Default for Config {
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
             open_window_hotkey: None,
             default_context_folder: None,
+            recent_working_dirs: Vec::new(),
+            overlay_prompt_history: Vec::new(),
             chats_roots_history: Vec::new(),
             v1_import_state: None,
             setup_completed: false,
@@ -1370,6 +1378,109 @@ pub fn patched(config: &Config, patch: &serde_json::Value) -> Result<Config, Str
     serde_json::from_value(value).map_err(|e| format!("not a valid setting: {e}"))
 }
 
+const MAX_RECENT_WORKING_DIRS: usize = 8;
+const MAX_OVERLAY_PROMPT_HISTORY: usize = 40;
+
+fn normalize_dir_key(path: &str) -> String {
+    let trimmed = path.trim();
+    let stripped = if cfg!(windows) {
+        let s = trimmed.trim_end_matches(['\\', '/']);
+        // Preserve drive roots like `C:` as `C:\` so `C:\` and `C:` collide cleanly.
+        if s.len() == 2 && s.as_bytes()[1] == b':' {
+            format!("{s}\\")
+        } else if s.is_empty() && !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            s.to_string()
+        }
+    } else {
+        let s = trimmed.trim_end_matches('/');
+        if s.is_empty() && !trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    if cfg!(windows) {
+        stripped.replace('/', "\\").to_ascii_lowercase()
+    } else {
+        stripped
+    }
+}
+
+/// Prepend an explicit working directory to `dirs` (MRU, deduplicated).
+/// Returns `true` when the list changed.
+pub fn push_recent_working_dir(dirs: &mut Vec<String>, raw_path: &str) -> bool {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let key = normalize_dir_key(trimmed);
+    if dirs
+        .first()
+        .is_some_and(|head| normalize_dir_key(head) == key && head == trimmed)
+    {
+        return false;
+    }
+    dirs.retain(|existing| normalize_dir_key(existing) != key);
+    dirs.insert(0, trimmed.to_string());
+    dirs.truncate(MAX_RECENT_WORKING_DIRS);
+    true
+}
+
+/// Prepend a submitted overlay prompt to `history` (MRU, deduplicated).
+/// Returns `true` when the list changed.
+pub fn push_overlay_prompt_history(history: &mut Vec<String>, raw_prompt: &str) -> bool {
+    let trimmed = raw_prompt.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if history.first().is_some_and(|head| head == trimmed) {
+        return false;
+    }
+    history.retain(|existing| existing != trimmed);
+    history.insert(0, trimmed.to_string());
+    history.truncate(MAX_OVERLAY_PROMPT_HISTORY);
+    true
+}
+
+fn mutate_and_persist_config(
+    app: &tauri::AppHandle,
+    label: &'static str,
+    mutate: impl FnOnce(&mut Config) -> bool,
+) {
+    use tauri::Manager;
+    let snapshot = {
+        let state = app.state::<crate::state::AppState>();
+        let mut guard = state.config.lock().unwrap();
+        if !mutate(&mut guard) {
+            return;
+        }
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = save(&snapshot) {
+            tracing::warn!("failed to persist {label}: {e}");
+        }
+    });
+}
+
+/// Record a user-selected working directory into MRU config history and
+/// persist asynchronously (emitting `config://changed` via [`save`]).
+pub fn record_recent_working_dir(app: &tauri::AppHandle, raw_path: &str) {
+    mutate_and_persist_config(app, "recent_working_dirs", |cfg| {
+        push_recent_working_dir(&mut cfg.recent_working_dirs, raw_path)
+    });
+}
+
+/// Record a submitted overlay prompt into MRU config history and persist
+/// asynchronously (emitting `config://changed` via [`save`]).
+pub fn record_overlay_prompt(app: &tauri::AppHandle, raw_prompt: &str) {
+    mutate_and_persist_config(app, "overlay_prompt_history", |cfg| {
+        push_overlay_prompt_history(&mut cfg.overlay_prompt_history, raw_prompt)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1910,5 +2021,47 @@ mod tests {
         let config = dir.join("config.json");
         assert_eq!(backup_corrupt_config_file(&config), None);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn push_recent_working_dir_deduplicates_and_caps_mru() {
+        let mut dirs = Vec::new();
+        assert!(!push_recent_working_dir(&mut dirs, "   "));
+        assert!(push_recent_working_dir(&mut dirs, r"D:\Projects\Alpha"));
+        assert!(!push_recent_working_dir(&mut dirs, r"D:\Projects\Alpha"));
+        for i in 0..10 {
+            push_recent_working_dir(&mut dirs, &format!(r"D:\Projects\P{i}"));
+        }
+        assert_eq!(dirs.len(), MAX_RECENT_WORKING_DIRS);
+        assert_eq!(dirs[0], r"D:\Projects\P9");
+
+        // Promoting an older path moves it back to the front without duplicating.
+        assert!(push_recent_working_dir(&mut dirs, r"D:\Projects\P5"));
+        assert_eq!(dirs.len(), MAX_RECENT_WORKING_DIRS);
+        assert_eq!(dirs[0], r"D:\Projects\P5");
+        assert_eq!(
+            dirs.iter().filter(|d| *d == r"D:\Projects\P5").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn push_overlay_prompt_history_deduplicates_and_caps_mru() {
+        let mut history = Vec::new();
+        assert!(!push_overlay_prompt_history(&mut history, ""));
+        assert!(push_overlay_prompt_history(&mut history, "first prompt"));
+        assert!(!push_overlay_prompt_history(&mut history, "first prompt"));
+        for i in 0..50 {
+            push_overlay_prompt_history(&mut history, &format!("prompt {i}"));
+        }
+        assert_eq!(history.len(), MAX_OVERLAY_PROMPT_HISTORY);
+        assert_eq!(history[0], "prompt 49");
+
+        assert!(push_overlay_prompt_history(&mut history, "prompt 45"));
+        assert_eq!(history[0], "prompt 45");
+        assert_eq!(
+            history.iter().filter(|p| *p == "prompt 45").count(),
+            1
+        );
     }
 }

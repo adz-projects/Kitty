@@ -9,23 +9,33 @@ import {
   onOverlaySubmitFailed,
   onProviderActivated,
   pickFiles,
+  pickFolder,
 } from '@/lib/ipc';
 import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { TrustIcon } from '@/lib/provider_trust';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import { pastedFileKind, readAsDataUrl } from '@/lib/pasteFiles';
 import { effortLabel, selectedEffort } from '@/lib/effort';
-import { isImageFileName } from '@/stores/chat/messageUtils';
+import { completeSlashCommand, isExactSlashCommand, matchSlashCommands } from '@/lib/slashCommands';
+import { DEFAULT_RESEARCH_TURNS, parseResearchCommand } from '@/lib/research';
+import { DEFAULT_TIDY_TEXT, parseTidyCommand } from '@/lib/tidy';
+import {
+  isImageFileName,
+  parseCritiqueCommand,
+  parseDebateCommand,
+} from '@/stores/chat/messageUtils';
 import { setupTitle } from '@/components/settings/setups/setupUtils';
 import { UploadIcon } from '@/components/icons/UploadIcon';
+import { CameraIcon } from '@/components/icons/CameraIcon';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { SparkIcon, SparkOffIcon } from '@/components/icons/SparkIcon';
-import { ContextMenu } from '@/components/shared/ContextMenu';
+import { ContextMenu, useContextMenuStore } from '@/components/shared/ContextMenu';
 import { useEscapeLayer } from '@/hooks/useEscapeLayer';
 import type {
   EffortOption,
+  OverlayHitRect,
   OverlayPromptRequest,
   PathInfo,
   ProviderView,
@@ -36,8 +46,8 @@ import type {
 const DEGRADED: StackStatus[] = ['backend_down'];
 const PASTE_THRESHOLD = 500;
 const MAX_TEXTAREA_HEIGHT = 160;
-const POPOVER_HEADROOM = 240;
-const MAX_OVERLAY_HEIGHT = 460;
+const MAX_RECENT_DIRS_SHOWN = 5;
+const MAX_PROMPT_HISTORY = 40;
 
 interface LocalDoc {
   id: string;
@@ -55,6 +65,18 @@ interface LocalImage {
 let seq = 0;
 const nextId = () => `ov_${Date.now()}_${++seq}`;
 
+function normalizeDirKey(dir: string): string {
+  return dir
+    .trim()
+    .replace(/[\\/]+$/, '')
+    .replace(/\//g, '\\')
+    .toLowerCase();
+}
+
+function dirLeafName(dir: string): string {
+  return dir.split(/[\\/]/).filter(Boolean).pop() || dir;
+}
+
 function Sparks({ option }: { option: EffortOption }) {
   if (option.stars === 0) return <SparkOffIcon />;
   return (
@@ -66,9 +88,10 @@ function Sparks({ option }: { option: EffortOption }) {
   );
 }
 
-/** Minimal Windows-"Run"-style overlay: prompt bar, attach button, model
-    pill, reasoning effort pill, and send button. Always starts a new chat in
-    the background and closes immediately on Send. */
+/** Minimal Windows-"Run"-style overlay: prompt bar, attach button, working
+    directory ("Thought Partner") pill, model pill, reasoning effort pill, and
+    send button. Always starts a new chat in the background and closes
+    immediately on Send. */
 export function App() {
   const status = useStackStore((s) => s.status);
   const initStack = useStackStore((s) => s.init);
@@ -80,6 +103,7 @@ export function App() {
   const [files, setFiles] = useState<PathInfo[]>([]);
   const [docs, setDocs] = useState<LocalDoc[]>([]);
   const [images, setImages] = useState<LocalImage[]>([]);
+  const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -87,21 +111,43 @@ export function App() {
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
   const [thinkingEffort, setThinkingEffort] = useState<ThinkingEffort | null>(null);
   const [selectedEffortValue, setSelectedEffortValue] = useState<string | null>(null);
+  const [recentDirs, setRecentDirs] = useState<string[]>([]);
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
 
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [cwdOpen, setCwdOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [effortOpen, setEffortOpen] = useState(false);
+  const [modelFilter, setModelFilter] = useState('');
+  const [modelHighlight, setModelHighlight] = useState(0);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const contextMenuOpen = useContextMenuStore((s) => s.menu !== null);
 
   const cardRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const attachWrapRef = useRef<HTMLDivElement>(null);
+  const cwdWrapRef = useRef<HTMLDivElement>(null);
   const modelWrapRef = useRef<HTMLDivElement>(null);
   const effortWrapRef = useRef<HTMLDivElement>(null);
+  const modelFilterRef = useRef<HTMLInputElement>(null);
   const resizeRaf = useRef<number | null>(null);
   const submittingRef = useRef(false);
+  const lastHitKeyRef = useRef('');
+  const historyIndexRef = useRef(-1);
+  const historyDraftRef = useRef('');
 
-  const menuOpen = modelOpen || effortOpen;
-  useEscapeLayer(menuOpen, () => {
+  const closeAllMenus = useCallback(() => {
+    setAttachOpen(false);
+    setCwdOpen(false);
     setModelOpen(false);
     setEffortOpen(false);
+  }, []);
+
+  const menuOpen = attachOpen || cwdOpen || modelOpen || effortOpen;
+  useEscapeLayer(menuOpen, () => {
+    closeAllMenus();
+    requestAnimationFrame(() => textareaRef.current?.focus());
   });
 
   const usableProviders = useMemo(() => providers.filter((p) => !p.disabled_reason), [providers]);
@@ -113,6 +159,26 @@ export function App() {
     }
     return usableProviders.find((p) => p.active) ?? usableProviders[0] ?? null;
   }, [usableProviders, selectedProviderId]);
+
+  const filteredProviders = useMemo(() => {
+    const q = modelFilter.trim().toLowerCase();
+    if (!q) return usableProviders;
+    return usableProviders.filter((p) => {
+      const haystack = `${p.name} ${setupTitle(p)} ${p.models.join(' ')}`.toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [usableProviders, modelFilter]);
+
+  const safeModelHighlight = Math.min(modelHighlight, Math.max(filteredProviders.length - 1, 0));
+
+  const slashMatches = useMemo(() => {
+    if (slashDismissed) return [];
+    const matches = matchSlashCommands(text, false).filter((c) => c.name !== 'compact');
+    if (matches.length === 1 && isExactSlashCommand(text)) return [];
+    return matches;
+  }, [slashDismissed, text]);
+  const slashOpen = slashMatches.length > 0;
+  const safeSlashIndex = Math.min(slashIndex, Math.max(slashMatches.length - 1, 0));
   const activeProviderId = activeProvider?.id ?? null;
   const toolsSupported = activeProvider ? activeProvider.tools_supported : true;
 
@@ -131,6 +197,10 @@ export function App() {
     return selectedEffort(thinkingEffort);
   }, [thinkingEffort, selectedEffortValue]);
 
+  const cwdLabel = selectedCwd
+    ? selectedCwd.split(/[\\/]/).filter(Boolean).pop() || selectedCwd
+    : null;
+
   const refreshProviders = useCallback(async () => {
     try {
       const list = await ipc.listProviders();
@@ -139,6 +209,42 @@ export function App() {
       // keep existing list if backend is temporarily unreachable
     }
   }, []);
+
+  const refreshConfig = useCallback(async () => {
+    try {
+      const cfg = await ipc.getConfig();
+      setRecentDirs(cfg.recent_working_dirs ?? []);
+      setPromptHistory(cfg.overlay_prompt_history ?? []);
+    } catch {
+      // keep existing config snapshot if temporarily unreachable
+    }
+  }, []);
+
+  const selectProvider = useCallback((providerId: string) => {
+    setSelectedProviderId(providerId);
+    setSelectedEffortValue(null);
+    setModelOpen(false);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
+  const openModelMenu = useCallback(() => {
+    setAttachOpen(false);
+    setCwdOpen(false);
+    setEffortOpen(false);
+    setModelFilter('');
+    const curIdx = usableProviders.findIndex((p) => p.id === activeProvider?.id);
+    setModelHighlight(curIdx >= 0 ? curIdx : 0);
+    setModelOpen(true);
+    requestAnimationFrame(() => modelFilterRef.current?.focus());
+  }, [usableProviders, activeProvider]);
+
+  const cycleEffort = useCallback(() => {
+    if (!thinkingEffort || thinkingEffort.options.length < 2) return;
+    const opts = thinkingEffort.options;
+    const curIdx = opts.findIndex((o) => o.value === activeEffortOption?.value);
+    const next = opts[(curIdx + 1) % opts.length];
+    if (next) setSelectedEffortValue(next.value);
+  }, [thinkingEffort, activeEffortOption]);
 
   const refreshEffort = useCallback(async (cardId: string | null) => {
     try {
@@ -172,12 +278,40 @@ export function App() {
     el.style.overflowY = 'hidden';
   };
 
+  const syncHitRects = useCallback(() => {
+    const els = document.querySelectorAll<HTMLElement>(
+      '.overlay-run-card, .overlay-run-popover, .overlay-run-slash-menu, .context-menu'
+    );
+    const rects: OverlayHitRect[] = [];
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        rects.push({
+          x: Math.floor(r.left),
+          y: Math.floor(r.top),
+          width: Math.ceil(r.width),
+          height: Math.ceil(r.height),
+        });
+      }
+    }
+    const key = JSON.stringify(rects);
+    if (key === lastHitKeyRef.current) return;
+    lastHitKeyRef.current = key;
+    void ipc.setOverlayHitRects(rects).catch(() => {});
+  }, []);
+
   useEffect(() => {
     void initStack();
     void refreshProviders();
+    void refreshConfig();
 
     const focusInput = () => {
       requestAnimationFrame(() => textareaRef.current?.focus());
+    };
+    const onShown = () => {
+      lastHitKeyRef.current = '';
+      syncHitRects();
+      focusInput();
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !e.defaultPrevented) {
@@ -188,13 +322,16 @@ export function App() {
     window.addEventListener('focus', focusInput);
 
     const un = [
-      onOverlayShown(focusInput),
+      onOverlayShown(onShown),
       onOverlaySubmitFailed(({ text: failedText, error }) => {
         setText((cur) => (cur.trim().length === 0 ? failedText : cur));
         scheduleTextareaResize();
         setNotice(error);
       }),
-      onConfigChanged(() => void refreshProviders()),
+      onConfigChanged(() => {
+        void refreshProviders();
+        void refreshConfig();
+      }),
       onProviderActivated(() => void refreshProviders()),
     ];
     return () => {
@@ -202,7 +339,39 @@ export function App() {
       window.removeEventListener('focus', focusInput);
       un.forEach((u) => void u.then((fn) => fn()));
     };
-  }, [initStack, refreshProviders, scheduleTextareaResize]);
+  }, [initStack, refreshConfig, refreshProviders, scheduleTextareaResize, syncHitRects]);
+
+  useLayoutEffect(() => {
+    syncHitRects();
+    const raf = requestAnimationFrame(syncHitRects);
+    const card = cardRef.current;
+    if (!card || typeof ResizeObserver === 'undefined') {
+      return () => cancelAnimationFrame(raf);
+    }
+    const ro = new ResizeObserver(() => syncHitRects());
+    ro.observe(card);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [
+    syncHitRects,
+    menuOpen,
+    slashOpen,
+    slashMatches.length,
+    modelFilter,
+    recentDirs.length,
+    canAttachImages,
+    contextMenuOpen,
+    usableProviders.length,
+    thinkingEffort,
+    degraded,
+    bootSpinner,
+    notice,
+    files.length,
+    docs.length,
+    images.length,
+  ]);
 
   useEffect(() => {
     void refreshEffort(activeProviderId);
@@ -219,49 +388,26 @@ export function App() {
   // Close popovers on click/tap outside or when the overlay loses window focus.
   useEffect(() => {
     if (!menuOpen) return;
-    const closeMenus = () => {
-      setModelOpen(false);
-      setEffortOpen(false);
-    };
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Node;
-      if (modelWrapRef.current?.contains(target) || effortWrapRef.current?.contains(target)) {
+      if (
+        attachWrapRef.current?.contains(target) ||
+        cwdWrapRef.current?.contains(target) ||
+        modelWrapRef.current?.contains(target) ||
+        effortWrapRef.current?.contains(target)
+      ) {
         return;
       }
-      closeMenus();
+      closeAllMenus();
     };
+    const onBlur = () => closeAllMenus();
     document.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('blur', closeMenus);
+    window.addEventListener('blur', onBlur);
     return () => {
       document.removeEventListener('pointerdown', onPointerDown);
-      window.removeEventListener('blur', closeMenus);
+      window.removeEventListener('blur', onBlur);
     };
-  }, [menuOpen]);
-
-  // Resize the window height dynamically to fit the card + upward popover headroom.
-  const syncWindowHeight = useCallback(() => {
-    const card = cardRef.current;
-    if (!card) return;
-    const cardHeight = Math.ceil(card.getBoundingClientRect().height);
-    if (cardHeight <= 0) return;
-    const pop = menuOpen ? card.querySelector<HTMLElement>('.overlay-run-popover') : null;
-    const popExtra = menuOpen
-      ? pop
-        ? Math.ceil(pop.getBoundingClientRect().height) + 12
-        : POPOVER_HEADROOM
-      : 0;
-    const target = Math.min(MAX_OVERLAY_HEIGHT, cardHeight + popExtra + 2);
-    void ipc.setOverlayHeight(target).catch(() => {});
-  }, [menuOpen]);
-
-  useLayoutEffect(() => {
-    syncWindowHeight();
-    const card = cardRef.current;
-    if (!card || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => syncWindowHeight());
-    ro.observe(card);
-    return () => ro.disconnect();
-  }, [syncWindowHeight, usableProviders.length, thinkingEffort]);
+  }, [closeAllMenus, menuOpen]);
 
   const addPaths = useCallback(
     async (paths: string[]) => {
@@ -377,6 +523,41 @@ export function App() {
       if (paths.length) await addPaths(paths);
     } catch (e) {
       setNotice(String(e));
+    } finally {
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+  };
+
+  const captureScreenSnip = async () => {
+    closeAllMenus();
+    if (!canAttachImages) {
+      setNotice("The active model doesn't support images — switch to a vision model for snips.");
+      return;
+    }
+    try {
+      const shot = await ipc.captureScreenshotRegion();
+      if (shot) {
+        setImages((prev) => [
+          ...prev,
+          { id: nextId(), label: 'Screen snip', mime: shot.mime, dataUrl: shot.data_url },
+        ]);
+      }
+    } catch (e) {
+      setNotice(String(e));
+    } finally {
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+  };
+
+  const chooseWorkingFolder = async () => {
+    closeAllMenus();
+    try {
+      const dir = await pickFolder();
+      if (dir) setSelectedCwd(dir);
+    } catch (e) {
+      setNotice(String(e));
+    } finally {
+      requestAnimationFrame(() => textareaRef.current?.focus());
     }
   };
 
@@ -412,19 +593,39 @@ export function App() {
     }
   };
 
+  const trimmedText = text.trim();
+  const parsedDebate = !slashOpen ? parseDebateCommand(trimmedText) : null;
+  const parsedCritique = !slashOpen ? parseCritiqueCommand(trimmedText) : null;
+  const parsedResearch = !slashOpen ? parseResearchCommand(trimmedText) : null;
+  const parsedTidy = !slashOpen ? parseTidyCommand(trimmedText) : null;
+
   const hasContent =
-    text.trim().length > 0 || files.length > 0 || docs.length > 0 || images.length > 0;
+    parsedResearch !== null
+      ? Boolean(parsedResearch.brief)
+      : parsedDebate !== null ||
+        parsedCritique !== null ||
+        parsedTidy !== null ||
+        trimmedText.length > 0 ||
+        files.length > 0 ||
+        docs.length > 0 ||
+        images.length > 0;
 
   const submit = async () => {
     if (!hasContent || degraded || bootSpinner || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
-    setModelOpen(false);
-    setEffortOpen(false);
+    closeAllMenus();
     setNotice(null);
 
     try {
       const trimmed = text.trim();
+      const debate = parseDebateCommand(trimmed);
+      const critique = parseCritiqueCommand(trimmed);
+      const research = parseResearchCommand(trimmed);
+      const tidy = parseTidyCommand(trimmed);
+
+      if (research !== null && !research.brief) return;
+
       const providerId = activeProvider?.id ?? null;
       const effortVal = activeEffortOption?.value ?? null;
 
@@ -462,23 +663,57 @@ export function App() {
         }
       }
 
+      const sendText =
+        tidy !== null
+          ? tidy || DEFAULT_TIDY_TEXT
+          : research !== null
+            ? research.brief
+            : critique !== null
+              ? critique
+              : debate !== null
+                ? debate
+                : trimmed;
+
       const request: OverlayPromptRequest = {
-        text: trimmed,
+        text: sendText,
+        ...(trimmed ? { raw_prompt: trimmed } : {}),
         ...(payloadImages.length ? { images: payloadImages } : {}),
         ...(otherFiles.length ? { attached_paths: otherFiles.map((f) => f.path) } : {}),
         ...(docs.length
           ? { documents: docs.map((d) => ({ label: d.label, content: d.content })) }
           : {}),
+        ...(debate !== null ? { debate: true } : {}),
+        ...(research !== null ? { research: { max_turns: research.maxTurns } } : {}),
+        ...(critique !== null ? { critique: 'start' as const } : {}),
+        ...(tidy !== null ? { tidy: true } : {}),
         provider_id: providerId,
         thinking_effort: effortVal,
+        ...(selectedCwd ? { cwd: selectedCwd } : {}),
       };
 
       await ipc.submitOverlayPrompt(request);
 
+      if (trimmed) {
+        setPromptHistory((prev) =>
+          [trimmed, ...prev.filter((item) => item !== trimmed)].slice(0, MAX_PROMPT_HISTORY)
+        );
+      }
+      if (selectedCwd) {
+        const cwdKey = normalizeDirKey(selectedCwd);
+        setRecentDirs((prev) =>
+          [selectedCwd, ...prev.filter((d) => normalizeDirKey(d) !== cwdKey)].slice(0, 8)
+        );
+      }
+
+      historyIndexRef.current = -1;
+      historyDraftRef.current = '';
+      setSlashDismissed(false);
+      setSlashIndex(0);
       setText('');
       setFiles([]);
       setDocs([]);
       setImages([]);
+      setSelectedCwd(null);
       resetTextareaHeight();
     } catch (e) {
       setNotice(String(e));
@@ -489,7 +724,47 @@ export function App() {
   };
 
   return (
-    <div className="overlay-root">
+    <div
+      className="overlay-root"
+      onPointerDown={(e) => {
+        if (e.target === e.currentTarget && menuOpen) {
+          closeAllMenus();
+        }
+      }}
+      onKeyDown={(e) => {
+        if (degraded || bootSpinner) return;
+        const mod = e.ctrlKey || e.metaKey;
+        if (!mod) return;
+        const k = e.key.toLowerCase();
+        if (e.shiftKey && !e.altKey && k === 's') {
+          e.preventDefault();
+          void captureScreenSnip();
+          return;
+        }
+        if (e.shiftKey || e.altKey) return;
+        if (k === 'm') {
+          e.preventDefault();
+          if (modelOpen) {
+            setModelOpen(false);
+            requestAnimationFrame(() => textareaRef.current?.focus());
+          } else {
+            openModelMenu();
+          }
+        } else if (k === 'd') {
+          e.preventDefault();
+          setAttachOpen(false);
+          setModelOpen(false);
+          setEffortOpen(false);
+          setCwdOpen((prev) => {
+            if (prev) requestAnimationFrame(() => textareaRef.current?.focus());
+            return !prev;
+          });
+        } else if (k === 'e') {
+          e.preventDefault();
+          cycleEffort();
+        }
+      }}
+    >
       <div className="overlay-run-card" ref={cardRef}>
         {degraded && !bootSpinner ? (
           <div className="overlay-run-degraded">
@@ -512,6 +787,57 @@ export function App() {
           </div>
         ) : (
           <>
+            {slashOpen && (
+              <ul
+                className="slash-menu overlay-run-slash-menu"
+                role="listbox"
+                aria-label="Slash commands"
+              >
+                {slashMatches.map((cmd, idx) => (
+                  <li
+                    key={cmd.name}
+                    role="option"
+                    aria-selected={idx === safeSlashIndex}
+                    className={`slash-item${idx === safeSlashIndex ? ' active' : ''}`}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      setText(completeSlashCommand(cmd));
+                      setSlashIndex(0);
+                      scheduleTextareaResize();
+                      textareaRef.current?.focus();
+                    }}
+                  >
+                    <span className="slash-name">/{cmd.name}</span>
+                    {cmd.args && <span className="slash-args muted">{cmd.args}</span>}
+                    <span className="slash-desc muted">{cmd.description}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {parsedDebate !== null && (
+              <div className="composer-hint overlay-run-hint" role="status">
+                Debate: say who the personas are, how many rounds, and what the debate should
+                examine. Attach or link the item under debate.
+              </div>
+            )}
+            {parsedCritique !== null && (
+              <div className="composer-hint overlay-run-hint" role="status">
+                Critique: attach or paste the draft. Options: genre=op-ed, essay, academic, memo,
+                proposal or other; stage=early, revising or polish; factcheck; sketches=off.
+              </div>
+            )}
+            {parsedResearch !== null && (
+              <div className="composer-hint overlay-run-hint" role="status">
+                Deep research: say what to research and what to produce. Add turns=N to set the
+                budget (default {DEFAULT_RESEARCH_TURNS}). You approve the plan before it starts.
+              </div>
+            )}
+            {parsedTidy !== null && (
+              <div className="composer-hint overlay-run-hint" role="status">
+                Tidy: Kitty grades your chats and proposes which to delete. Add what to keep or
+                clear if you like.
+              </div>
+            )}
             <textarea
               ref={textareaRef}
               rows={1}
@@ -520,10 +846,113 @@ export function App() {
               value={text}
               placeholder={bootSpinner ? 'Starting Kitty…' : 'Ask Kitty…'}
               onChange={(e) => {
+                historyIndexRef.current = -1;
+                setSlashDismissed(false);
+                setSlashIndex(0);
                 setText(e.target.value);
                 scheduleTextareaResize();
               }}
               onKeyDown={(e) => {
+                if (slashOpen) {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setSlashIndex((i) => (i + 1) % slashMatches.length);
+                    return;
+                  }
+                  if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setSlashIndex((i) => (i - 1 + slashMatches.length) % slashMatches.length);
+                    return;
+                  }
+                  if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+                    const cmd = slashMatches[safeSlashIndex];
+                    if (cmd) {
+                      e.preventDefault();
+                      setText(completeSlashCommand(cmd));
+                      setSlashIndex(0);
+                      scheduleTextareaResize();
+                    }
+                    return;
+                  }
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setSlashDismissed(true);
+                    return;
+                  }
+                }
+
+                if (e.key === 'Tab' && e.shiftKey && !menuOpen) {
+                  e.preventDefault();
+                  cycleEffort();
+                  return;
+                }
+
+                if (
+                  e.key === 'ArrowUp' &&
+                  !e.ctrlKey &&
+                  !e.metaKey &&
+                  !e.altKey &&
+                  !e.shiftKey &&
+                  promptHistory.length > 0
+                ) {
+                  const el = e.currentTarget;
+                  const atEmptyOrStart =
+                    el.value.length === 0 || (el.selectionStart === 0 && el.selectionEnd === 0);
+                  const onFirstLine = !el.value.slice(0, el.selectionStart).includes('\n');
+                  if (
+                    (historyIndexRef.current === -1 && atEmptyOrStart) ||
+                    (historyIndexRef.current >= 0 && onFirstLine)
+                  ) {
+                    e.preventDefault();
+                    if (historyIndexRef.current === -1) {
+                      historyDraftRef.current = text;
+                      historyIndexRef.current = 0;
+                    } else {
+                      historyIndexRef.current = Math.min(
+                        historyIndexRef.current + 1,
+                        promptHistory.length - 1
+                      );
+                    }
+                    const recalled = promptHistory[historyIndexRef.current] ?? '';
+                    setText(recalled);
+                    setSlashDismissed(true);
+                    scheduleTextareaResize();
+                    requestAnimationFrame(() => {
+                      const area = textareaRef.current;
+                      if (area) area.setSelectionRange(recalled.length, recalled.length);
+                    });
+                    return;
+                  }
+                }
+
+                if (
+                  e.key === 'ArrowDown' &&
+                  !e.ctrlKey &&
+                  !e.metaKey &&
+                  !e.altKey &&
+                  !e.shiftKey &&
+                  historyIndexRef.current >= 0
+                ) {
+                  const el = e.currentTarget;
+                  const onLastLine = !el.value.slice(el.selectionEnd).includes('\n');
+                  if (onLastLine) {
+                    e.preventDefault();
+                    const nextIdx = historyIndexRef.current - 1;
+                    historyIndexRef.current = nextIdx;
+                    const restored =
+                      nextIdx >= 0 ? (promptHistory[nextIdx] ?? '') : historyDraftRef.current;
+                    setText(restored);
+                    setSlashDismissed(true);
+                    scheduleTextareaResize();
+                    requestAnimationFrame(() => {
+                      const area = textareaRef.current;
+                      if (area) area.setSelectionRange(restored.length, restored.length);
+                    });
+                    return;
+                  }
+                }
+
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   void submit();
@@ -550,20 +979,36 @@ export function App() {
 
             {(files.length > 0 || docs.length > 0 || images.length > 0) && (
               <div className="file-chips overlay-run-attachments">
-                {files.map((f) => (
-                  <span className="chip" key={f.path} title={f.path}>
-                    <span>{f.is_dir ? <FolderIcon /> : <DocumentIcon />}</span>
-                    <span className="chip-name">{f.name}</span>
-                    <button
-                      type="button"
-                      className="chip-x"
-                      title="Remove"
-                      onClick={() => setFiles((prev) => prev.filter((x) => x.path !== f.path))}
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
+                {files.map((f) => {
+                  const isCurrentCwd =
+                    f.is_dir &&
+                    selectedCwd !== null &&
+                    normalizeDirKey(f.path) === normalizeDirKey(selectedCwd);
+                  return (
+                    <span className="chip" key={f.path} title={f.path}>
+                      <span>{f.is_dir ? <FolderIcon /> : <DocumentIcon />}</span>
+                      <span className="chip-name">{f.name}</span>
+                      {f.is_dir && !isCurrentCwd && (
+                        <button
+                          type="button"
+                          className="chip-action"
+                          title="Use this folder as the chat working directory"
+                          onClick={() => setSelectedCwd(f.path)}
+                        >
+                          Set cwd
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="chip-x"
+                        title="Remove"
+                        onClick={() => setFiles((prev) => prev.filter((x) => x.path !== f.path))}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
                 {docs.map((d) => (
                   <span className="chip" key={d.id} title={d.label}>
                     <DocumentIcon />
@@ -606,30 +1051,197 @@ export function App() {
 
             <div className="overlay-run-footer">
               <div className="overlay-run-controls">
-                {/* 1. File attachment button */}
-                <button
-                  type="button"
-                  className="overlay-run-attach"
-                  onClick={() => void attachFromPicker()}
-                  title="Attach files"
-                  aria-label="Attach files"
-                >
-                  <UploadIcon />
-                </button>
+                {/* 1. File / screen-snip attachment button */}
+                <div className="overlay-run-control-wrap" ref={attachWrapRef}>
+                  <button
+                    type="button"
+                    className="overlay-run-attach"
+                    onClick={() => {
+                      if (!canAttachImages) {
+                        closeAllMenus();
+                        void attachFromPicker();
+                        return;
+                      }
+                      setCwdOpen(false);
+                      setModelOpen(false);
+                      setEffortOpen(false);
+                      setAttachOpen((o) => !o);
+                    }}
+                    title={canAttachImages ? 'Attach files or capture screen snip' : 'Attach files'}
+                    aria-label={
+                      canAttachImages ? 'Attach files or capture screen snip' : 'Attach files'
+                    }
+                    aria-haspopup={canAttachImages ? 'menu' : undefined}
+                    aria-expanded={canAttachImages ? attachOpen : undefined}
+                  >
+                    <UploadIcon />
+                  </button>
+                  {attachOpen && canAttachImages && (
+                    <div
+                      className="mode-popover attach-popover overlay-run-popover"
+                      role="menu"
+                      aria-label="Attach"
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          closeAllMenus();
+                          void attachFromPicker();
+                        }}
+                      >
+                        <span className="overlay-popover-row">
+                          <span className="overlay-popover-row-main">
+                            <UploadIcon />
+                            <span>Attach files…</span>
+                          </span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void captureScreenSnip()}
+                      >
+                        <span className="overlay-popover-row">
+                          <span className="overlay-popover-row-main">
+                            <CameraIcon />
+                            <span>Capture screen region</span>
+                          </span>
+                          <span className="overlay-menu-shortcut">Ctrl+Shift+S</span>
+                        </span>
+                      </button>
+                    </div>
+                  )}
+                </div>
 
-                {/* 2. Model pill */}
+                {/* 2. Working directory ("Thought Partner") pill */}
+                <div className="overlay-run-control-wrap" ref={cwdWrapRef}>
+                  {selectedCwd ? (
+                    <span className="status-badge overlay-run-cwd overlay-run-cwd-active">
+                      <button
+                        type="button"
+                        className="overlay-run-cwd-body"
+                        title={`Working directory: ${selectedCwd} — click to change (Ctrl+D)`}
+                        aria-haspopup="menu"
+                        aria-expanded={cwdOpen}
+                        onClick={() => {
+                          setAttachOpen(false);
+                          setModelOpen(false);
+                          setEffortOpen(false);
+                          setCwdOpen((o) => !o);
+                        }}
+                      >
+                        <FolderIcon />
+                        <span className="overlay-run-cwd-label">{cwdLabel}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="overlay-run-cwd-reset"
+                        title="Return to thought partner (clear the working folder)"
+                        aria-label="Return to thought partner"
+                        onClick={() => {
+                          setCwdOpen(false);
+                          setSelectedCwd(null);
+                          requestAnimationFrame(() => textareaRef.current?.focus());
+                        }}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="status-badge overlay-run-cwd"
+                      title="Thinking space — click to set a working directory (Ctrl+D)"
+                      aria-haspopup="menu"
+                      aria-expanded={cwdOpen}
+                      onClick={() => {
+                        setAttachOpen(false);
+                        setModelOpen(false);
+                        setEffortOpen(false);
+                        setCwdOpen((o) => !o);
+                      }}
+                    >
+                      <span className="overlay-run-cwd-label">Thought Partner</span>
+                    </button>
+                  )}
+                  {cwdOpen && (
+                    <div
+                      className="mode-popover cwd-popover overlay-run-popover"
+                      role="menu"
+                      aria-label="Working directory"
+                    >
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={!selectedCwd}
+                        className={!selectedCwd ? 'active' : undefined}
+                        onClick={() => {
+                          setSelectedCwd(null);
+                          setCwdOpen(false);
+                          requestAnimationFrame(() => textareaRef.current?.focus());
+                        }}
+                      >
+                        <span className="overlay-popover-row">
+                          <span>Thought Partner (default)</span>
+                        </span>
+                      </button>
+                      {recentDirs.slice(0, MAX_RECENT_DIRS_SHOWN).map((dir) => {
+                        const checked =
+                          selectedCwd !== null &&
+                          normalizeDirKey(dir) === normalizeDirKey(selectedCwd);
+                        return (
+                          <button
+                            key={dir}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={checked}
+                            title={dir}
+                            className={checked ? 'active' : undefined}
+                            onClick={() => {
+                              setSelectedCwd(dir);
+                              setCwdOpen(false);
+                              requestAnimationFrame(() => textareaRef.current?.focus());
+                            }}
+                          >
+                            <span className="overlay-cwd-item">
+                              <span className="overlay-cwd-name">
+                                <FolderIcon />
+                                <span>{dirLeafName(dir)}</span>
+                              </span>
+                              <span className="overlay-cwd-path">{dir}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                      <hr className="mode-popover-sep" />
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void chooseWorkingFolder()}
+                      >
+                        Choose another folder…
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* 3. Model pill */}
                 <div className="overlay-run-control-wrap" ref={modelWrapRef}>
                   <button
                     type="button"
                     className="status-badge provider-badge"
                     title={
                       activeProvider
-                        ? `${setupTitle(activeProvider)}\nClick to choose model`
-                        : 'Choose model'
+                        ? `${setupTitle(activeProvider)}\nClick to choose model (Ctrl+M)`
+                        : 'Choose model (Ctrl+M)'
                     }
                     onClick={() => {
-                      setEffortOpen(false);
-                      setModelOpen((o) => !o);
+                      if (modelOpen) {
+                        setModelOpen(false);
+                      } else {
+                        openModelMenu();
+                      }
                     }}
                   >
                     {activeProvider ? (
@@ -647,40 +1259,76 @@ export function App() {
                   </button>
                   {modelOpen && (
                     <div className="mode-popover provider-popover overlay-run-popover" role="menu">
-                      {usableProviders.map((p) => (
+                      <input
+                        ref={modelFilterRef}
+                        type="text"
+                        className="overlay-model-filter"
+                        placeholder="Filter models…"
+                        aria-label="Filter models"
+                        value={modelFilter}
+                        onChange={(e) => {
+                          setModelFilter(e.target.value);
+                          setModelHighlight(0);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'ArrowDown') {
+                            e.preventDefault();
+                            setModelHighlight((i) =>
+                              filteredProviders.length
+                                ? Math.min(i + 1, filteredProviders.length - 1)
+                                : 0
+                            );
+                          } else if (e.key === 'ArrowUp') {
+                            e.preventDefault();
+                            setModelHighlight((i) => Math.max(i - 1, 0));
+                          } else if (e.key === 'Enter') {
+                            const pick = filteredProviders[safeModelHighlight];
+                            if (pick) {
+                              e.preventDefault();
+                              selectProvider(pick.id);
+                            }
+                          }
+                        }}
+                      />
+                      {filteredProviders.map((p, idx) => (
                         <button
                           key={p.id}
                           type="button"
                           role="menuitemradio"
                           aria-checked={p.id === activeProvider?.id}
-                          className={`provider-option${p.id === activeProvider?.id ? ' active' : ''}`}
+                          className={`provider-option${
+                            p.id === activeProvider?.id ? ' active' : ''
+                          }${idx === safeModelHighlight ? ' highlighted' : ''}`}
                           title={setupTitle(p)}
-                          onClick={() => {
-                            setSelectedProviderId(p.id);
-                            setSelectedEffortValue(null);
-                            setModelOpen(false);
-                          }}
+                          onMouseEnter={() => setModelHighlight(idx)}
+                          onClick={() => selectProvider(p.id)}
                         >
                           <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
                           <span className="provider-option-name">{p.name}</span>
                         </button>
                       ))}
-                      {usableProviders.length === 0 && <span className="muted">No models yet</span>}
+                      {filteredProviders.length === 0 && (
+                        <span className="overlay-model-empty">
+                          {usableProviders.length === 0 ? 'No models yet' : 'No matching models'}
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
 
-                {/* 3. Reasoning effort pill */}
+                {/* 4. Reasoning effort pill */}
                 {thinkingEffort && activeEffortOption && (
                   <div className="overlay-run-control-wrap" ref={effortWrapRef}>
                     <button
                       type="button"
                       className="status-badge effort-picker"
-                      title={effortLabel(activeEffortOption, thinkingEffort.max_stars)}
+                      title={`${effortLabel(activeEffortOption, thinkingEffort.max_stars)} (Shift+Tab or Ctrl+E)`}
                       aria-label={effortLabel(activeEffortOption, thinkingEffort.max_stars)}
                       aria-haspopup="menu"
                       aria-expanded={effortOpen}
                       onClick={() => {
+                        setAttachOpen(false);
+                        setCwdOpen(false);
                         setModelOpen(false);
                         setEffortOpen((o) => !o);
                       }}
@@ -707,6 +1355,7 @@ export function App() {
                               onClick={() => {
                                 setSelectedEffortValue(o.value);
                                 setEffortOpen(false);
+                                requestAnimationFrame(() => textareaRef.current?.focus());
                               }}
                             >
                               <Sparks option={o} />
@@ -722,7 +1371,7 @@ export function App() {
               {/* Drag handle spacer */}
               <div className="overlay-run-spacer" data-tauri-drag-region />
 
-              {/* 4. Send button */}
+              {/* 5. Send button */}
               <button
                 type="button"
                 className="primary overlay-run-send"

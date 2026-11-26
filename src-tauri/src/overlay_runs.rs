@@ -4,6 +4,7 @@
 //! prompt deduplication.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,18 @@ pub struct OverlayPromptRequest {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub thinking_effort: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub debate: Option<bool>,
+    #[serde(default)]
+    pub research: Option<crate::bigtiny::research::ResearchArgs>,
+    #[serde(default)]
+    pub critique: Option<String>,
+    #[serde(default)]
+    pub tidy: Option<bool>,
+    #[serde(default)]
+    pub raw_prompt: Option<String>,
 }
 
 /// One-shot drain response consumed by the newly opened full Kitty window
@@ -58,8 +71,12 @@ pub struct OverlayDrainResult {
     pub busy: bool,
 }
 
+static RUN_SEQ: AtomicU64 = AtomicU64::new(1);
+
 /// Live state for a chat started from the minimal overlay.
 pub struct OverlayRunState {
+    pub seq: u64,
+    pub submitted_at: Instant,
     pub session_id: String,
     pub cwd: String,
     pub prompt_preview: String,
@@ -122,6 +139,13 @@ fn make_prompt_preview(text: &str, has_attachments: bool) -> String {
 }
 
 fn build_attachment_signature(req: &OverlayPromptRequest) -> String {
+    let cwd_sig = req
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.replace('\\', "/"))
+        .unwrap_or_default();
     let mut paths = req.attached_paths.clone().unwrap_or_default();
     paths.sort();
     let mut doc_labels: Vec<String> = req
@@ -131,8 +155,18 @@ fn build_attachment_signature(req: &OverlayPromptRequest) -> String {
         .unwrap_or_default();
     doc_labels.sort();
     let image_count = req.images.as_ref().map(|i| i.len()).unwrap_or(0);
+    let slash_sig = format!(
+        "db:{},rs:{},cr:{},td:{}",
+        req.debate.unwrap_or(false),
+        req.research
+            .as_ref()
+            .map(|r| r.max_turns.map(|t| t.to_string()).unwrap_or_else(|| "default".into()))
+            .unwrap_or_default(),
+        req.critique.as_deref().unwrap_or(""),
+        req.tidy.unwrap_or(false),
+    );
     format!(
-        "p:[{}]|d:[{}]|img:{image_count}",
+        "cwd:{cwd_sig}|slash:{slash_sig}|p:[{}]|d:[{}]|img:{image_count}",
         paths.join(","),
         doc_labels.join(",")
     )
@@ -874,12 +908,24 @@ fn open_revealed_window(
     session_id: String,
     handoff: Value,
     reason: RevealReason,
+    submitted_at: Instant,
+    force_focus: bool,
 ) {
     let app_main = app.clone();
     let sid_main = session_id.clone();
     let reason_main = reason.clone();
     if let Err(e) = app.run_on_main_thread(move || {
-        if let Err(err) = crate::windows::open_new_chat_window(&app_main, Some(handoff)) {
+        let elapsed_ms = submitted_at.elapsed().as_millis() as u64;
+        let steal_focus = crate::windows::should_steal_focus_on_reveal(
+            force_focus,
+            elapsed_ms,
+            crate::windows::user_idle_ms(),
+        );
+        if let Err(err) = crate::windows::open_new_chat_window_with_focus(
+            &app_main,
+            Some(handoff),
+            steal_focus,
+        ) {
             tracing::warn!("failed to open Kitty window for overlay run: {err}");
             handle_reveal_open_failure(&app_main, &sid_main, &reason_main);
         }
@@ -893,7 +939,7 @@ fn open_revealed_window(
 /// run; otherwise buffer it for zero-loss handoff and open a new full Kitty
 /// window on the first reveal trigger.
 pub fn emit_or_buffer(app: &AppHandle, session_id: &str, event_name: &str, payload: Value) {
-    let reveal: Option<(Value, RevealReason)> = {
+    let reveal: Option<(Value, RevealReason, Instant)> = {
         let state = app.state::<AppState>();
         let mut runs = state.overlay_runs.lock().unwrap();
         let Some(run) = runs.get_mut(session_id) else {
@@ -930,15 +976,15 @@ pub fn emit_or_buffer(app: &AppHandle, session_id: &str, event_name: &str, paylo
         }));
         if let Some(r) = reason {
             run.window_opened = true;
-            Some((build_handoff_payload(run), r))
+            Some((build_handoff_payload(run), r, run.submitted_at))
         } else {
             None
         }
     };
 
-    if let Some((handoff, reason)) = reveal {
+    if let Some((handoff, reason, submitted_at)) = reveal {
         notifications::refresh_tray(app);
-        open_revealed_window(app, session_id.to_string(), handoff, reason);
+        open_revealed_window(app, session_id.to_string(), handoff, reason, submitted_at, false);
     }
 }
 
@@ -947,7 +993,7 @@ pub fn emit_or_buffer(app: &AppHandle, session_id: &str, event_name: &str, paylo
 /// answer an HITL prompt without hijacking an unrelated window.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub fn reveal_for_hitl(app: &AppHandle, pending: &crate::approvals::PendingApproval) -> bool {
-    let action: Option<Option<Value>> = {
+    let action: Option<Option<(Value, Instant)>> = {
         let state = app.state::<AppState>();
         let mut runs = state.overlay_runs.lock().unwrap();
         match runs.get_mut(&pending.session_id) {
@@ -955,7 +1001,7 @@ pub fn reveal_for_hitl(app: &AppHandle, pending: &crate::approvals::PendingAppro
             Some(run) if run.handed_off => None,
             Some(run) if !run.window_opened => {
                 run.window_opened = true;
-                Some(Some(build_handoff_payload(run)))
+                Some(Some((build_handoff_payload(run), run.submitted_at)))
             }
             Some(_) => Some(None),
         }
@@ -965,7 +1011,7 @@ pub fn reveal_for_hitl(app: &AppHandle, pending: &crate::approvals::PendingAppro
         return false;
     };
 
-    if let Some(handoff) = maybe_handoff {
+    if let Some((handoff, submitted_at)) = maybe_handoff {
         notifications::refresh_tray(app);
         open_revealed_window(
             app,
@@ -975,6 +1021,8 @@ pub fn reveal_for_hitl(app: &AppHandle, pending: &crate::approvals::PendingAppro
                 tool_name: pending.tool_name.clone(),
                 scheduled: pending.scheduled,
             },
+            submitted_at,
+            false,
         );
     } else {
         // Window open is already in progress (mounting before `drain_overlay_run`):
@@ -1004,14 +1052,18 @@ pub fn reveal_for_hitl(app: &AppHandle, pending: &crate::approvals::PendingAppro
 /// adopting the session drains `overlay_runs` instead of stranding live events.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub fn handoff_for_unhanded_run(app: &AppHandle, session_id: &str) -> Option<Value> {
-    let state = app.state::<AppState>();
-    let mut runs = state.overlay_runs.lock().unwrap();
-    let run = runs.get_mut(session_id)?;
-    if run.handed_off {
-        return None;
-    }
-    run.window_opened = true;
-    Some(build_handoff_payload(run))
+    let payload = {
+        let state = app.state::<AppState>();
+        let mut runs = state.overlay_runs.lock().unwrap();
+        let run = runs.get_mut(session_id)?;
+        if run.handed_off {
+            return None;
+        }
+        run.window_opened = true;
+        build_handoff_payload(run)
+    };
+    notifications::refresh_tray(app);
+    Some(payload)
 }
 
 /// True while `session_id` is an overlay run whose full window has not opened yet.
@@ -1093,16 +1145,71 @@ pub fn drain_run(app: &AppHandle, session_id: &str) -> OverlayDrainResult {
     OverlayDrainResult { events, busy }
 }
 
-/// Prompt previews for all overlay runs still thinking invisibly (shown on
-/// system tray hover).
+/// Unrevealed background overlay runs sorted chronologically: `(session_id, prompt_preview)`.
 #[cfg_attr(not(desktop), allow(dead_code))]
-pub fn unrevealed_previews(app: &AppHandle) -> Vec<String> {
+pub fn unrevealed_tray_runs(app: &AppHandle) -> Vec<(String, String)> {
     let state = app.state::<AppState>();
     let runs = state.overlay_runs.lock().unwrap();
-    runs.values()
+    let mut entries: Vec<(u64, String, String)> = runs
+        .values()
         .filter(|run| !run.window_opened)
-        .map(|run| run.prompt_preview.clone())
+        .map(|run| (run.seq, run.session_id.clone(), run.prompt_preview.clone()))
+        .collect();
+    entries.sort_by_key(|(seq, _, _)| *seq);
+    entries
+        .into_iter()
+        .map(|(_, sid, preview)| (sid, preview))
         .collect()
+}
+
+/// Immediately open and focus the chat window for an active background overlay run.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub fn reveal_now(app: &AppHandle, session_id: &str) {
+    let pending: Option<(Value, Instant)> = {
+        let state = app.state::<AppState>();
+        let mut runs = state.overlay_runs.lock().unwrap();
+        match runs.get_mut(session_id) {
+            Some(run) if !run.handed_off && !run.window_opened => {
+                run.window_opened = true;
+                Some((build_handoff_payload(run), run.submitted_at))
+            }
+            _ => None,
+        }
+    };
+    if let Some((handoff, submitted_at)) = pending {
+        notifications::refresh_tray(app);
+        open_revealed_window(
+            app,
+            session_id.to_string(),
+            handoff,
+            RevealReason::Output,
+            submitted_at,
+            true,
+        );
+        return;
+    }
+    let app_bg = app.clone();
+    let sid = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        crate::windows::focus_or_open_session(&app_bg, &sid).await;
+    });
+}
+
+/// Cancel an in-flight background overlay run from the system tray without opening its window.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub fn cancel_background_run(app: &AppHandle, session_id: &str) {
+    {
+        let state = app.state::<AppState>();
+        state.overlay_runs.lock().unwrap().remove(session_id);
+    }
+    notifications::refresh_tray(app);
+    let app_bg = app.clone();
+    let sid = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = crate::bigtiny::stream::cancel(&app_bg, &sid).await {
+            tracing::warn!("tray cancel of background overlay run {sid} failed: {e}");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,7 +1259,14 @@ pub async fn submit_overlay_prompt(app: AppHandle, req: OverlayPromptRequest) ->
         .is_some_and(|p| !p.is_empty())
         || req.documents.as_ref().is_some_and(|d| !d.is_empty())
         || req.images.as_ref().is_some_and(|i| !i.is_empty());
-    if req.text.trim().is_empty() && !has_attachments {
+    let has_slash_command = req.debate.unwrap_or(false)
+        || req.research.is_some()
+        || req
+            .critique
+            .as_deref()
+            .is_some_and(|s| crate::bigtiny::critique::Stage::parse(s).is_some())
+        || req.tidy.unwrap_or(false);
+    if req.text.trim().is_empty() && !has_attachments && !has_slash_command {
         return Ok(());
     }
 
@@ -1188,6 +1302,14 @@ async fn execute_recorded_submission(
     req: OverlayPromptRequest,
     record_id: u64,
 ) -> Result<(), String> {
+    if let Some(hist) = req
+        .raw_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| (!req.text.trim().is_empty()).then_some(req.text.as_str()))
+    {
+        crate::config::record_overlay_prompt(app, hist);
+    }
     let cwd_path = crate::commands::fresh_chat_folder(app).await?;
     let cwd = cwd_path.to_string_lossy().replace('\\', "/");
 
@@ -1220,6 +1342,27 @@ async fn execute_recorded_submission(
     .await?;
     let session_id = info.session_id.clone();
     attach_session_to_recent_prompt(app, record_id, &session_id);
+
+    if let Some(custom_cwd) = req
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let c_owned = custom_cwd.to_string();
+        let c_for_blocking = c_owned.clone();
+        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&c_for_blocking))
+            .await
+            .map_err(|e| format!("working-directory creation task panicked: {e}"))?
+            .map_err(|e| format!("could not create the working directory {c_owned}: {e}"))?;
+        let custom_norm = c_owned.replace('\\', "/");
+        crate::bigtiny::sessions::update_cwd(app, &session_id, &custom_norm).await?;
+        info.is_default_folder = crate::commands::is_default_folder(app, &custom_norm);
+        info.cwd = custom_norm;
+        if !info.is_default_folder {
+            crate::config::record_recent_working_dir(app, &info.cwd);
+        }
+    }
 
     let persona = card
         .as_ref()
@@ -1295,12 +1438,11 @@ async fn execute_recorded_submission(
         raw_paths = staged_files;
     }
 
-    let documents = req.documents.unwrap_or_default();
+    let mut documents = req.documents.unwrap_or_default();
     let attached_paths_opt = (!raw_paths.is_empty()).then_some(raw_paths.clone());
-    let composed_text = crate::bigtiny::turn_text::compose(&req.text, &documents, &raw_paths);
 
-    // Seed the user-message event so the full Kitty window renders the user's
-    // prompt + attachment chips immediately upon opening.
+    // Seed the user-message event BEFORE appending synthetic slash docs so the
+    // full Kitty window shows only the user's own attachments cleanly.
     let mut initial_attachments: Vec<Value> = raw_paths
         .iter()
         .map(|p| {
@@ -1333,13 +1475,87 @@ async fn execute_recorded_submission(
         }
     }
 
+    let debate_panel = if req.debate.unwrap_or(false) {
+        let turn = crate::bigtiny::debate::prepare(
+            app,
+            &session_id,
+            &documents,
+            &raw_paths,
+        )
+        .await;
+        documents.push(turn.brief);
+        turn.panel
+    } else {
+        None
+    };
+    let debate_panel = match req
+        .critique
+        .as_deref()
+        .and_then(crate::bigtiny::critique::Stage::parse)
+    {
+        Some(stage) => {
+            let turn = crate::bigtiny::critique::prepare(
+                app,
+                &session_id,
+                stage,
+                &req.text,
+                &documents,
+                &raw_paths,
+            )
+            .await;
+            documents.extend(turn.playbook);
+            turn.panel
+        }
+        None => debate_panel,
+    };
+    if let Some(args) = req.research {
+        let client = crate::bigtiny::client::ensure_client(app)?;
+        let started = crate::bigtiny::research::start(&client, &session_id, &req.text, &args)
+            .await
+            .map_err(|e| {
+                tracing::warn!("deep research start for {session_id}: {e}");
+                if e.contains("already has a research run") {
+                    "This chat already has a deep research run in progress.".to_string()
+                } else {
+                    "Could not start deep research.".to_string()
+                }
+            })?;
+        documents.push(crate::bigtiny::research::instructions_document(&started));
+    }
+    if req.tidy.unwrap_or(false) {
+        let doc = crate::bigtiny::tidy::prepare(app, &session_id, &req.text)
+            .await
+            .map_err(|e| {
+                tracing::warn!("tidy prepare for {session_id}: {e}");
+                if e.contains("answered 404") {
+                    "Kitty's engine is older than this Kitty and has no /tidy yet. It updates \
+                     when it restarts: on its own once nothing is using it, or from the banner."
+                        .to_string()
+                } else {
+                    "Could not read the chats to tidy.".to_string()
+                }
+            })?;
+        documents.push(doc);
+    }
+
+    let composed_text = crate::bigtiny::turn_text::compose(&req.text, &documents, &raw_paths);
     let has_any_att = !initial_attachments.is_empty();
-    let preview = make_prompt_preview(&req.text, has_any_att);
+    let display_text = if req.text.trim().is_empty() {
+        req.raw_prompt.as_deref().unwrap_or("").trim()
+    } else {
+        req.text.trim()
+    };
+    let preview_source = req
+        .raw_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&req.text);
+    let preview = make_prompt_preview(preview_source, has_any_att);
     let user_msg_event = json!({
         "event": "chat://user-message",
         "payload": {
             "session_id": session_id,
-            "text": req.text.trim(),
+            "text": display_text,
             "attachments": initial_attachments,
         }
     });
@@ -1349,6 +1565,8 @@ async fn execute_recorded_submission(
         state.overlay_runs.lock().unwrap().insert(
             session_id.clone(),
             OverlayRunState {
+                seq: RUN_SEQ.fetch_add(1, Ordering::Relaxed),
+                submitted_at: Instant::now(),
                 session_id: session_id.clone(),
                 cwd: info.cwd.clone(),
                 prompt_preview: preview,
@@ -1371,7 +1589,7 @@ async fn execute_recorded_submission(
         composed_text,
         req.images,
         attached_paths_opt,
-        None,
+        debate_panel,
     )
     .await
     {
