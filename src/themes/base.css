@@ -246,12 +246,18 @@ button:disabled {
 }
 
 /* --- Overlay window: lower-right Windows-"Run"-style launcher card --- */
+html:has(.overlay-root),
+body:has(.overlay-root) {
+  overflow: hidden;
+}
+
 .overlay-root {
   display: flex;
   align-items: flex-end;
   justify-content: center;
   height: 100%;
   padding: 0;
+  overflow: hidden;
 }
 
 .overlay-run-card {
@@ -351,8 +357,14 @@ button:disabled {
   line-height: 1;
 }
 
+/* Override the `@media (max-width: 700px)` 90px mobile cap (the desktop
+   overlay is 540px wide) and size the label to fit ~"Qwen: DeepSeek V4 4.1 1017". */
+.overlay-run-footer .provider-badge {
+  max-width: none;
+}
+
 .overlay-run-footer .provider-badge-label {
-  max-width: 160px;
+  max-width: 24ch;
 }
 
 .overlay-run-send {
@@ -363,13 +375,24 @@ button:disabled {
   font-weight: 500;
 }
 
-.overlay-run-popover {
+.overlay-root .mode-popover.overlay-run-popover {
   top: auto;
   right: auto;
   bottom: calc(100% + 6px);
   left: 0;
   max-height: 220px;
   overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.overlay-root .mode-popover.overlay-run-popover.provider-popover {
+  min-width: 240px;
+  max-width: 380px;
+}
+
+.overlay-root .effort-popover .effort-option {
+  min-height: 28px;
+  padding: 6px 8px;
 }
 
 .overlay-run-degraded {

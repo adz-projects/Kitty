@@ -24,7 +24,7 @@ use crate::state::AppState;
 /// Overlay window size (logical px). Compact Windows-"Run"-style launcher bar;
 /// height grows upward dynamically for multiline prompts and upward popovers.
 const OVERLAY_W: u32 = 540;
-const OVERLAY_H: u32 = 124;
+const OVERLAY_H: u32 = 96;
 
 /// Slide-animation tuning (Round-3 follow-up: overlay rises from/sinks into the
 /// taskbar rather than snapping visible/hidden).
@@ -151,10 +151,11 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let win = WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Kitty")
         .inner_size(f64::from(OVERLAY_W), f64::from(OVERLAY_H))
-        .min_inner_size(360.0, 96.0)
+        .min_inner_size(360.0, 72.0)
         .resizable(false)
         .decorations(false)
         .transparent(true)
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
@@ -271,7 +272,7 @@ pub fn resize_overlay_height(app: &AppHandle, logical_height: f64) -> tauri::Res
     } else {
         None
     };
-    let clamped = logical_height.clamp(96.0, 480.0);
+    let clamped = logical_height.clamp(72.0, 480.0);
     win.set_size(tauri::LogicalSize::new(f64::from(OVERLAY_W), clamped))?;
     if visible {
         ANIM_GEN.fetch_add(1, Ordering::SeqCst);

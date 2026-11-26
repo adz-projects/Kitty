@@ -216,19 +216,26 @@ export function App() {
     };
   }, [activeProviderId, refreshEffort]);
 
-  // Close popovers on click/tap outside.
+  // Close popovers on click/tap outside or when the overlay loses window focus.
   useEffect(() => {
     if (!menuOpen) return;
+    const closeMenus = () => {
+      setModelOpen(false);
+      setEffortOpen(false);
+    };
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Node;
       if (modelWrapRef.current?.contains(target) || effortWrapRef.current?.contains(target)) {
         return;
       }
-      setModelOpen(false);
-      setEffortOpen(false);
+      closeMenus();
     };
     document.addEventListener('pointerdown', onPointerDown);
-    return () => document.removeEventListener('pointerdown', onPointerDown);
+    window.addEventListener('blur', closeMenus);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('blur', closeMenus);
+    };
   }, [menuOpen]);
 
   // Resize the window height dynamically to fit the card + upward popover headroom.
@@ -237,9 +244,13 @@ export function App() {
     if (!card) return;
     const cardHeight = Math.ceil(card.getBoundingClientRect().height);
     if (cardHeight <= 0) return;
-    const target = menuOpen
-      ? Math.min(MAX_OVERLAY_HEIGHT, cardHeight + POPOVER_HEADROOM)
-      : cardHeight + 2;
+    const pop = menuOpen ? card.querySelector<HTMLElement>('.overlay-run-popover') : null;
+    const popExtra = menuOpen
+      ? pop
+        ? Math.ceil(pop.getBoundingClientRect().height) + 12
+        : POPOVER_HEADROOM
+      : 0;
+    const target = Math.min(MAX_OVERLAY_HEIGHT, cardHeight + popExtra + 2);
     void ipc.setOverlayHeight(target).catch(() => {});
   }, [menuOpen]);
 
@@ -250,7 +261,7 @@ export function App() {
     const ro = new ResizeObserver(() => syncWindowHeight());
     ro.observe(card);
     return () => ro.disconnect();
-  }, [syncWindowHeight]);
+  }, [syncWindowHeight, usableProviders.length, thinkingEffort]);
 
   const addPaths = useCallback(
     async (paths: string[]) => {
