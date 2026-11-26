@@ -66,10 +66,14 @@ pub struct Config {
     // the next save.
     /// First-run wizard completion flag (gates the wizard in Phase 7).
     pub setup_completed: bool,
-    /// Active theme name (built-ins `light`/`dark`, or a user `.css` filename).
+    /// Active theme name (built-ins `light`/`dark`, `"system"`, or a user `.css` filename).
     /// `"default"` is also accepted on load as `light`'s pre-rename id — see
     /// `migrate_theme_default_to_light`.
     pub theme: String,
+    /// Built-in theme palette & typography style: `classic` (warm paper/walnut)
+    /// | `modern` (monochrome, emerald) | `cli` (80s P39 phosphor / greenbar, monospace).
+    #[serde(default = "default_theme_style")]
+    pub theme_style: String,
     // Background-image machinery (path/dim/fit/position) removed
     // (release-fixes item 18) — same drop-silently-on-next-save story as
     // `ollama_base_url` above: no `deny_unknown_fields`, so an existing
@@ -472,6 +476,7 @@ impl Default for Config {
             v1_import_state: None,
             setup_completed: false,
             theme: "light".to_string(),
+            theme_style: default_theme_style(),
             notifications: NotificationPrefs::default(),
             providers: Vec::new(),
             providers_schema: crate::config::providers::SCHEMA_MERGED,
@@ -566,6 +571,10 @@ fn default_bigtiny_args() -> Vec<String> {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_theme_style() -> String {
+    "classic".to_string()
 }
 
 fn default_adaptive_pathway_enabled() -> bool {
@@ -1587,6 +1596,8 @@ mod tests {
         assert_eq!(c.hotkeys, vec!["Alt+Space".to_string()]);
         assert!(!c.setup_completed);
         assert!(c.notifications.approval_needed);
+        assert_eq!(c.theme, "light");
+        assert_eq!(c.theme_style, "classic");
     }
 
     #[test]
@@ -1648,6 +1659,7 @@ mod tests {
         // A config written by an older build (only one field) must still load.
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(back.theme, "dark");
+        assert_eq!(back.theme_style, "classic");
         assert_eq!(back.default_context_folder, None);
         // Predates the second (open-new-chat-window) hotkey entirely — must
         // default to unregistered, not error out on the missing field.

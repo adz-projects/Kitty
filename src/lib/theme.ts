@@ -5,10 +5,26 @@
 
 import lightCss from '@/themes/light.css?raw';
 import darkCss from '@/themes/dark.css?raw';
+import modernLightCss from '@/themes/modern-light.css?raw';
+import modernDarkCss from '@/themes/modern-dark.css?raw';
+import cliLightCss from '@/themes/cli-light.css?raw';
+import cliDarkCss from '@/themes/cli-dark.css?raw';
 import { ipc, onThemeChanged } from './ipc';
 import { applyPlatformAttribute } from './platform';
 
-const BUILTIN: Record<string, string> = { light: lightCss, dark: darkCss };
+export type ThemeStyle = 'classic' | 'modern' | 'cli';
+
+const BUILTIN_STYLES: Record<ThemeStyle, { light: string; dark: string }> = {
+  classic: { light: lightCss, dark: darkCss },
+  modern: { light: modernLightCss, dark: modernDarkCss },
+  cli: { light: cliLightCss, dark: cliDarkCss },
+};
+
+export function resolveThemeStyle(style?: string | null): ThemeStyle {
+  if (style === 'modern') return 'modern';
+  if (style === 'cli') return 'cli';
+  return 'classic';
+}
 
 /** `theme: "system"` follows the OS (D16): `light` under
     `prefers-color-scheme: light`, `dark` under dark. Not a third stylesheet —
@@ -49,19 +65,40 @@ function ensureStyle(id: string): HTMLStyleElement {
 // content for that name instead of silently wrenching the user to `default`.
 const userThemeCache = new Map<string, string>();
 
-async function themeCss(name: string): Promise<string> {
-  if (BUILTIN[name]) return BUILTIN[name];
+interface ResolvedTheme {
+  css: string;
+  dataTheme: 'light' | 'dark' | null;
+  dataStyle: ThemeStyle | null;
+}
+
+function setRootThemeAttrs(dataTheme: 'light' | 'dark' | null, dataStyle: ThemeStyle | null) {
+  const root = document.documentElement;
+  if (dataTheme) root.setAttribute('data-theme', dataTheme);
+  else root.removeAttribute('data-theme');
+  if (dataStyle) root.setAttribute('data-theme-style', dataStyle);
+  else root.removeAttribute('data-theme-style');
+}
+
+async function resolveThemePayload(name: string, style?: string | null): Promise<ResolvedTheme> {
+  if (name === 'light' || name === 'dark') {
+    const resolvedStyle = resolveThemeStyle(style);
+    return {
+      css: BUILTIN_STYLES[resolvedStyle][name],
+      dataTheme: name,
+      dataStyle: resolvedStyle,
+    };
+  }
   try {
     const css = await ipc.readUserTheme(name);
     userThemeCache.set(name, css);
-    return css;
+    return { css, dataTheme: null, dataStyle: null };
   } catch (e) {
     const cached = userThemeCache.get(name);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return { css: cached, dataTheme: null, dataStyle: null };
     // Unknown/missing theme (renamed/deleted user file) — light is the
     // only sane content, but log so the silent swap isn't invisible.
     console.warn(`theme "${name}" could not be read; falling back to light`, e);
-    return BUILTIN.light;
+    return { css: BUILTIN_STYLES.classic.light, dataTheme: 'light', dataStyle: 'classic' };
   }
 }
 
@@ -79,11 +116,15 @@ async function applyFromConfig() {
     // A newer applyFromConfig() started while we were waiting — drop this
     // stale result so an older config can't clobber the newer one on the DOM.
     if (gen !== themeApplyGen) return;
-    const css = await themeCss(resolveThemeName(cfg.theme, prefersDark()));
-    // themeCss may itself await an IPC round-trip (readUserTheme) — re-check
-    // before writing, otherwise a slow stale call can still win the DOM write.
+    const resolved = await resolveThemePayload(
+      resolveThemeName(cfg.theme, prefersDark()),
+      cfg.theme_style
+    );
+    // resolveThemePayload may itself await an IPC round-trip (readUserTheme) —
+    // re-check before writing, otherwise a slow stale call can still win.
     if (gen !== themeApplyGen) return;
-    ensureStyle('app-theme').textContent = css;
+    ensureStyle('app-theme').textContent = resolved.css;
+    setRootThemeAttrs(resolved.dataTheme, resolved.dataStyle);
   } catch {
     // Backend down / IPC failure — keep whatever theme is already applied
     // (initTheme's synchronously-injected built-in). Caught here, once, so
@@ -101,7 +142,9 @@ export function initTheme() {
   // Inject a synchronously-resolved built-in to avoid an unstyled flash. Uses
   // the OS preference rather than always `light`, so a dark-mode user on
   // `theme: "system"` doesn't get a white flash before the config loads.
-  ensureStyle('app-theme').textContent = prefersDark() ? BUILTIN.dark : BUILTIN.light;
+  const initialMode = prefersDark() ? 'dark' : 'light';
+  ensureStyle('app-theme').textContent = BUILTIN_STYLES.classic[initialMode];
+  setRootThemeAttrs(initialMode, 'classic');
   void applyFromConfig();
   void onThemeChanged(() => void applyFromConfig());
   // Follow the OS while `theme: "system"` is active. `applyFromConfig`

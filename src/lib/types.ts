@@ -20,6 +20,8 @@ export interface Config {
   overlay_prompt_history?: string[];
   setup_completed: boolean;
   theme: string;
+  /** Built-in theme palette & typography style: `classic` | `modern` | `cli`. */
+  theme_style?: string;
   notifications: NotificationPrefs;
   providers: ProviderProfile[];
   active_provider_id: string | null;

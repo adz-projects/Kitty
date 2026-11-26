@@ -1,0 +1,37 @@
+/* 80s CLI light theme — continuous IBM greenbar paper with crisp dark-forest
+   terminal ink, quiet greenbar rules, emerald for what can be acted on, and
+   mint-green for find matches. Monospace end to end. Palette shared with
+   Bacon's cli light style. */
+:root {
+  --bg: #f2f7f1;
+  --surface: #e4ede3;
+  --surface-2: #d4e3d3;
+  --text: #102413;
+  --text-muted: #3c5c40;
+  --accent: #136628;
+  --accent-fill: #136628;
+  --accent-text: #f2f7f1;
+  --border: #b6cfb8;
+  --radius: 0px;
+  --radius-sm: 0px;
+  --font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --font-reading: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  /* Running text of the chat: ~8.9:1 on --bg, a step softer than --text. */
+  --chat-text: #29482d;
+  --chat-strong: #17311b;
+  --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --selection: #c8ebd0;
+  --find-match: #b5e3bc;
+  --find-current: #136628;
+  --find-current-text: #f2f7f1;
+  --overlay-opacity: 1;
+  --overlay-shadow: 4px 4px 0 #9fc2a2;
+  --ok: #136628;
+  --warn: #755200;
+  --ok-bg: rgba(19, 102, 40, 0.1);
+  --warn-bg: rgba(117, 82, 0, 0.1);
+  --danger-bg: rgba(158, 42, 43, 0.09);
+  --danger: #9e2a2b;
+  /* Figures (themes/viz.css): the one colour beside ink and paper. */
+  --viz-accent: #9e2a2b;
+}

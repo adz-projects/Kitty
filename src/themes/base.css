@@ -821,7 +821,7 @@ body:has(.overlay-root) {
   /* `--chat-text`, like the answer's prose: see `.bubble.markdown` below. */
   color: var(--chat-text, var(--text));
   padding: 8px 12px;
-  border-radius: 8px;
+  border-radius: var(--radius);
   font-family: var(--font-reading, inherit);
   font-size: var(--chat-font-size);
   line-height: var(--reading-line-height, 1.6);
@@ -4399,4 +4399,161 @@ button.link {
 ::highlight(kitty-find-current) {
   background-color: var(--find-current, var(--accent));
   color: var(--find-current-text, var(--accent-text));
+}
+
+/* 80s CLI theme style: 0px sharp geometry, dashed terminal dividers,
+   reverse-video selections, [button] brackets, raster/greenbar surfaces, and
+   chrome-only phosphor bloom (chat prose stays razor-sharp). */
+:root[data-platform='desktop'][data-theme-style='cli'] *::-webkit-scrollbar-thumb {
+  border-radius: 0px;
+}
+
+[data-theme-style='cli'] .chip-thumb,
+[data-theme-style='cli'] .chip-remember,
+[data-theme-style='cli'] .sheet-handle {
+  border-radius: 0px;
+}
+
+[data-theme-style='cli'] .titlebar,
+[data-theme-style='cli'] .chat-header,
+[data-theme-style='cli'] .session-search,
+[data-theme-style='cli'] .code-block-head,
+[data-theme-style='cli'] .viz-card-head {
+  border-bottom-style: dashed;
+}
+
+[data-theme-style='cli'] .overlay-run-footer,
+[data-theme-style='cli'] .session-selection-bar,
+[data-theme-style='cli'] .find-bar {
+  border-top-style: dashed;
+}
+
+[data-theme-style='cli'] .settings-nav {
+  border-right-style: dashed;
+}
+
+[data-theme-style='cli'] .artifacts-pane {
+  border-left-style: dashed;
+}
+
+[data-theme-style='cli'] .msg-user .bubble {
+  border: 1px dashed var(--border);
+}
+
+[data-theme-style='cli'] .session-item.active,
+[data-theme-style='cli'] .session-item.active:hover,
+[data-theme-style='cli'] .settings-nav button.active,
+[data-theme-style='cli'] .slash-item.active,
+[data-theme-style='cli'] .mode-popover button.active {
+  background: var(--accent-fill);
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+[data-theme-style='cli'] .session-item.active .session-title::before,
+[data-theme-style='cli'] .settings-nav button.active::before {
+  content: '> ';
+}
+
+[data-theme-style='cli']
+  :is(
+    button.primary,
+    button.danger,
+    .modal-actions button,
+    .wizard-actions button,
+    .approval .actions button,
+    .overlay-run-send,
+    .status-panel .actions button,
+    .settings-section > .row > button,
+    .settings-section .field > .row > button
+  )::before {
+  content: '[';
+  opacity: 0.65;
+  margin-right: 0.15em;
+}
+
+[data-theme-style='cli']
+  :is(
+    button.primary,
+    button.danger,
+    .modal-actions button,
+    .wizard-actions button,
+    .approval .actions button,
+    .overlay-run-send,
+    .status-panel .actions button,
+    .settings-section > .row > button,
+    .settings-section .field > .row > button
+  )::after {
+  content: ']';
+  opacity: 0.65;
+  margin-left: 0.15em;
+}
+
+[data-theme-style='cli'] .composer textarea:focus,
+[data-theme-style='cli'] .field :is(input, select, textarea):focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+[data-theme-style='cli']
+  :is(.overlay-run-card, .modal, .mode-popover, .context-menu, .slash-menu, .chat-header-menu) {
+  box-shadow: var(--overlay-shadow);
+}
+
+[data-theme-style='cli'] .msg-assistant .bubble.markdown :is(h1, h2, h3) {
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+[data-theme-style='cli'] .msg-assistant .bubble.markdown :is(h1, h2) {
+  border-bottom: 1px dashed var(--border);
+  padding-bottom: 0.15em;
+}
+
+[data-theme-style='cli'][data-theme='dark'] .main-center,
+[data-theme-style='cli'][data-theme='dark'] .settings-main,
+[data-theme-style='cli'][data-theme='dark'] .sessions-route {
+  background-color: var(--bg);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.22) 2px,
+    rgba(0, 0, 0, 0.22) 3px
+  );
+}
+
+[data-theme-style='cli'][data-theme='light'] .message-list,
+[data-theme-style='cli'][data-theme='light'] .settings-main,
+[data-theme-style='cli'][data-theme='light'] .sessions-route > .session-list {
+  background-color: var(--bg);
+  background-attachment: local;
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 26px,
+    color-mix(in srgb, var(--surface) 58%, var(--bg)) 26px,
+    color-mix(in srgb, var(--surface) 58%, var(--bg)) 52px
+  );
+}
+
+/* Faint CRT phosphor bloom on dark-mode chrome only (never on chat prose). */
+[data-theme-style='cli'][data-theme='dark']
+  :is(
+    .titlebar,
+    .session-list,
+    .settings-nav,
+    .chat-header,
+    .artifacts-head,
+    .overlay-run-footer,
+    button.primary,
+    button.danger
+  ) {
+  text-shadow: 0 0 5px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+[data-theme-style='cli'][data-theme='dark']
+  :is(.session-item.active, .settings-nav button.active, button.primary) {
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 16%, transparent);
 }

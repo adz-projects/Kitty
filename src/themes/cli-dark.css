@@ -1,0 +1,37 @@
+/* 80s CLI dark theme — deep phosphor-black with crisp P39 green text,
+   quiet terminal grid lines, bright phosphor green for what can be acted on,
+   and warm amber for find matches. Monospace end to end. Palette shared with
+   Bacon's cli dark style. */
+:root {
+  --bg: #080c08;
+  --surface: #0e150e;
+  --surface-2: #162316;
+  --text: #c9f7c9;
+  --text-muted: #7fc282;
+  --accent: #52eb73;
+  --accent-fill: #155925;
+  --accent-text: #e8ffe8;
+  --border: #1c331e;
+  --radius: 0px;
+  --radius-sm: 0px;
+  --font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --font-reading: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  /* Running text of the chat: crisp P39 phosphor below --text's full bloom. */
+  --chat-text: #8cd18f;
+  --chat-strong: #c9f7c9;
+  --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --selection: #173d1e;
+  --find-match: #7d5d18;
+  --find-current: #e6be53;
+  --find-current-text: #080c08;
+  --overlay-opacity: 1;
+  --overlay-shadow: 4px 4px 0 #030503, 0 0 12px rgba(82, 235, 115, 0.14);
+  --ok: #52eb73;
+  --warn: #e6be53;
+  --ok-bg: rgba(82, 235, 115, 0.12);
+  --warn-bg: rgba(230, 190, 83, 0.12);
+  --danger-bg: rgba(240, 130, 130, 0.12);
+  --danger: #f08282;
+  /* Figures (themes/viz.css): the one colour beside ink and paper. */
+  --viz-accent: #e6be53;
+}

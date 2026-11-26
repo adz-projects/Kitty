@@ -1,0 +1,36 @@
+/* Modern dark theme — pure monochrome ink and graphite with crisp emerald
+   for what can be acted on. Palette shared with Bacon's modern dark style. */
+:root {
+  --bg: #0e0e10;
+  --surface: #151518;
+  --surface-2: #202025;
+  --text: #f2f2f5;
+  --text-muted: #a0a0ab;
+  --accent: #5cd69d;
+  --accent-fill: #1a6142;
+  --accent-text: #eefbf4;
+  --border: #292930;
+  --radius: 6px;
+  --radius-sm: 5px;
+  --font-family: 'Montserrat', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-reading: 'Open Sans Variable', 'Open Sans', 'Segoe UI', Roboto, sans-serif;
+  /* Running text of the chat: ~7.5:1 on --bg, where --text is ~17:1. */
+  --chat-text: #a3a3ae;
+  /* Bold within it: a little under --text. */
+  --chat-strong: #d5d5dc;
+  --mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --selection: #1d362b;
+  --find-match: #277351;
+  --find-current: #5cd69d;
+  --find-current-text: #0e0e10;
+  --overlay-opacity: 1;
+  --overlay-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 10px 28px rgba(0, 0, 0, 0.42);
+  --ok: #7fd19e;
+  --warn: #e3b864;
+  --ok-bg: rgba(127, 209, 158, 0.11);
+  --warn-bg: rgba(227, 184, 100, 0.11);
+  --danger-bg: rgba(235, 141, 141, 0.11);
+  --danger: #eb8d8d;
+  /* Figures (themes/viz.css): the one colour beside ink and paper. */
+  --viz-accent: #f0705a;
+}

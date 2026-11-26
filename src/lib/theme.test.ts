@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveThemeName, SYSTEM_THEME } from './theme';
+import { resolveThemeName, resolveThemeStyle, SYSTEM_THEME } from './theme';
 
 /** D16: `system` is not a third stylesheet, it resolves to one of the two
     built-ins. Everything else — including a user's own CSS file — must pass
@@ -30,5 +30,16 @@ describe('resolveThemeName', () => {
   it('reserves only the exact name', () => {
     expect(resolveThemeName('System', true)).toBe('System');
     expect(resolveThemeName('systemic', true)).toBe('systemic');
+  });
+});
+
+describe('resolveThemeStyle', () => {
+  it('recognizes classic, modern, and cli and falls back to classic', () => {
+    expect(resolveThemeStyle('classic')).toBe('classic');
+    expect(resolveThemeStyle('modern')).toBe('modern');
+    expect(resolveThemeStyle('cli')).toBe('cli');
+    expect(resolveThemeStyle(undefined)).toBe('classic');
+    expect(resolveThemeStyle(null)).toBe('classic');
+    expect(resolveThemeStyle('unknown')).toBe('classic');
   });
 });

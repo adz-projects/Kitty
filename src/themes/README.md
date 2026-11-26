@@ -1,10 +1,11 @@
 # Theme contract
 
 A theme is **one CSS file** that sets custom properties on `:root`. `base.css`
-(structural, color-free) consumes them. Built-in themes live here
-(`light.css`, `dark.css`); user themes are `.css` files dropped into
-`%APPDATA%/goose-overlay/themes/`, which then appear in Settings → Appearance and
-apply at runtime with no rebuild.
+(structural, color-free) consumes them. Built-in styles live here — `classic`
+(`light.css`, `dark.css`), `modern` (`modern-light.css`, `modern-dark.css`),
+and `cli` (`cli-light.css`, `cli-dark.css`); user themes are `.css` files
+dropped into `%APPDATA%/Kitty/themes/`, which then appear in Settings →
+Appearance and apply at runtime with no rebuild.
 
 ## Required custom properties
 

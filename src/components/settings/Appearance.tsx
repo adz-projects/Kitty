@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
-import { SYSTEM_THEME } from '@/lib/theme';
+import { resolveThemeStyle, SYSTEM_THEME } from '@/lib/theme';
 import { useConfigDraft } from './useConfigDraft';
 import { isAndroid } from '@/lib/platform';
 
-/** Appearance: theme (built-in + user CSS). */
+/** Appearance: theme (built-in + user CSS) and built-in style. */
 export function Appearance() {
   const { draft, update, save, saved, error } = useConfigDraft();
   const [themes, setThemes] = useState<{ builtins: string[]; user: string[] }>({
@@ -16,6 +16,11 @@ export function Appearance() {
   useEffect(loadThemes, []);
 
   if (!draft) return <p className="muted">Loading…</p>;
+
+  const isBuiltinTheme =
+    draft.theme === SYSTEM_THEME ||
+    draft.theme === 'default' ||
+    themes.builtins.includes(draft.theme);
 
   return (
     <section className="settings-section">
@@ -64,6 +69,24 @@ export function Appearance() {
             themes/README.md for the contract.
           </small>
         )}
+      </label>
+
+      <label className="field">
+        <span>Style</span>
+        <select
+          value={resolveThemeStyle(draft.theme_style)}
+          onChange={(e) => update({ theme_style: e.target.value })}
+          disabled={!isBuiltinTheme}
+        >
+          <option value="classic">Classic (warm paper &amp; walnut)</option>
+          <option value="modern">Modern (monochrome, emerald)</option>
+          <option value="cli">80s CLI (P39 phosphor, monospace)</option>
+        </select>
+        <small className="muted">
+          {isBuiltinTheme
+            ? 'Palette and typography for built-in Light and Dark (including Match system).'
+            : 'Applies only to built-in themes; custom CSS files control their own palette.'}
+        </small>
       </label>
 
       <div className="row">
