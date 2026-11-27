@@ -70,6 +70,9 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",
+    "Win32_System_Com",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Variant",
 ] }
 # The WebView2 context-menu bridge (`context_menu.rs`): the same versions
 # wry uses, so the COM interfaces are the ones Tauri's webview hands over.

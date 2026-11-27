@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:signed": "tauri build --config src-tauri/tauri.sign.local.json",
     "preview": "vite preview",
     "tauri": "tauri",
     "lint": "eslint . && prettier --check .",

@@ -19,9 +19,6 @@ use serde::Serialize;
 
 pub const FLAG: &str = "--overnight-wake";
 
-/// The task's name in Task Scheduler (a folder of Kitty's own).
-pub const TASK_NAME: &str = "Kitty\\Overnight memory";
-
 /// Minutes after the window opens that the task wakes the machine.
 pub const WAKE_AFTER_START_MIN: u32 = 5;
 
@@ -140,11 +137,100 @@ pub fn parse_powercfg(out: &str) -> WakeTimers {
     }
 }
 
+/// Check whether an existing task's XML already matches the desired executable
+/// path, wake time, and wake-to-run flags so startup skips redundant writes.
+pub fn xml_matches(existing_xml: &str, exe: &str, at: &str) -> bool {
+    let escaped_exe = xml_escape(exe);
+    existing_xml.contains(&format!("<Command>{escaped_exe}</Command>"))
+        && existing_xml.contains(&format!("<Arguments>{FLAG}</Arguments>"))
+        && existing_xml.contains(&format!("T{at}:00</StartBoundary>"))
+        && existing_xml.contains("<WakeToRun>true</WakeToRun>")
+        && existing_xml.contains("<Enabled>true</Enabled>")
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
     use crate::util::hidden_command;
     use std::path::Path;
+    use windows::core::{BSTR, VARIANT};
+    use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, VARIANT_TRUE};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::TaskScheduler::{
+        IRegisteredTask, ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE,
+        TASK_LOGON_INTERACTIVE_TOKEN,
+    };
+
+    const FOLDER_PATH: &str = "\\Kitty";
+    const FOLDER_NAME: &str = "Kitty";
+    const TASK_SUBNAME: &str = "Overnight memory";
+
+    struct ComGuard(bool);
+
+    impl ComGuard {
+        fn init() -> Result<Self, String> {
+            let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            if hr.is_ok() {
+                Ok(Self(true))
+            } else if hr == RPC_E_CHANGED_MODE {
+                Ok(Self(false))
+            } else {
+                Err(format!("COM init failed: {}", hr.message()))
+            }
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    fn connect() -> Result<(ComGuard, ITaskService), String> {
+        let guard = ComGuard::init()?;
+        let service: ITaskService =
+            unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| format!("could not open Task Scheduler: {e}"))?;
+        let empty = VARIANT::default();
+        unsafe { service.Connect(&empty, &empty, &empty, &empty) }
+            .map_err(|e| format!("could not connect to Task Scheduler: {e}"))?;
+        Ok((guard, service))
+    }
+
+    fn open_folder(service: &ITaskService) -> Option<ITaskFolder> {
+        unsafe { service.GetFolder(&BSTR::from(FOLDER_PATH)) }.ok()
+    }
+
+    fn open_task(folder: &ITaskFolder) -> Option<IRegisteredTask> {
+        unsafe { folder.GetTask(&BSTR::from(TASK_SUBNAME)) }.ok()
+    }
+
+    fn ensure_folder(service: &ITaskService) -> Result<ITaskFolder, String> {
+        if let Some(folder) = open_folder(service) {
+            return Ok(folder);
+        }
+        let root = unsafe { service.GetFolder(&BSTR::from("\\")) }
+            .map_err(|e| format!("could not open root Task Scheduler folder: {e}"))?;
+        let empty = VARIANT::default();
+        unsafe { root.CreateFolder(&BSTR::from(FOLDER_NAME), &empty) }
+            .or_else(|e| open_folder(service).ok_or_else(|| format!("could not create task folder: {e}")))
+    }
+
+    fn task_already_matches(task: &IRegisteredTask, exe: &str, at: &str) -> bool {
+        let enabled = unsafe { task.Enabled() }.ok() == Some(VARIANT_TRUE);
+        if !enabled {
+            return false;
+        }
+        let Ok(xml) = (unsafe { task.Xml() }) else {
+            return false;
+        };
+        xml_matches(&xml.to_string(), exe, at)
+    }
 
     fn system32(exe: &str) -> std::path::PathBuf {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
@@ -152,58 +238,60 @@ mod imp {
     }
 
     pub fn is_registered() -> bool {
-        hidden_command(&system32("schtasks.exe"))
-            .args(["/Query", "/TN", TASK_NAME])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        let Ok((_guard, service)) = connect() else {
+            return false;
+        };
+        open_folder(&service).is_some_and(|f| open_task(&f).is_some())
     }
 
     pub fn register(start: &str) -> Result<(), String> {
         let at = wake_time(start).ok_or_else(|| format!("'{start}' is not a time"))?;
         let exe =
             std::env::current_exe().map_err(|e| format!("could not find Kitty's own path: {e}"))?;
-        let xml = task_xml(&exe.to_string_lossy(), &at);
-        // Task Scheduler reads task XML as UTF-16 with a byte-order mark.
-        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
-        for u in xml.encode_utf16() {
-            bytes.extend_from_slice(&u.to_le_bytes());
+        let exe_str = exe.to_string_lossy();
+        let (_guard, service) = connect()?;
+
+        if let Some(folder) = open_folder(&service) {
+            if let Some(existing) = open_task(&folder) {
+                if task_already_matches(&existing, &exe_str, &at) {
+                    return Ok(());
+                }
+            }
         }
-        let path = std::env::temp_dir().join("kitty-overnight-task.xml");
-        std::fs::write(&path, bytes).map_err(|e| format!("could not write the task file: {e}"))?;
-        let out = hidden_command(&system32("schtasks.exe"))
-            .args(["/Create", "/F", "/TN", TASK_NAME, "/XML"])
-            .arg(&path)
-            .output()
-            .map_err(|e| format!("could not run schtasks: {e}"));
-        let _ = std::fs::remove_file(&path);
-        let out = out?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            tracing::warn!("schtasks /Create failed: {detail}");
-            Err("Windows did not accept the wake-up task.".into())
+
+        let folder = ensure_folder(&service)?;
+        let xml = task_xml(&exe_str, &at);
+        let empty = VARIANT::default();
+        unsafe {
+            folder.RegisterTask(
+                &BSTR::from(TASK_SUBNAME),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &empty,
+                &empty,
+                TASK_LOGON_INTERACTIVE_TOKEN,
+                &empty,
+            )
         }
+        .map_err(|e| {
+            tracing::warn!("Task Scheduler RegisterTask failed: {e}");
+            "Windows did not accept the wake-up task.".to_string()
+        })?;
+        Ok(())
     }
 
     pub fn unregister() -> Result<(), String> {
-        if !is_registered() {
+        let (_guard, service) = connect()?;
+        let Some(folder) = open_folder(&service) else {
+            return Ok(());
+        };
+        if open_task(&folder).is_none() {
             return Ok(());
         }
-        let out = hidden_command(&system32("schtasks.exe"))
-            .args(["/Delete", "/F", "/TN", TASK_NAME])
-            .output()
-            .map_err(|e| format!("could not run schtasks: {e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            tracing::warn!(
-                "schtasks /Delete failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            Err("Windows did not remove the wake-up task.".into())
-        }
+        unsafe { folder.DeleteTask(&BSTR::from(TASK_SUBNAME), 0) }.map_err(|e| {
+            tracing::warn!("Task Scheduler DeleteTask failed: {e}");
+            "Windows did not remove the wake-up task.".to_string()
+        })
     }
 
     pub fn wake_timers() -> WakeTimers {
@@ -266,6 +354,14 @@ mod tests {
         assert!(x.contains("T00:05:00</StartBoundary>"));
         assert!(x.contains("Kitty &amp; Co"));
         assert!(x.contains("<Arguments>--overnight-wake</Arguments>"));
+        assert!(xml_matches(&x, r"C:\Program Files\Kitty & Co\kitty.exe", "00:05"));
+        assert!(!xml_matches(&x, r"C:\Users\adamz\AppData\Local\Kitty\kitty.exe", "00:05"));
+        assert!(!xml_matches(&x, r"C:\Program Files\Kitty & Co\kitty.exe", "01:05"));
+        assert!(!xml_matches(
+            &x.replace("<WakeToRun>true</WakeToRun>", "<WakeToRun>false</WakeToRun>"),
+            r"C:\Program Files\Kitty & Co\kitty.exe",
+            "00:05",
+        ));
     }
 
     #[test]

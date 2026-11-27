@@ -3,6 +3,7 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+src-tauri/tauri.sign.local.json
 .vite/
 
 # Rust / Tauri

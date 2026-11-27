@@ -42,7 +42,7 @@
         "silent": true
       },
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "perMachine",
         "installerHooks": "nsis-hooks.nsh"
       }
     }
