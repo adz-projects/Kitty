@@ -3,7 +3,7 @@
     "Uncategorized" bucket, which isn't a real filesystem folder — visually
     distinguishes it from a real one without needing a second glyph the way
     📁 vs 🗂 did. Replaces 📁/🗂. */
-export function FolderIcon({ variant = 'folder' }: { variant?: 'folder' | 'tray' }) {
+export function FolderIcon({ variant = 'folder' }: { variant?: 'folder' | 'tray' | 'plus' }) {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
@@ -13,6 +13,14 @@ export function FolderIcon({ variant = 'folder' }: { variant?: 'folder' | 'tray'
         strokeLinejoin="round"
         strokeDasharray={variant === 'tray' ? '2 1.6' : undefined}
       />
+      {variant === 'plus' && (
+        <path
+          d="M7.75 7.25v3.5M6 9h3.5"
+          stroke="currentColor"
+          strokeWidth="1.3"
+          strokeLinecap="round"
+        />
+      )}
     </svg>
   );
 }

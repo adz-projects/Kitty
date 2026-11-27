@@ -1,6 +1,6 @@
 import { useEffect, useRef, type MutableRefObject } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { MessageItem } from './MessageItem';
+import { MessageItem, messageHasThinkingBox } from './MessageItem';
 import { ThinkingIndicator, type ProgressStage } from './ThinkingIndicator';
 import type { Message } from '@/stores/chatStore';
 import { useFindStore } from '@/stores/findStore';
@@ -99,6 +99,8 @@ function PlainList({
     if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
+  const last = messages[messages.length - 1];
+  const stageInLastTurn = Boolean(stage && last && messageHasThinkingBox(last));
   return (
     <div
       className={`message-list${messages.length === 0 ? ' empty' : ''}`}
@@ -107,9 +109,14 @@ function PlainList({
     >
       {messages.length === 0 && <p className="muted">{empty}</p>}
       {messages.map((m, i) => (
-        <MessageItem key={m.id} message={m} index={i} />
+        <MessageItem
+          key={m.id}
+          message={m}
+          index={i}
+          progressStage={stageInLastTurn && i === messages.length - 1 ? stage : null}
+        />
       ))}
-      {stage && <ThinkingIndicator stage={stage} />}
+      {stage && !stageInLastTurn && <ThinkingIndicator stage={stage} />}
     </div>
   );
 }
@@ -148,6 +155,9 @@ function VirtualList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
+  const last = messages[messages.length - 1];
+  const stageInLastTurn = Boolean(stage && last && messageHasThinkingBox(last));
+
   return (
     <div className="message-list" ref={scrollRef} onScroll={handleScroll}>
       <div style={{ height: rv.getTotalSize(), position: 'relative', width: '100%' }}>
@@ -164,11 +174,15 @@ function VirtualList({
               transform: `translateY(${vi.start}px)`,
             }}
           >
-            <MessageItem message={messages[vi.index]} index={vi.index} />
+            <MessageItem
+              message={messages[vi.index]}
+              index={vi.index}
+              progressStage={stageInLastTurn && vi.index === messages.length - 1 ? stage : null}
+            />
           </div>
         ))}
       </div>
-      {stage && <ThinkingIndicator stage={stage} />}
+      {stage && !stageInLastTurn && <ThinkingIndicator stage={stage} />}
     </div>
   );
 }

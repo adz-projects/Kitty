@@ -658,44 +658,31 @@ body:has(.overlay-root) {
   justify-content: space-between;
   gap: 8px;
   margin-inline: calc(-1 * var(--chat-gutter));
-  padding-block: 0 8px;
+  padding-block: 0 4px;
   padding-inline: calc(var(--chat-gutter) + max(0px, (100% - var(--reading-max-width, 44rem)) / 2));
-  border-bottom: 1px solid var(--border);
   flex-wrap: nowrap;
 }
-/* The folder/thought-partner pill takes remaining space and truncates first —
-   the control group to its right (mode toggle/provider/effort/approval) holds
-   its own shrink behavior instead of the whole header wrapping to 2 lines.
-
-   Both the pill AND its popover wrapper are listed. The pill used to be a
-   direct child of `.chat-header`; wrapping it in `AllowedDirsPopover` (so a
-   thought-partner session can still show and revoke its file grants) made it a
-   *grandchild*, and this child-combinator rule silently stopped matching —
-   the pill shrink-wrapped to its label instead of spanning to the controls,
-   and lost the `min-width: 0` that keeps a long folder name from wrapping the
-   header to two lines. The growth now has to cross two boxes, so both need
-   `min-width: 0` for the ellipsis to still land. */
+/* Shrink-wrap the folder / thought-partner pill to its label (capped so a long
+   folder name still truncates cleanly) rather than stretching it across the
+   entire reading column like an empty text input. */
 .chat-header > .pill {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
+  max-width: 260px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* The wrapper grows and may shrink, but deliberately keeps `overflow: visible`:
-   it is the positioning context for the grants popover, which is absolutely
-   positioned and would be clipped away entirely by `overflow: hidden` here.
-   Truncation belongs to the pill inside it, which does the clipping. */
+/* The wrapper keeps `overflow: visible` so its absolutely-positioned grants
+   popover is never clipped; truncation belongs to the pill inside it. */
 .chat-header > .allowed-dirs-trigger {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
+  max-width: 260px;
   min-width: 0;
 }
-/* Fill the wrapper rather than shrink-wrapping inside it. `max-width` is reset
-   because the base `.pill` caps at 60% — which used to mean 60% of the header
-   and now would mean 60% of an already-shrink-wrapped trigger. */
 .chat-header > .allowed-dirs-trigger > .pill {
-  width: 100%;
-  max-width: none;
+  width: auto;
+  max-width: 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -704,7 +691,7 @@ body:has(.overlay-root) {
 .chat-header-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-shrink: 0;
   min-width: 0;
 }
@@ -1048,7 +1035,49 @@ body:has(.overlay-root) {
   display: inline-flex;
   gap: 6px;
   align-items: center;
+  justify-content: space-between;
   font-size: var(--fs-sm);
+}
+.reasoning-summary:hover {
+  background: transparent;
+  color: var(--text);
+}
+.reasoning-summary-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+/* Live streaming thinking container: absorbs the progress stage inline so the
+   user sees one clean live status bar inside the active turn. */
+.reasoning.reasoning-live {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 6px 10px;
+}
+.reasoning.reasoning-live > .reasoning-summary {
+  display: flex;
+  width: 100%;
+  padding: 2px 0;
+  color: var(--text);
+}
+.reasoning-live-dot,
+.progress-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: progress-pulse 1.4s ease-in-out infinite;
+}
+.reasoning-live-stage {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.reasoning-live-tag {
+  font-size: var(--fs-xs);
+  flex-shrink: 0;
 }
 .reasoning-caret {
   display: inline-block;
@@ -1083,13 +1112,14 @@ body:has(.overlay-root) {
   margin-top: 10px;
 }
 
-/* Real-terms progress indicator (Round-5 Batch 6) — replaces the animated
-   ellipsis with a pulsing stage label (connecting / thinking / formulating). */
+/* Real-terms progress indicator (Round-5 Batch 6) — shown aligned in the
+   reading column before the assistant turn has its own live ThinkingBox. */
 .progress-indicator {
   display: inline-flex;
   align-items: center;
+  gap: 8px;
   color: var(--text-muted);
-  font-size: var(--fs-md);
+  font-size: var(--fs-sm);
 }
 .progress-pulse {
   animation: progress-pulse 1.4s ease-in-out infinite;
@@ -1104,7 +1134,9 @@ body:has(.overlay-root) {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .progress-pulse {
+  .progress-pulse,
+  .reasoning-live-dot,
+  .progress-dot {
     animation: none;
     opacity: 0.75;
   }
@@ -1215,10 +1247,22 @@ body:has(.overlay-root) {
 
 .composer {
   display: flex;
-  gap: 8px;
-  align-items: flex-end;
+  flex-direction: column;
   padding-top: 8px;
   position: relative;
+}
+/* Unified 2-row composer container: full-width writing surface on top,
+   hairline-separated action + model-control toolbar below. */
+.composer-box {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  transition: border-color 120ms ease;
+}
+.composer-box:focus-within {
+  border-color: var(--accent);
 }
 /* Working-directory pill hover list — what this chat may read and write.
    Shrink-wrapped and monospace-pathed: it is a reassurance panel, so the paths
@@ -1386,12 +1430,13 @@ body:has(.overlay-root) {
   pointer-events: none;
 }
 .composer textarea {
-  flex: 1;
+  width: 100%;
   resize: none;
-  padding: 10px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--surface-2);
+  padding: 10px 12px 6px;
+  border: none;
+  outline: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: transparent;
   color: var(--text);
   font: inherit;
   max-height: 160px;
@@ -1400,23 +1445,80 @@ body:has(.overlay-root) {
      shouldn't show scrollbar chrome at all. */
   overflow-y: hidden;
 }
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+}
+.composer-footer-left,
+.composer-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.composer-footer-left {
+  gap: 2px;
+}
+.composer-footer .chat-header-controls {
+  gap: 6px;
+}
+.composer-footer .status-badge {
+  height: 28px;
+  padding: 0 8px;
+  line-height: 1;
+  background: var(--surface);
+}
+.composer-footer .status-badge:hover {
+  background: var(--border);
+}
+.composer-footer .chat-header-menu-trigger {
+  padding: 0 8px;
+}
+.composer-submit {
+  height: 28px;
+  padding: 0 12px;
+  line-height: 1;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  flex-shrink: 0;
+}
 /* Force-stop button (Round-5) — an assertive variant shown after the Stop
    grace period elapses with the turn still stuck. */
 .composer .force-stop {
   border-color: var(--danger);
   color: var(--danger);
 }
-/* Icon-only attach button (Round-5) — square so it lines up with the send
-   button at the composer's bottom edge. */
+/* Icon-only attach/capture buttons inside the unified composer footer. */
 .composer-attach {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: transparent;
   color: var(--text-muted);
 }
 .composer-attach:hover {
+  background: var(--surface);
   color: var(--text);
+}
+.provider-switch-error {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  margin-top: 4px;
+}
+.composer-footer .provider-switch-error {
+  top: auto;
+  bottom: calc(100% + 6px);
+  margin-top: 0;
 }
 
 .chat-error {
@@ -2274,9 +2376,9 @@ body:has(.overlay-root) {
 }
 .titlebar-title {
   /* Centred, so it may use only as much width as stays clear of the buttons
-     on the right on both sides (about 330px of buttons and spacing); in a
+     on the right on both sides (including the labelled Artifacts toggle); in a
      narrow window it shrinks, then gives way entirely. */
-  max-width: min(40%, calc(100% - 2 * 340px));
+  max-width: min(40%, calc(100% - 2 * 365px));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2325,7 +2427,7 @@ body:has(.overlay-root) {
 .titlebar-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
 }
 .titlebar-buttons {
   display: flex;
@@ -2416,11 +2518,7 @@ body:has(.overlay-root) {
   background: var(--surface);
   z-index: 2;
 }
-.session-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 4px 10px;
+.session-list-head {
   /* Pinned to the top of the sidebar while the chats scroll under it. On the
      desktop the search box is up in the title bar, so this is the first thing
      in the list; where the search box still heads the list, it pins below it. */
@@ -2428,9 +2526,74 @@ body:has(.overlay-root) {
   top: 0;
   background: var(--surface);
   z-index: 1;
+  border-bottom: 1px solid var(--border);
 }
-.session-search + .session-toolbar {
+.session-search + .session-list-head {
   top: 51px;
+}
+.session-primary-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 6px;
+}
+.session-new-chat {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.session-new-folder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 10px;
+  font-size: var(--fs-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  white-space: nowrap;
+}
+.session-new-folder:hover {
+  border-color: var(--accent);
+}
+.session-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px 6px;
+}
+.session-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.session-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+}
+.session-refresh-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.session-select-btn {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+.session-select-btn:hover {
+  color: var(--text);
 }
 
 /* --- Chat folders (Round-2 item 15) --- */
@@ -2680,19 +2843,47 @@ body:has(.overlay-root) {
 .artifacts-list {
   padding: 0 6px;
 }
-/* The count on the title-bar button while the pane is shut. */
+/* Desktop labelled pill toggle for the Artifacts drawer. */
+.titlebar button.titlebar-artifacts {
+  height: 28px;
+  padding: 0 10px;
+  gap: 5px;
+  margin-left: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+.titlebar button.titlebar-artifacts:hover,
+.titlebar button.titlebar-artifacts.active,
+.titlebar button.titlebar-artifacts.artifacts-unseen {
+  border-color: var(--accent);
+}
+.titlebar-artifacts-sep {
+  color: var(--text-muted);
+}
+/* The count on the title-bar button. */
 .titlebar-count {
   font-size: var(--fs-xs);
   color: var(--text-muted);
+  font-weight: 500;
 }
-/* Something new was made while the drawer was shut: the button turns red until
-   the drawer has been opened. */
-.titlebar button.artifacts-unseen,
+.titlebar-unseen-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+/* Something new was made while the drawer was shut: highlight with the theme
+   accent rather than the error/danger color. */
+.titlebar button.titlebar-artifacts.artifacts-unseen .titlebar-count {
+  color: var(--accent);
+}
 .main-header-actions button.artifacts-unseen {
-  color: var(--danger);
-}
-.titlebar button.artifacts-unseen .titlebar-count {
-  color: inherit;
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .artifacts-close {
   padding: 0 6px;
@@ -4415,14 +4606,15 @@ button.link {
 }
 
 [data-theme-style='cli'] .titlebar,
-[data-theme-style='cli'] .chat-header,
 [data-theme-style='cli'] .session-search,
+[data-theme-style='cli'] .session-list-head,
 [data-theme-style='cli'] .code-block-head,
 [data-theme-style='cli'] .viz-card-head {
   border-bottom-style: dashed;
 }
 
 [data-theme-style='cli'] .overlay-run-footer,
+[data-theme-style='cli'] .composer-footer,
 [data-theme-style='cli'] .session-selection-bar,
 [data-theme-style='cli'] .find-bar {
   border-top-style: dashed;
@@ -4489,7 +4681,7 @@ button.link {
   margin-left: 0.15em;
 }
 
-[data-theme-style='cli'] .composer textarea:focus,
+[data-theme-style='cli'] .composer-box:focus-within,
 [data-theme-style='cli'] .field :is(input, select, textarea):focus {
   outline: none;
   border-color: var(--accent);

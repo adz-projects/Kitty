@@ -19,6 +19,7 @@ import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { ExportIcon } from '@/components/icons/ExportIcon';
 import { MenuIcon } from '@/components/icons/MenuIcon';
+import { ArtifactsPanelIcon } from '@/components/icons/ArtifactsPanelIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['backend_down'];
@@ -171,15 +172,21 @@ export function ChatWorkspace({
           <SettingsGearIcon />
         </button>
       )}
-      <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
-        <NewChatIcon />
-      </button>
-      {/* Desktop: the artifacts drawer opens and closes with this button,
-          last in the row so it sits on the side the drawer opens on. It is
-          red while something new is waiting in it. */}
+      {/* Android keeps New chat in the top bar (the chat list lives inside
+          the swipe-out drawer). On desktop, New chat lives at the top of the
+          sidebar right beside New folder (`SessionList`). */}
+      {android && (
+        <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
+          <NewChatIcon />
+        </button>
+      )}
+      {/* Desktop: clearly labelled pill toggle for the artifacts drawer,
+          last in the row so it sits on the side the drawer opens on. Shows
+          an accent dot while something new is waiting in it. */}
       {!android && (
         <button
-          className={unseen ? 'artifacts-unseen' : undefined}
+          data-artifacts-toggle
+          className={`titlebar-artifacts${artifactsShown ? ' active' : ''}${unseen ? ' artifacts-unseen' : ''}`}
           onClick={toggleArtifacts}
           title={
             artifactsShown
@@ -197,11 +204,17 @@ export function ChatWorkspace({
           }
           aria-pressed={artifactsShown}
         >
-          <MenuIcon size={16} />
-          {/* With the drawer shut, the button says how much is behind it. */}
-          {!artifactsShown && artifactCount > 0 && (
-            <span className="titlebar-count">{artifactCount}</span>
+          <ArtifactsPanelIcon size={14} />
+          <span>Artifacts</span>
+          {artifactCount > 0 && (
+            <>
+              <span className="titlebar-artifacts-sep" aria-hidden="true">
+                ·
+              </span>
+              <span className="titlebar-count">{artifactCount}</span>
+            </>
           )}
+          {unseen && <span className="titlebar-unseen-dot" aria-hidden="true" />}
         </button>
       )}
     </div>

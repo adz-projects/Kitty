@@ -173,7 +173,7 @@ export function ChatView({ headerSlot }: { headerSlot?: HTMLElement | null } = {
                 </span>
               </AllowedDirsPopover>
             )}
-            <ChatHeaderControls menu={headerSlot === undefined} />
+            {headerSlot !== undefined && <ChatHeaderControls menu={false} />}
           </div>
         )}
 
@@ -364,6 +364,9 @@ export function ChatView({ headerSlot }: { headerSlot?: HTMLElement | null } = {
         concluded={sessionConcluded}
         sendBlocked={starting}
         spectating={spectating}
+        footerControls={
+          !isAndroid() && headerSlot === undefined ? <ChatHeaderControls /> : undefined
+        }
       />
     </div>
   );

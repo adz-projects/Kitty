@@ -6,7 +6,7 @@
     the way the dots did. Settles when the answer text starts rendering. */
 export type ProgressStage = 'connecting' | 'thinking' | 'formulating';
 
-const LABELS: Record<ProgressStage, string> = {
+export const PROGRESS_LABELS: Record<ProgressStage, string> = {
   connecting: 'Connecting to the server',
   thinking: 'Provider is thinking',
   formulating: 'Formulating a response',
@@ -14,8 +14,11 @@ const LABELS: Record<ProgressStage, string> = {
 
 export function ThinkingIndicator({ stage }: { stage: ProgressStage }) {
   return (
-    <span className="progress-indicator" role="status" aria-label={LABELS[stage]}>
-      <span className="progress-pulse">{LABELS[stage]}…</span>
-    </span>
+    <div className="msg msg-assistant">
+      <span className="progress-indicator" role="status" aria-label={PROGRESS_LABELS[stage]}>
+        <span className="progress-dot" aria-hidden="true" />
+        <span className="progress-pulse">{PROGRESS_LABELS[stage]}…</span>
+      </span>
+    </div>
   );
 }

@@ -31,7 +31,8 @@ const NO_ENTRIES: FileEntry[] = [];
     every IDLE_POLL_INTERVAL_MS and whenever the window regains focus.
 
     Desktop: a drawer over the window's right edge (absolutely positioned, so
-    the conversation never moves); closes by the title-bar button, ✕ or Escape.
+    the conversation never moves); closes by the title-bar button, ✕, Escape,
+    or clicking outside the drawer.
     Android: a bottom sheet that slides up on mount and closes by ✕, the scrim,
     Back, or a swipe down. Every one of those animates out first and only then
     calls `onClose`, which unmounts it. A swipe on the list only moves the sheet
@@ -81,6 +82,24 @@ export function ArtifactsPane({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     if (android) return;
     return registerEscapeLayer(() => onCloseRef.current());
+  }, [android]);
+
+  // Desktop: clicking outside the drawer closes it. Ignores clicks on the
+  // title-bar toggle (whose own onClick toggles it, preventing close-then-
+  // reopen) and on the right-click context menu (portaled outside this aside).
+  useEffect(() => {
+    if (android) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (sheetRef.current?.contains(target)) return;
+      if (target instanceof Element && target.closest('[data-artifacts-toggle], .context-menu')) {
+        return;
+      }
+      onCloseRef.current();
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
   }, [android]);
 
   // Animate out, then unmount. The timeout backs up `transitionend`, which

@@ -29,6 +29,7 @@ import { useContextMenu } from '@/components/shared/ContextMenu';
 import { SessionSelectionBar } from './SessionSelectionBar';
 import type { SessionSummary } from '@/lib/types';
 import { FolderIcon } from '@/components/icons/FolderIcon';
+import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { RefreshIcon } from '@/components/icons/RefreshIcon';
 import { PencilIcon } from '@/components/icons/PencilIcon';
 import { TrashIcon } from '@/components/icons/TrashIcon';
@@ -83,6 +84,7 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
   const sessions = useSessionStore((s) => s.sessions);
   const assignments = useSessionStore((s) => s.assignments);
   const activeId = useChatStore((s) => s.sessionId);
+  const newSession = useChatStore((s) => s.newSession);
 
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
@@ -413,9 +415,13 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
         placeholder="Search chats"
         onChange={(e) => onSearchChange(e.target.value)}
       />
-      <button title="Refresh" aria-label="Refresh" onClick={() => void refresh()}>
-        <RefreshIcon />
-      </button>
+      {/* On desktop when search is portaled into the title bar, Refresh lives
+          in the sidebar toolbar beside Select so the titlebar stays clean. */}
+      {!searchSlot && (
+        <button title="Refresh" aria-label="Refresh" onClick={() => void refresh()}>
+          <RefreshIcon />
+        </button>
+      )}
     </div>
   );
 
@@ -424,35 +430,65 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
       {/* Desktop: the search box lives in the window's title bar, above this
           list. Elsewhere it heads the list. */}
       {searchSlot ? createPortal(search, searchSlot) : search}
-      <div className="session-toolbar">
-        <span className="muted" style={{ fontSize: 13 }}>
-          {query.trim()
-            ? searching
-              ? 'Searching…'
-              : `${total} match${total === 1 ? '' : 'es'}`
-            : `${storeTotal || total} chat${(storeTotal || total) === 1 ? '' : 's'}`}
-        </span>
-        {/* Desktop's way into bulk select (Android long-presses a row). */}
-        {!isAndroid() && total > 0 && (
-          <button
-            className="link"
-            onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
-          >
-            {selectionMode ? 'Done' : 'Select'}
-          </button>
-        )}
-        {/* Folders foregone on Android for now — no way to create one there. */}
+      <div className="session-list-head">
+        {/* Desktop primary creation row: New chat sits beside New folder right
+            above the chat list it populates. */}
         {!isAndroid() && (
-          <button
-            className="link"
-            onClick={() => {
-              setNewFolderName('');
-              setCreatingFolder(true);
-            }}
-          >
-            ＋ Folder
-          </button>
+          <div className="session-primary-actions">
+            <button
+              className="primary session-new-chat"
+              onClick={() => void newSession()}
+              title="New chat"
+              aria-label="New chat"
+            >
+              <NewChatIcon />
+              <span>New chat</span>
+            </button>
+            <button
+              className="session-new-folder"
+              title="New folder"
+              aria-label="New folder"
+              onClick={() => {
+                setNewFolderName('');
+                setCreatingFolder(true);
+              }}
+            >
+              <FolderIcon variant="plus" />
+              <span>Folder</span>
+            </button>
+          </div>
         )}
+        <div className="session-toolbar">
+          <span className="muted" style={{ fontSize: 13 }}>
+            {query.trim()
+              ? searching
+                ? 'Searching…'
+                : `${total} match${total === 1 ? '' : 'es'}`
+              : `${storeTotal || total} chat${(storeTotal || total) === 1 ? '' : 's'}`}
+          </span>
+          {!isAndroid() && (
+            <div className="session-toolbar-actions">
+              {searchSlot && (
+                <button
+                  className="session-refresh-btn"
+                  title="Refresh chats"
+                  aria-label="Refresh chats"
+                  onClick={() => void refresh()}
+                >
+                  <RefreshIcon />
+                </button>
+              )}
+              {total > 0 && (
+                <button
+                  className="link session-select-btn"
+                  onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+                >
+                  {selectionMode ? 'Done' : 'Select'}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* `loadError` covers both a failed refresh and a failed delete. It was

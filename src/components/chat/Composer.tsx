@@ -1,6 +1,6 @@
 import { DEFAULT_RESEARCH_TURNS, parseResearchCommand } from '@/lib/research';
 import { DEFAULT_TIDY_TEXT, parseTidyCommand } from '@/lib/tidy';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { hasSomethingToSend, useChatStore } from '@/stores/chatStore';
 import { parseCritiqueCommand, parseDebateCommand } from '@/stores/chat/messageUtils';
 import { pastedFileKind, readAsDataUrl } from '@/lib/pasteFiles';
@@ -47,6 +47,7 @@ export function Composer({
   concluded,
   sendBlocked,
   spectating,
+  footerControls,
 }: {
   onSend: (
     text: string,
@@ -71,6 +72,9 @@ export function Composer({
       (unlike `disabled`, which implies a response is actively streaming) —
       used while the stack is still warming up at startup. */
   sendBlocked?: boolean;
+  /** Optional per-session controls anchored inside the composer footer on
+      desktop (model picker, reasoning effort, overflow menu). */
+  footerControls?: ReactNode;
 }) {
   // One flag for "input is closed", so a new reason cannot be added to the
   // placeholder and forgotten on the three `disabled` attributes below.
@@ -305,129 +309,142 @@ ${prefill}`
           keep or clear if you like. You approve the list, and nothing is read without your say-so.
         </div>
       )}
-      <button
-        className="composer-attach"
-        onClick={() => void attachFiles()}
-        title="Attach files"
-        aria-label="Attach files"
-        disabled={readOnly}
-      >
-        <UploadIcon />
-      </button>
-      {/* Region capture is a Win32 GDI screen grab driven by a
-          transparent always-on-top selection window — `commands::screenshot`
-          is `#[cfg(windows)]` and the window it needs cannot exist on
-          Android, so the button could only ever fail.
-          Also hidden when the active model can't see images: the button used
-          to be always-on and answer a click with "the active model doesn't
-          support images", which is a worse way to say the same thing than not
-          offering it. `canAttachImages` honors the provider's manual override,
-          so a vision model the name patterns don't recognize still gets it. */}
-      {!isAndroid() && canAttachImages && (
-        <button
-          className="composer-attach"
-          onClick={() => void captureScreenshot()}
-          title="Capture a screenshot region"
-          aria-label="Capture a screenshot region"
+      <div className="composer-box">
+        <textarea
           disabled={readOnly}
-        >
-          <CameraIcon />
-        </button>
-      )}
-      <textarea
-        disabled={readOnly}
-        ref={ref}
-        rows={1}
-        autoFocus
-        value={text}
-        placeholder={
-          spectating
-            ? `Watching ${spectating} — you can't reply to a specialist.`
-            : concluded
-              ? 'Chat concluded.'
-              : DEFAULT_PLACEHOLDER
-        }
-        role="combobox"
-        aria-expanded={slashOpen}
-        aria-autocomplete="list"
-        onChange={(e) => {
-          setText(e.target.value);
-          setSlashIndex(0);
-          // Resize is coalesced into a rAF (see scheduleResize) so typing never
-          // forces a synchronous reflow on the keystroke path.
-          scheduleResize();
-        }}
-        onKeyDown={(e) => {
-          // The command menu, while open, takes the arrows, Tab and Enter.
-          // Enter completes a partly typed command; on a finished one (an
-          // exact `/compact`) it falls through and acts as usual.
-          if (slashOpen) {
-            const n = slashSuggestions.length;
-            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          ref={ref}
+          rows={1}
+          autoFocus
+          value={text}
+          placeholder={
+            spectating
+              ? `Watching ${spectating} — you can't reply to a specialist.`
+              : concluded
+                ? 'Chat concluded.'
+                : DEFAULT_PLACEHOLDER
+          }
+          role="combobox"
+          aria-expanded={slashOpen}
+          aria-autocomplete="list"
+          onChange={(e) => {
+            setText(e.target.value);
+            setSlashIndex(0);
+            // Resize is coalesced into a rAF (see scheduleResize) so typing never
+            // forces a synchronous reflow on the keystroke path.
+            scheduleResize();
+          }}
+          onKeyDown={(e) => {
+            // The command menu, while open, takes the arrows, Tab and Enter.
+            // Enter completes a partly typed command; on a finished one (an
+            // exact `/compact`) it falls through and acts as usual.
+            if (slashOpen) {
+              const n = slashSuggestions.length;
+              if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSlashIndex((slashActive + (e.key === 'ArrowDown' ? 1 : n - 1)) % n);
+                return;
+              }
+              if (
+                e.key === 'Tab' ||
+                (e.key === 'Enter' && !e.shiftKey && !isExactSlashCommand(text))
+              ) {
+                e.preventDefault();
+                chooseSlash(slashSuggestions[slashActive]);
+                return;
+              }
+            }
+            // Enter sends on desktop (Shift+Enter for a newline). On Android the
+            // on-screen keyboard's Return key should start a new paragraph like
+            // any other text field — there's no Shift chord on a touch keyboard —
+            // so Enter falls through to the textarea's default newline and the
+            // Send button is the only way to submit.
+            if (!isAndroid() && e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
-              setSlashIndex((slashActive + (e.key === 'ArrowDown' ? 1 : n - 1)) % n);
+              submit();
+            }
+          }}
+          onPaste={(e) => {
+            const files = Array.from(e.clipboardData.files);
+            if (files.length > 0) {
+              e.preventDefault();
+              void attachPastedFiles(files);
               return;
             }
-            if (
-              e.key === 'Tab' ||
-              (e.key === 'Enter' && !e.shiftKey && !isExactSlashCommand(text))
-            ) {
+            const pasted = e.clipboardData.getData('text');
+            if (pasted.length > PASTE_THRESHOLD) {
               e.preventDefault();
-              chooseSlash(slashSuggestions[slashActive]);
-              return;
+              addPastedText(pasted);
             }
-          }
-          // Enter sends on desktop (Shift+Enter for a newline). On Android the
-          // on-screen keyboard's Return key should start a new paragraph like
-          // any other text field — there's no Shift chord on a touch keyboard —
-          // so Enter falls through to the textarea's default newline and the
-          // Send button is the only way to submit.
-          if (!isAndroid() && e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-        onPaste={(e) => {
-          const files = Array.from(e.clipboardData.files);
-          if (files.length > 0) {
-            e.preventDefault();
-            void attachPastedFiles(files);
-            return;
-          }
-          const pasted = e.clipboardData.getData('text');
-          if (pasted.length > PASTE_THRESHOLD) {
-            e.preventDefault();
-            addPastedText(pasted);
-          }
-        }}
-      />
-      {disabled ? (
-        stopPhase === 'forceable' ? (
-          <button
-            className="force-stop"
-            onClick={forceStop}
-            title="Force stop — reset now (Kitty may still be finishing in the background)"
-          >
-            Force stop
-          </button>
-        ) : stopPhase === 'stopping' ? (
-          <button disabled title="Waiting for Kitty to stop…">
-            Stopping…
-          </button>
-        ) : (
-          <button onClick={onStop} title="Stop the current response">
-            Stop
-          </button>
-        )
-      ) : (
-        <button
-          className="primary"
-          onClick={submit}
-          disabled={(!text.trim() && !hasAttachments) || readOnly || sendBlocked}
-        >
-          Send
-        </button>
-      )}
+          }}
+        />
+        <div className="composer-footer">
+          <div className="composer-footer-left">
+            <button
+              className="composer-attach"
+              onClick={() => void attachFiles()}
+              title="Attach files"
+              aria-label="Attach files"
+              disabled={readOnly}
+            >
+              <UploadIcon />
+            </button>
+            {/* Region capture is a Win32 GDI screen grab driven by a
+                transparent always-on-top selection window — `commands::screenshot`
+                is `#[cfg(windows)]` and the window it needs cannot exist on
+                Android, so the button could only ever fail.
+                Also hidden when the active model can't see images: the button used
+                to be always-on and answer a click with "the active model doesn't
+                support images", which is a worse way to say the same thing than not
+                offering it. `canAttachImages` honors the provider's manual override,
+                so a vision model the name patterns don't recognize still gets it. */}
+            {!isAndroid() && canAttachImages && (
+              <button
+                className="composer-attach"
+                onClick={() => void captureScreenshot()}
+                title="Capture a screenshot region"
+                aria-label="Capture a screenshot region"
+                disabled={readOnly}
+              >
+                <CameraIcon />
+              </button>
+            )}
+          </div>
+          <div className="composer-footer-right">
+            {footerControls}
+            {disabled ? (
+              stopPhase === 'forceable' ? (
+                <button
+                  className="composer-submit force-stop"
+                  onClick={forceStop}
+                  title="Force stop — reset now (Kitty may still be finishing in the background)"
+                >
+                  Force stop
+                </button>
+              ) : stopPhase === 'stopping' ? (
+                <button className="composer-submit" disabled title="Waiting for Kitty to stop…">
+                  Stopping…
+                </button>
+              ) : (
+                <button
+                  className="composer-submit"
+                  onClick={onStop}
+                  title="Stop the current response"
+                >
+                  Stop
+                </button>
+              )
+            ) : (
+              <button
+                className="primary composer-submit"
+                onClick={submit}
+                disabled={(!text.trim() && !hasAttachments) || readOnly || sendBlocked}
+              >
+                Send
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

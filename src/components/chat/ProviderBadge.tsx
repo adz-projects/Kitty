@@ -136,11 +136,7 @@ export function ProviderBadge() {
       )}
       {branchFlow.gate}
       {(switchError ?? branchFlow.error) && (
-        <div
-          className="chat-error"
-          role="alert"
-          style={{ position: 'absolute', top: '100%', right: 0, zIndex: 20 }}
-        >
+        <div className="chat-error provider-switch-error" role="alert">
           {switchError ?? branchFlow.error}{' '}
           <button
             className="link"

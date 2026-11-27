@@ -8,6 +8,7 @@ import {
 import { useMobileUiStore } from '@/stores/mobileUiStore';
 import { isAndroid } from '@/lib/platform';
 import { ThinkingBox } from './ThinkingBox';
+import type { ProgressStage } from './ThinkingIndicator';
 import { PreviousAttemptBox } from './PreviousAttemptBox';
 import { MessageActions } from './MessageActions';
 import { MessageAttachmentChips } from './MessageAttachmentChips';
@@ -19,6 +20,18 @@ import { OutputCards } from './OutputCards';
     actions: links, buttons (code-block copy, the Thinking toggle, the actions
     themselves), and interactive cards. */
 const TAP_IGNORE = 'a, button, input, textarea, select, summary, label, .viz-card, .msg-actions';
+
+/** True when this message renders a `ThinkingBox` that can absorb the live
+    `ProgressStage` indicator (preventing a duplicate floating status line). */
+export function messageHasThinkingBox(message: Message): boolean {
+  if (message.role !== 'assistant' || message.superseded) return false;
+  return Boolean(
+    message.reasoning ||
+    message.draftText ||
+    message.memoryRecall ||
+    message.toolCalls.some((c) => !isVisualizationToolCall(c))
+  );
+}
 
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Actions
@@ -33,9 +46,11 @@ const TAP_IGNORE = 'a, button, input, textarea, select, summary, label, .viz-car
 export const MessageItem = memo(function MessageItem({
   message,
   index,
+  progressStage,
 }: {
   message: Message;
   index: number;
+  progressStage?: ProgressStage | null;
 }) {
   const toggleReveal = useMobileUiStore((s) => s.toggleRevealMessage);
 
@@ -111,6 +126,7 @@ export const MessageItem = memo(function MessageItem({
           streaming={message.streaming}
           hasAnswer={message.text.length > 0}
           draft={message.draftText}
+          progressStage={progressStage}
         />
       )}
       {vizCalls.map((call) => (
