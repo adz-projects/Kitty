@@ -347,6 +347,75 @@ pub fn extract_excel_text(resolved: &Path) -> Result<String, String> {
     Ok(out)
 }
 
+/// A cell as a reader sees it: integral numbers without `.0`, dates without a
+/// midnight time, booleans as TRUE/FALSE, errors as `#ERROR`.
+fn cell_display(d: &Data) -> String {
+    match d {
+        Data::Empty => String::new(),
+        Data::String(s) => s.clone(),
+        Data::Int(i) => i.to_string(),
+        Data::Float(f) => float_to_display(*f),
+        Data::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Data::DateTime(dt) => dt
+            .as_datetime()
+            .map(|ndt| {
+                if ndt.format("%H:%M:%S").to_string() == "00:00:00" {
+                    ndt.format("%Y-%m-%d").to_string()
+                } else {
+                    ndt.format("%Y-%m-%d %H:%M").to_string()
+                }
+            })
+            .unwrap_or_default(),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
+        Data::Error(_) => "#ERROR".to_string(),
+    }
+}
+
+/// A sheet's name and its rows of cell text.
+pub type SheetRows = (String, Vec<Vec<String>>);
+
+/// Every non-empty sheet as `(name, rows of cell text)`, with empty trailing
+/// rows and columns trimmed. Additive, for Bacon's importer (sheets as
+/// tables). Honors the same file-size cap as the tools.
+pub fn extract_excel_sheets(resolved: &Path) -> Result<Vec<SheetRows>, String> {
+    if let Some(len) = stat_len(resolved) {
+        if len > EXCEL_MAX_FILE_BYTES {
+            return Err(format!(
+                "spreadsheet exceeds the {EXCEL_MAX_FILE_BYTES} byte read limit"
+            ));
+        }
+    }
+    let mut wb = open(resolved)?;
+    let names = wb.sheet_names().to_vec();
+    let mut out = Vec::new();
+    for (idx, name) in names.iter().enumerate() {
+        let range: Range<Data> = match wb.worksheet_range_at(idx) {
+            Some(Ok(r)) => r,
+            _ => continue,
+        };
+        let mut rows: Vec<Vec<String>> = range
+            .rows()
+            .map(|row| {
+                let mut cells: Vec<String> = row.iter().map(cell_display).collect();
+                while cells.last().is_some_and(|c| c.trim().is_empty()) {
+                    cells.pop();
+                }
+                cells
+            })
+            .collect();
+        while rows.last().is_some_and(|r| r.is_empty()) {
+            rows.pop();
+        }
+        while rows.first().is_some_and(|r| r.is_empty()) {
+            rows.remove(0);
+        }
+        if !rows.is_empty() {
+            out.push((name.clone(), rows));
+        }
+    }
+    Ok(out)
+}
+
 /// `output_format` is `"json"` (default) or `"csv"`.
 pub fn excel_read_rows(
     path: &str,

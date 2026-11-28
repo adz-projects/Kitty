@@ -5,6 +5,7 @@ pub mod excel;
 pub mod fs;
 pub mod image;
 pub mod pdf;
+pub mod pdf_layout;
 pub mod viz;
 
 use std::path::PathBuf;

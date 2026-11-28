@@ -51,6 +51,31 @@ pub fn render_pdf_pages(
 /// outcome with a single failure rather than an error, so the caller treats
 /// "unreadable" uniformly with "a page failed".
 pub fn render_pdf_bytes(bytes: &[u8], scale: f32, max_pages: usize) -> RenderOutcome {
+    render_selected(bytes, scale, |total| {
+        (1..=total.min(max_pages) as u32).collect()
+    })
+}
+
+/// Render exactly the listed 1-based pages (in the order given, duplicates and
+/// pages past the end skipped). For vision reading, which needs the scanned
+/// pages wherever they are, not the first N.
+pub fn render_pdf_page_list(bytes: &[u8], scale: f32, pages: &[u32]) -> RenderOutcome {
+    let wanted = pages.to_vec();
+    render_selected(bytes, scale, move |total| {
+        let mut seen = std::collections::HashSet::new();
+        wanted
+            .iter()
+            .copied()
+            .filter(|p| *p >= 1 && (*p as usize) <= total && seen.insert(*p))
+            .collect()
+    })
+}
+
+fn render_selected(
+    bytes: &[u8],
+    scale: f32,
+    pick: impl FnOnce(usize) -> Vec<u32>,
+) -> RenderOutcome {
     let pdf = match Pdf::new(bytes.to_vec()) {
         Ok(pdf) => pdf,
         Err(e) => {
@@ -64,10 +89,9 @@ pub fn render_pdf_bytes(bytes: &[u8], scale: f32, max_pages: usize) -> RenderOut
         }
     };
     let total = pdf.pages().len();
-    let count = total.min(max_pages);
     let mut outcome = RenderOutcome::default();
-    for idx in 0..count {
-        let page_no = idx as u32 + 1;
+    for page_no in pick(total) {
+        let idx = page_no as usize - 1;
         let rendered = catch_unwind(AssertUnwindSafe(|| {
             render_pdf(
                 &pdf,

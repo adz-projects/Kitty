@@ -96,6 +96,56 @@ pub fn read_image(path: &str) -> Result<(String, String, String), String> {
     Ok((data, mime.to_string(), note))
 }
 
+/// Make an image fit to send to a vision model: PNG, JPEG, GIF or WebP that
+/// is already within `max_dim` pixels and 2.5 MB passes through unchanged;
+/// anything larger (or a BMP) is decoded, scaled to fit `max_dim` on its long
+/// side, and re-encoded as JPEG. Returns `(mime type, bytes)`. Additive, for
+/// Bacon's image sources.
+pub fn prepare_for_vision(bytes: &[u8], max_dim: u32) -> Result<(String, Vec<u8>), String> {
+    let format = image::guess_format(bytes).map_err(|_| "not a recognised image".to_string())?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => "",
+    };
+    let dims = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok());
+    let small = bytes.len() as u64 <= MAX_IMAGE_BYTES && dims.is_none_or_fits(max_dim);
+    if !mime.is_empty() && small {
+        return Ok((mime.to_string(), bytes.to_vec()));
+    }
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| format!("could not decode the image to resize it: {e}"))?;
+    let img = if img.width().max(img.height()) > max_dim {
+        img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgb = img.to_rgb8();
+    let mut out = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+    enc.encode_image(&rgb)
+        .map_err(|e| format!("could not re-encode the image: {e}"))?;
+    Ok(("image/jpeg".to_string(), out))
+}
+
+trait FitsWithin {
+    fn is_none_or_fits(&self, max_dim: u32) -> bool;
+}
+
+impl FitsWithin for Option<(u32, u32)> {
+    fn is_none_or_fits(&self, max_dim: u32) -> bool {
+        match self {
+            Some((w, h)) => (*w).max(*h) <= max_dim,
+            None => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

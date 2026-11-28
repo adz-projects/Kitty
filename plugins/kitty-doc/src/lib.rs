@@ -16,6 +16,8 @@ pub mod doc_store;
 pub mod docx;
 pub mod envelope;
 pub mod extract;
+pub mod markdown;
+pub mod office;
 pub mod paths;
 #[cfg(feature = "pdf-render")]
 pub mod pdf_render;

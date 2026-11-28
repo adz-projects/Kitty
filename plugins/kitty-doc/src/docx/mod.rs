@@ -1,3 +1,4 @@
+pub mod markdown;
 pub mod read;
 pub mod styles;
 pub mod write;
@@ -61,7 +62,10 @@ pub fn read_paragraphs(path: &Path) -> Result<Vec<ParagraphInfo>, DocxError> {
     Ok(read::extract_paragraphs(&document_xml, &style_names))
 }
 
-fn read_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_zip_entry(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+) -> Option<Vec<u8>> {
     let file = archive.by_name(name).ok()?;
     let mut buf = Vec::new();
     // Cap decompression (`take` + explicit size check) so a bombed entry is

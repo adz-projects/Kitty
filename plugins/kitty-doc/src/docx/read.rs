@@ -269,6 +269,17 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                     }
                 }
             }
+            // `&amp;`, `&lt;` and character references arrive as their own
+            // events (quick-xml >= 0.38); ignoring them dropped every `&`.
+            Ok(Event::GeneralRef(r)) => {
+                if fallback_depth.is_none() && in_t && ruby_depth == 0 {
+                    if let (Some(p), Some(s)) =
+                        (current.as_mut(), crate::markdown::xml::resolve_ref(&r))
+                    {
+                        p.text.push_str(&s);
+                    }
+                }
+            }
             Ok(Event::End(e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref());
@@ -433,6 +444,13 @@ mod tests {
             doc(r#"<w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>"#);
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         assert_eq!(paras[0].text, "a\tb\nc");
+    }
+
+    #[test]
+    fn entity_references_are_kept() {
+        let xml = doc(r#"<w:p><w:r><w:t>Tom &amp; Jerry &lt;3&#33;</w:t></w:r></w:p>"#);
+        let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
+        assert_eq!(paras[0].text, "Tom & Jerry <3!");
     }
 
     #[test]

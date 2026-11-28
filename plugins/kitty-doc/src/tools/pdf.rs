@@ -45,7 +45,7 @@ const PDF_MAX_PAGE_CHARS: usize = 50_000;
 /// Hard cap on the PDF file size, checked before `lopdf::Document::load`
 /// (audit #120): `load` reads the whole file into memory, so a giant file
 /// must be rejected at the door. Same pattern as `fs.rs`'s `MAX_FILE_BYTES`.
-const PDF_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const PDF_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// The extractor-version salt for `doc_store` ids (see `doc_store::id_for`).
 /// Bump it whenever a change to extraction should replace records already on
 /// disk — the lopdf-era records were blank, and must never be served again.
@@ -61,7 +61,7 @@ const NOTE_IMAGE_ONLY: &str =
 const NOTE_FAILED: &str = "[This page has text that could not be extracted — its font carries no \
      usable character mapping. It is not an image.]";
 
-fn open(path: &Path) -> Result<Document, lopdf::Error> {
+pub(crate) fn open(path: &Path) -> Result<Document, lopdf::Error> {
     // lopdf 0.42 decrypts during `load` whenever the empty user password
     // opens the file — the owner-password-only, permissions-restricted PDFs
     // that every viewer opens without a prompt, and that 0.34 made this tool
@@ -587,6 +587,24 @@ pub fn extract_pdf_pages(resolved: &Path) -> Result<Vec<(u32, String)>, String> 
         .into_iter()
         .enumerate()
         .map(|(i, text)| (i as u32 + 1, text))
+        .collect())
+}
+
+/// The PDF's outline (bookmarks) as `(level, title, page)`, 1-based levels
+/// and pages, from the same extract-once cache. Empty when it has none.
+/// Additive, for Bacon's source importer (headings from bookmarks).
+pub fn extract_pdf_outline(resolved: &Path) -> Result<Vec<(u32, String, u32)>, String> {
+    let doc = cached_pdf(resolved)?;
+    Ok(doc
+        .outline
+        .iter()
+        .filter_map(|o| {
+            Some((
+                o.get("level")?.as_u64()? as u32,
+                o.get("title")?.as_str()?.to_string(),
+                o.get("page")?.as_u64()? as u32,
+            ))
+        })
         .collect())
 }
 
