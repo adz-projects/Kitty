@@ -16,6 +16,7 @@ import {
   type SlashCommand,
 } from '@/lib/slashCommands';
 import { useEscapeLayer } from '@/hooks/useEscapeLayer';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
 const PASTE_THRESHOLD = 500;
@@ -88,6 +89,7 @@ export function Composer({
   const slashOpen = slashSuggestions.length > 0 && !readOnly;
   const slashActive = Math.min(slashIndex, Math.max(0, slashSuggestions.length - 1));
   useEscapeLayer(slashOpen, () => setSlashDismissedFor(text));
+  useBackDismiss(slashOpen, () => setSlashDismissedFor(text));
   const chooseSlash = (command: SlashCommand) => {
     setText(completeSlashCommand(command));
     setSlashIndex(0);
@@ -286,7 +288,8 @@ ${prefill}`
       {debating && (
         <div className="composer-hint" role="status">
           Debate: say who the personas are, how many rounds, and what the debate should examine.
-          Attach or link the item under debate. The panel is set in Settings → Specialists.
+          Attach or link the item under debate.
+          {!isAndroid() && ' The panel is set in Settings → Specialists.'}
         </div>
       )}
       {critiquing && (
@@ -314,7 +317,8 @@ ${prefill}`
           disabled={readOnly}
           ref={ref}
           rows={1}
-          autoFocus
+          autoFocus={!isAndroid()}
+          enterKeyHint={isAndroid() ? 'enter' : 'send'}
           value={text}
           placeholder={
             spectating

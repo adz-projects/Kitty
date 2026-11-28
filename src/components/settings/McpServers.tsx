@@ -628,8 +628,9 @@ function KittyToolsCard({
         />
       </div>
       <span className="muted ext-card-desc">
-        Lets the agent read, edit, and run things on your machine — files, shell commands, Word
-        docs.
+        {isAndroid()
+          ? 'Lets the agent read and edit chat files, Word docs, Excel sheets, and PDFs.'
+          : 'Lets the agent read, edit, and run things on your machine — files, shell commands, Word docs.'}
       </span>
       <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}

@@ -99,6 +99,15 @@ function PlainList({
     if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (stickToBottomRef.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [scrollRef]);
   const last = messages[messages.length - 1];
   const stageInLastTurn = Boolean(stage && last && messageHasThinkingBox(last));
   return (
@@ -154,6 +163,17 @@ function VirtualList({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (messages.length > 0 && stickToBottomRef.current) {
+        rv.scrollToIndex(messages.length - 1, { align: 'end' });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [scrollRef, rv, messages.length]);
 
   const last = messages[messages.length - 1];
   const stageInLastTurn = Boolean(stage && last && messageHasThinkingBox(last));

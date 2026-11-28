@@ -56,8 +56,15 @@ export function App() {
     const onVisible = () => {
       if (!document.hidden) void drainIncoming();
     };
+    const onIncoming = () => void drainIncoming();
     document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
+    window.addEventListener('kitty:incoming', onIncoming);
+    window.addEventListener('focus', onIncoming);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('kitty:incoming', onIncoming);
+      window.removeEventListener('focus', onIncoming);
+    };
   }, [android, stackOk]);
 
   // Android only: the soft keyboard shrinks the *visual* viewport without

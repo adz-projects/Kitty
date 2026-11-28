@@ -34,7 +34,7 @@ pub enum Incoming {
     },
     /// A notification about this chat was tapped.
     OpenChat {
-        #[serde(rename = "sessionId", alias = "session_id")]
+        #[serde(alias = "sessionId")]
         session_id: String,
     },
 }
@@ -80,5 +80,17 @@ mod tests {
             panic!()
         };
         assert_eq!(paths, &["/c/a.png"]);
+    }
+
+    #[test]
+    fn open_chat_serializes_session_id_in_snake_case_for_webview() {
+        let val = serde_json::to_value(Incoming::OpenChat {
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({ "kind": "open_chat", "session_id": "s1" })
+        );
     }
 }

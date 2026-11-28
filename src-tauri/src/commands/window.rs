@@ -200,3 +200,18 @@ pub async fn restart_backend(
         lifecycle::engine_restart::restart_now(&app, force.unwrap_or(false)).await
     }
 }
+
+/// Sync Android system status/navigation bar icon contrast with Kitty's active
+/// theme (`light` = dark icons on a light page). No-op on desktop.
+#[tauri::command]
+pub async fn set_system_bars_appearance(light: bool) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        tokio::task::spawn_blocking(move || crate::android::system_bars::set_appearance(light))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = light;
+    Ok(())
+}

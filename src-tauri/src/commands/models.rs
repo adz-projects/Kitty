@@ -403,11 +403,22 @@ mod foreground {
     #[cfg(target_os = "android")]
     use std::sync::atomic::Ordering;
 
-    /// Whether a session is currently open. Guards `progress` so a stray
-    /// progress event (an early failure that reports before the session
-    /// starts) can't start a service nothing will ever stop.
+    /// Number of downloads currently holding the foreground service open.
+    /// Refcounted (like `stream.rs::TurnSession`) so two concurrent downloads
+    /// keep `DownloadService` alive until the last one finishes.
     #[cfg(target_os = "android")]
-    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(target_os = "android")]
+    fn ask_for_notifications_once() {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if ASKED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::thread::spawn(|| {
+            crate::android::download_service::request_notification_permission();
+        });
+    }
 
     /// Starts the service on construction, stops it on drop — so every exit
     /// path out of `run_download`, including the early failures, tears it
@@ -422,13 +433,14 @@ mod foreground {
                 // Asked for here, at the first download, rather than at
                 // startup: a notification prompt before the user has done
                 // anything needing one is the kind everybody dismisses.
-                crate::android::download_service::request_notification_permission();
-                crate::android::download_service::start_or_update(
-                    &format!("Downloading {model}"),
-                    0,
-                    0,
-                );
-                ACTIVE.store(true, Ordering::SeqCst);
+                // Spawned off-thread so the async download worker never blocks
+                // waiting on the Android permission prompt.
+                ask_for_notifications_once();
+                ACTIVE.fetch_add(1, Ordering::SeqCst);
+                let title = format!("Downloading {model}");
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::android::download_service::start_or_update(&title, 0, 0);
+                });
             }
             Session
         }
@@ -438,8 +450,11 @@ mod foreground {
         fn drop(&mut self) {
             #[cfg(target_os = "android")]
             {
-                ACTIVE.store(false, Ordering::SeqCst);
-                crate::android::download_service::stop();
+                if ACTIVE.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    tauri::async_runtime::spawn_blocking(|| {
+                        crate::android::download_service::stop();
+                    });
+                }
             }
         }
     }
@@ -460,7 +475,7 @@ mod foreground {
     pub fn progress(model: &str, received: u64, total: Option<u64>) {
         #[cfg(target_os = "android")]
         {
-            if !ACTIVE.load(Ordering::SeqCst) {
+            if ACTIVE.load(Ordering::SeqCst) == 0 {
                 return;
             }
             let now = std::time::SystemTime::now()

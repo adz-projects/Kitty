@@ -224,6 +224,7 @@ pub fn run() {
             commands::get_startup_phase,
             commands::window_ready,
             commands::restart_backend,
+            commands::set_system_bars_appearance,
             commands::new_session,
             commands::bind_window_session,
             commands::set_app_foreground,
@@ -399,8 +400,13 @@ pub fn run() {
                 match handle.path().app_data_dir() {
                     Ok(dir) => {
                         config::init_app_dir(dir);
-                        let (reloaded, _) = config::load_with_recovery();
-                        *handle.state::<AppState>().config.lock().unwrap() = reloaded;
+                        let (reloaded, recovered) = config::load_with_recovery();
+                        let state = handle.state::<AppState>();
+                        *state.config.lock().unwrap() = reloaded;
+                        if let Some(p) = recovered {
+                            *state.config_recovered.lock().unwrap() =
+                                Some(p.to_string_lossy().into_owned());
+                        }
                     }
                     Err(e) => {
                         // Nothing below can write: config, the daemon's DB,

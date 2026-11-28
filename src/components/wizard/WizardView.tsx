@@ -104,6 +104,9 @@ export function WizardView() {
   // Repair is a detour from Settings, so there's always a way back (#63).
   const cancel = () => goto('settings', { section: 'advanced' });
   useBackDismiss(isAndroid() && repair, cancel);
+  useBackDismiss(isAndroid() && !repair && stepIndex > 0, () =>
+    setStepIndex((i) => Math.max(i - 1, 0))
+  );
 
   useEffect(() => {
     void ipc

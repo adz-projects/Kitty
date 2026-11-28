@@ -23,6 +23,8 @@ import {
   onSessionTitle,
 } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { relativeTime } from '@/lib/relativeTime';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import { useContextMenu } from '@/components/shared/ContextMenu';
@@ -136,7 +138,18 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
     setSelectionError(null);
   };
 
+  useBackDismiss(isAndroid() && selectionMode, exitSelectionMode);
+
   const deleteSelected = async () => {
+    const count = selectedIds.size;
+    if (count === 0) return;
+    const ok = await confirmDialog({
+      title: `Delete ${count} chat${count === 1 ? '' : 's'}?`,
+      message: 'This permanently deletes the selected chats and cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     setSelectionBusy(true);
     setSelectionError(null);
     try {
@@ -279,10 +292,16 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
         const dx = pos.x - st.startX;
         const dy = pos.y - st.startY;
         if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
-        // Real movement — this is a drag, not a long-press. Whichever
-        // pending long-press timer was armed for this pointer-down no longer
-        // applies.
+        // Real movement — this is a drag (desktop) or scroll (Android), not a
+        // long-press. Whichever pending long-press timer was armed for this
+        // pointer-down no longer applies.
         cancelLongPress();
+        // Android has no chat folders to drop onto; entering folder-drag mode
+        // there only dims the row under the user's thumb while scrolling.
+        if (isAndroid()) {
+          dragState.current = null;
+          return;
+        }
         st.dragging = true;
         setDragId(st.sessionId);
       }
@@ -297,19 +316,23 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
       if (raf == null) raf = requestAnimationFrame(processMove);
     };
 
-    const onUp = () => {
+    const resetInteraction = () => {
       if (raf != null) {
         cancelAnimationFrame(raf);
         raf = null;
       }
-      // A release before the long-press timer fires is just a tap (or the
-      // start of a real drag, already cancelled above) — either way, the
-      // pending long-press callback must not fire late.
       cancelLongPress();
       const st = dragState.current;
       dragState.current = null;
-      if (st?.dragging && dragOverFolderRef.current != null) {
-        const target = dragOverFolderRef.current;
+      setDragId(null);
+      setOverFolder(null);
+      return st;
+    };
+
+    const onUp = () => {
+      const target = dragOverFolderRef.current;
+      const st = resetInteraction();
+      if (st?.dragging && target != null) {
         void assignFolder(st.sessionId, target === '' ? null : target);
       } else if (st?.longPressFired && !st.dragging) {
         // Long press fired and the finger lifted without ever moving past
@@ -320,16 +343,20 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
         setSelectionMode(true);
         setSelectedIds(new Set([st.sessionId]));
       }
-      setDragId(null);
-      setOverFolder(null);
+    };
+
+    const onCancel = () => {
+      resetInteraction();
     };
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
     return () => {
       if (raf != null) cancelAnimationFrame(raf);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
     };
   }, [assignFolder]);
 
@@ -411,6 +438,8 @@ export function SessionList({ searchSlot = null }: { searchSlot?: HTMLElement | 
   const search = (
     <div className="session-search">
       <input
+        type="search"
+        enterKeyHint="search"
         value={searchInput}
         placeholder="Search chats"
         onChange={(e) => onSearchChange(e.target.value)}

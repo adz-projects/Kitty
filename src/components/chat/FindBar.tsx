@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { useFindStore } from '@/stores/findStore';
 import { findRanges, paintMatches, revealMatch } from '@/lib/findInPage';
 import { useChatStore } from '@/stores/chatStore';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
 
 /** Find in this chat (Ctrl+F): docked at the bottom of the chat, above the
     composer. Enter / Shift+Enter step through the matches, Escape closes.
@@ -19,6 +20,7 @@ export function FindBar() {
   const inputRef = useRef<HTMLInputElement>(null);
   const rangesRef = useRef<Range[]>([]);
   const currentRef = useRef(0);
+  useBackDismiss(open, close);
 
   const listEl = () => barRef.current?.closest('.chat')?.querySelector('.message-list') ?? null;
 

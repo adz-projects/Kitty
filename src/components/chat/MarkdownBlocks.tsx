@@ -1,4 +1,4 @@
-import { memo, useRef, type ReactNode } from 'react';
+import { memo, useRef, type ComponentPropsWithoutRef, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -33,10 +33,18 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
   );
 }
 
+function ScrollableTable(props: ComponentPropsWithoutRef<'table'>) {
+  return (
+    <div className="markdown-table-wrap">
+      <table {...props} />
+    </div>
+  );
+}
+
 // Module constants, not inline literals: a fresh array or object here would be
 // a new prop identity every render and would defeat `MarkdownBlock`'s memo
 // entirely, which is the whole point of splitting.
-export const MARKDOWN_COMPONENTS = { pre: CodeBlock, a: ExternalLink };
+export const MARKDOWN_COMPONENTS = { pre: CodeBlock, a: ExternalLink, table: ScrollableTable };
 export const REMARK_PLUGINS = [remarkGfm];
 export const REHYPE_PLUGINS = [rehypeHighlight];
 

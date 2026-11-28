@@ -78,8 +78,9 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
         let wants_memory = cfg.adaptive_pathway_enabled
             || (cfg.memorabilia_enabled && memory.memorabilia_supported);
         let memory_ok = !wants_memory || memory.model_installed;
-        let summarizer_ok =
-            !cfg.summarizer.enabled || crate::models::resolve(&cfg.summarizer.model).is_some();
+        let summarizer_ok = cfg!(target_os = "android")
+            || !cfg.summarizer.enabled
+            || crate::models::resolve(&cfg.summarizer.model).is_some();
         (
             active,
             cfg.adaptive_pathway_enabled,

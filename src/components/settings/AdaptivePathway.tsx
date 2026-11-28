@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc, onAdaptivePathwayEmbeddingStatus, onModelProgress } from '@/lib/ipc';
+import { isAndroid } from '@/lib/platform';
 import type { AdaptivePathwayMcpStatus, DownloadProgress, EmbeddingModelStatus } from '@/lib/types';
 import { defaultFor } from '@/lib/curated_models';
 import { BeliefBrowser } from './BeliefBrowser';
@@ -197,8 +198,9 @@ export function AdaptivePathway() {
             </button>
           </div>
           <p className="muted" style={{ margin: 0 }}>
-            Both Adaptive Pathway and Memorabilia share {embeddingModel || 'the embedding model'}.
-            Chat works without it; memory activates once downloaded.
+            {isAndroid()
+              ? `Adaptive Pathway uses ${embeddingModel || 'the embedding model'}. Chat works without it; memory activates once downloaded.`
+              : `Both Adaptive Pathway and Memorabilia share ${embeddingModel || 'the embedding model'}. Chat works without it; memory activates once downloaded.`}
           </p>
           {defaultFor('embedding')?.gated && (
             <div className="gated-token">
@@ -206,8 +208,11 @@ export function AdaptivePathway() {
                 Gemma-licensed: accept the license on the{' '}
                 <a
                   href={`https://huggingface.co/${defaultFor('embedding')?.repo ?? ''}`}
-                  target="_blank"
-                  rel="noreferrer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    const repo = defaultFor('embedding')?.repo ?? '';
+                    if (repo) void ipc.openUrl(`https://huggingface.co/${repo}`).catch(() => {});
+                  }}
                 >
                   model page
                 </a>{' '}

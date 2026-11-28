@@ -66,17 +66,16 @@ export function LearningModel() {
     draft.kind === 'provider' ? accounts.find((a) => a.id === draft.provider_id) : undefined;
   const incomplete = draft.kind === 'provider' && (!draft.provider_id || !draft.model);
   const dirty = !sameLearningModel(draft, saved);
-  const helperLabel = isAndroid()
-    ? "The chat's own model (no helper model on this device)"
-    : "Helper model, else the chat's own model";
+  const android = isAndroid();
+  const helperLabel = android ? "The chat's own model" : "Helper model, else the chat's own model";
 
   return (
     <>
       <div className="settings-subhead">
         <h2>Memory learning model</h2>
         <p className="muted">
-          What Adaptive Pathway and Memorabilia learn with. Applies to the next pass; if it fails,
-          learning falls back rather than stopping.
+          What {android ? 'Adaptive Pathway learns' : 'Adaptive Pathway and Memorabilia learn'}{' '}
+          with. Applies to the next pass; if it fails, learning falls back rather than stopping.
         </p>
       </div>
       {error && <div className="chat-error">{error}</div>}
@@ -85,22 +84,24 @@ export function LearningModel() {
           <input
             type="radio"
             name="learning-model"
-            checked={draft.kind === 'auto'}
+            checked={draft.kind === 'auto' || (android && draft.kind === 'chat')}
             disabled={busy}
             onChange={() => setKind('auto')}
           />
           <span>{helperLabel}</span>
         </label>
-        <label className="check">
-          <input
-            type="radio"
-            name="learning-model"
-            checked={draft.kind === 'chat'}
-            disabled={busy}
-            onChange={() => setKind('chat')}
-          />
-          <span>The chat&apos;s own model (keeps this computer&apos;s CPU and GPU free)</span>
-        </label>
+        {!android && (
+          <label className="check">
+            <input
+              type="radio"
+              name="learning-model"
+              checked={draft.kind === 'chat'}
+              disabled={busy}
+              onChange={() => setKind('chat')}
+            />
+            <span>The chat&apos;s own model (keeps this computer&apos;s CPU and GPU free)</span>
+          </label>
+        )}
         <label className="check">
           <input
             type="radio"

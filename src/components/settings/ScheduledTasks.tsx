@@ -328,24 +328,26 @@ export function ScheduledTasks() {
               placeholder="What should the agent do when this fires?"
             />
           </div>
-          <div className="field">
-            <span>Working directory (optional)</span>
-            <div className="row">
-              <input
-                value={form.cwd}
-                placeholder="Default folder if left blank"
-                onChange={(e) => setForm({ ...form, cwd: e.target.value })}
-              />
-              <button
-                onClick={async () => {
-                  const dir = await pickFolder();
-                  if (dir) setForm({ ...form, cwd: dir });
-                }}
-              >
-                Browse…
-              </button>
+          {!isAndroid() && (
+            <div className="field">
+              <span>Working directory (optional)</span>
+              <div className="row">
+                <input
+                  value={form.cwd}
+                  placeholder="Default folder if left blank"
+                  onChange={(e) => setForm({ ...form, cwd: e.target.value })}
+                />
+                <button
+                  onClick={async () => {
+                    const dir = await pickFolder();
+                    if (dir) setForm({ ...form, cwd: dir });
+                  }}
+                >
+                  Browse…
+                </button>
+              </div>
             </div>
-          </div>
+          )}
           <div className="field">
             <span>Model (optional)</span>
             <select

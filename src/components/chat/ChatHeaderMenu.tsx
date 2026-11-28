@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { isAndroid } from '@/lib/platform';
 import { useChatStore } from '@/stores/chatStore';
+import { useFindStore } from '@/stores/findStore';
 import { Dialog } from '@/components/shared/Dialog';
 import { AdaptivePathwayToggle } from './AdaptivePathwayToggle';
 import { SpecialistsToggle } from './SpecialistsToggle';
@@ -36,6 +37,18 @@ export function ChatHeaderMenu() {
         <div ref={popoverRef} className="chat-header-menu" role="menu" style={style}>
           <AdaptivePathwayToggle />
           <SpecialistsToggle />
+          {android && (
+            <button
+              className="status-badge"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                useFindStore.getState().show();
+              }}
+            >
+              Find in chat
+            </button>
+          )}
           {android && sessionId && (
             <button
               className="status-badge"

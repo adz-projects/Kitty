@@ -26,6 +26,7 @@ pub mod intents;
 pub mod logcat;
 pub mod notify;
 pub mod secrets;
+pub mod system_bars;
 pub mod turn_service;
 
 use std::sync::OnceLock;

@@ -286,7 +286,13 @@ export function HelperModels() {
                 <div className="gated-token">
                   <label className="muted" htmlFor={`hf-token-${c.file}`}>
                     Gemma-licensed: accept it on the{' '}
-                    <a href={`https://huggingface.co/${c.repo}`} target="_blank" rel="noreferrer">
+                    <a
+                      href={`https://huggingface.co/${c.repo}`}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        void ipc.openUrl(`https://huggingface.co/${c.repo}`).catch(() => {});
+                      }}
+                    >
                       model page
                     </a>{' '}
                     and paste a HuggingFace token (read scope). Used only for this download, never

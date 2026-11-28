@@ -15,6 +15,7 @@ import android.provider.OpenableColumns
 import android.util.Base64
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -66,6 +67,11 @@ class NotifyArgs {
     var channel: String? = null
     /** The chat it is about; tapping opens it. */
     var sessionId: String? = null
+}
+
+@InvokeArg
+class SystemBarsArgs {
+    var light: Boolean = false
 }
 
 /**
@@ -164,20 +170,22 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun copyContentUri(invoke: Invoke) {
         val args = invoke.parseArgs(CopyContentUriArgs::class.java)
-        try {
-            val dest = copyUriInto(Uri.parse(args.uri), File(args.destDir)) ?: run {
-                invoke.reject("could not open the attachment: ${args.uri}")
-                return
+        Thread {
+            try {
+                val dest = copyUriInto(Uri.parse(args.uri), File(args.destDir)) ?: run {
+                    invoke.reject("could not open the attachment: ${args.uri}")
+                    return@Thread
+                }
+                invoke.resolve(
+                    JSObject()
+                        .put("name", dest.name)
+                        .put("path", dest.absolutePath)
+                        .put("bytes", dest.length())
+                )
+            } catch (e: Exception) {
+                invoke.reject("could not copy the attachment: ${e.message}", e)
             }
-            invoke.resolve(
-                JSObject()
-                    .put("name", dest.name)
-                    .put("path", dest.absolutePath)
-                    .put("bytes", dest.length())
-            )
-        } catch (e: Exception) {
-            invoke.reject("could not copy the attachment: ${e.message}", e)
-        }
+        }.start()
     }
 
     /** The copy itself, shared with the share intake below. Null when the
@@ -250,15 +258,44 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     private val pendingIntents = mutableListOf<JSObject>()
     /** Shares whose files are still being copied, so a poll can wait. */
     private var copying = 0
+    private var webView: WebView? = null
 
     override fun load(webView: WebView) {
         super.load(webView)
+        this.webView = webView
+        pruneSharedCache()
         // A cold start: the intent that launched the activity.
         capture(activity.intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         capture(intent)
+    }
+
+    private fun notifyWebViewIncoming() {
+        val wv = webView ?: return
+        wv.post {
+            wv.evaluateJavascript("window.dispatchEvent(new Event('kitty:incoming'))", null)
+        }
+    }
+
+    /** Delete stale incoming-share staging directories older than 1 hour so
+     *  shared attachments do not accumulate in cacheDir across launches. */
+    private fun pruneSharedCache() {
+        Thread {
+            try {
+                val sharedRoot = File(activity.cacheDir, "shared")
+                val entries = sharedRoot.listFiles() ?: return@Thread
+                val cutoff = System.currentTimeMillis() - 3_600_000L
+                for (entry in entries) {
+                    if (entry.lastModified() < cutoff) {
+                        entry.deleteRecursively()
+                    }
+                }
+            } catch (_: Exception) {
+                // Best-effort cache cleanup.
+            }
+        }.start()
     }
 
     private fun capture(intent: Intent?) {
@@ -271,6 +308,7 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
                 val sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: return
                 val item = JSObject().put("kind", "open_chat").put("sessionId", sessionId)
                 synchronized(pendingIntents) { pendingIntents.add(item) }
+                notifyWebViewIncoming()
             }
         }
     }
@@ -305,6 +343,7 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
                 pendingIntents.add(item)
                 copying--
             }
+            notifyWebViewIncoming()
         }.start()
     }
 
@@ -375,65 +414,84 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun writeDocument(invoke: Invoke) {
         val args = invoke.parseArgs(WriteDocumentArgs::class.java)
-        try {
-            val resolver = activity.contentResolver
-            val picked = Uri.parse(args.uri)
+        Thread {
+            try {
+                val resolver = activity.contentResolver
+                val picked = Uri.parse(args.uri)
 
-            // A tree URI names a directory: create the document first. The
-            // `isTreeUri` check is what tells the two apart -- a caller cannot
-            // be trusted to know which dialog produced the URI it was handed.
-            val target = if (DocumentsContract.isTreeUri(picked)) {
-                val name = args.fileName
-                    ?: run {
-                        invoke.reject("a folder was chosen but no file name was given")
-                        return
+                // A tree URI names a directory: create the document first. The
+                // `isTreeUri` check is what tells the two apart -- a caller cannot
+                // be trusted to know which dialog produced the URI it was handed.
+                val target = if (DocumentsContract.isTreeUri(picked)) {
+                    val name = args.fileName
+                        ?: run {
+                            invoke.reject("a folder was chosen but no file name was given")
+                            return@Thread
+                        }
+                    val parent = DocumentsContract.buildDocumentUriUsingTree(
+                        picked,
+                        DocumentsContract.getTreeDocumentId(picked)
+                    )
+                    // The provider owns the final name: it de-duplicates against
+                    // what is already there (`report.jsonl` -> `report (1).jsonl`)
+                    // and may adjust the extension to match the MIME type. Which
+                    // is why nothing here assumes the name it asked for.
+                    DocumentsContract.createDocument(
+                        resolver,
+                        parent,
+                        args.mimeType ?: "application/octet-stream",
+                        name
+                    ) ?: run {
+                        invoke.reject("could not create \"$name\" in the chosen folder")
+                        return@Thread
                     }
-                val parent = DocumentsContract.buildDocumentUriUsingTree(
-                    picked,
-                    DocumentsContract.getTreeDocumentId(picked)
-                )
-                // The provider owns the final name: it de-duplicates against
-                // what is already there (`report.jsonl` -> `report (1).jsonl`)
-                // and may adjust the extension to match the MIME type. Which
-                // is why nothing here assumes the name it asked for.
-                DocumentsContract.createDocument(
-                    resolver,
-                    parent,
-                    args.mimeType ?: "application/octet-stream",
-                    name
-                ) ?: run {
-                    invoke.reject("could not create \"$name\" in the chosen folder")
-                    return
-                }
-            } else {
-                picked
-            }
-
-            // Mode "w", not "wt". Truncation is meaningless on a document that
-            // was just created, and several providers -- Drive among them --
-            // reject or silently mishandle the "t" flag.
-            val written = resolver.openOutputStream(target, "w")?.use { output ->
-                val src = args.sourcePath
-                if (src != null) {
-                    File(src).inputStream().use { input -> input.copyTo(output) }
                 } else {
-                    val bytes = Base64.decode(args.contentBase64 ?: "", Base64.DEFAULT)
-                    output.write(bytes)
-                    // `copyTo` reports its own count; this branch has to.
-                    bytes.size.toLong()
-                }.also { output.flush() }
-            } ?: run {
-                invoke.reject("the chosen location could not be opened for writing")
-                return
-            }
+                    picked
+                }
 
-            invoke.resolve(
-                JSObject()
-                    .put("uri", target.toString())
-                    .put("bytes", written)
-            )
-        } catch (e: Exception) {
-            invoke.reject("could not save the file: ${e.message}", e)
+                // Mode "w", not "wt". Truncation is meaningless on a document that
+                // was just created, and several providers -- Drive among them --
+                // reject or silently mishandle the "t" flag.
+                val written = resolver.openOutputStream(target, "w")?.use { output ->
+                    val src = args.sourcePath
+                    if (src != null) {
+                        File(src).inputStream().use { input -> input.copyTo(output) }
+                    } else {
+                        val bytes = Base64.decode(args.contentBase64 ?: "", Base64.DEFAULT)
+                        output.write(bytes)
+                        // `copyTo` reports its own count; this branch has to.
+                        bytes.size.toLong()
+                    }.also { output.flush() }
+                } ?: run {
+                    invoke.reject("the chosen location could not be opened for writing")
+                    return@Thread
+                }
+
+                invoke.resolve(
+                    JSObject()
+                        .put("uri", target.toString())
+                        .put("bytes", written)
+                )
+            } catch (e: Exception) {
+                invoke.reject("could not save the file: ${e.message}", e)
+            }
+        }.start()
+    }
+
+    // --- System bars theme contrast --------------------------------------
+
+    @Command
+    fun setSystemBarsAppearance(invoke: Invoke) {
+        val args = invoke.parseArgs(SystemBarsArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+                controller.isAppearanceLightStatusBars = args.light
+                controller.isAppearanceLightNavigationBars = args.light
+                invoke.resolve()
+            } catch (e: Exception) {
+                invoke.reject("could not update system bars appearance: ${e.message}", e)
+            }
         }
     }
 

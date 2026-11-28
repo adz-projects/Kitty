@@ -1,7 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
 import { useEscapeLayer } from '@/hooks/useEscapeLayer';
 
 const MARGIN = 4;
+
+function readInsetPx(name: string): number {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(name);
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 /** Keeps a `.mode-popover`-style dropdown fully within the viewport,
     regardless of where its trigger sits — flips above/below and left/right
@@ -27,7 +34,12 @@ const MARGIN = 4;
     that root. Position is (re)computed via `useLayoutEffect` — after the DOM
     reflects `open` but before the browser paints, so there's no visible
     flash of the wrong position. */
-export function usePopoverPosition(open: boolean, onClose: () => void) {
+export function usePopoverPosition(
+  open: boolean,
+  onClose: () => void,
+  options?: { outsideClick?: boolean }
+) {
+  const outsideClick = options?.outsideClick ?? true;
   const triggerRef = useRef<HTMLElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const [style, setStyle] = useState<CSSProperties>({});
@@ -39,8 +51,20 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     if (!trigger || !popover) return;
 
     const triggerRect = trigger.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const vv = window.visualViewport;
+    const vvLeft = vv?.offsetLeft ?? 0;
+    const vvTop = vv?.offsetTop ?? 0;
+    const vw = vv?.width ?? window.innerWidth;
+    const vh = vv?.height ?? window.innerHeight;
+    const safeTop = readInsetPx('--safe-top');
+    const safeBottom = readInsetPx('--safe-bottom');
+    const safeLeft = readInsetPx('--safe-left');
+    const safeRight = readInsetPx('--safe-right');
+    const minLeft = vvLeft + safeLeft + MARGIN;
+    const maxRight = vvLeft + vw - safeRight - MARGIN;
+    const minTop = vvTop + safeTop + MARGIN;
+    const maxBottom = vvTop + vh - safeBottom - MARGIN;
+    const availW = Math.max(0, maxRight - minLeft);
 
     // Measure the popover *as it will actually be laid out*, not as it
     // currently is. Before this effect runs it is still in the class's
@@ -62,7 +86,7 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     popover.style.left = '0px';
     popover.style.right = 'auto';
     popover.style.bottom = 'auto';
-    popover.style.maxWidth = `${Math.max(0, vw - 2 * MARGIN)}px`;
+    popover.style.maxWidth = `${availW}px`;
     popover.style.maxHeight = 'none';
     const popoverRect = popover.getBoundingClientRect();
     popover.style.cssText = measuredCss;
@@ -94,16 +118,21 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     // can never render partly off-screen — it scrolls internally as a last
     // resort instead (still fully "in the frame", just not every item
     // visible without scrolling in that degenerate case).
-    const spaceBelow = vh - triggerRect.bottom - MARGIN;
-    const spaceAbove = triggerRect.top - MARGIN;
+    const spaceBelow = maxBottom - (triggerRect.bottom + MARGIN);
+    const spaceAbove = triggerRect.top - MARGIN - minTop;
     const fitsBelow = popoverRect.height <= spaceBelow;
     const openBelow = fitsBelow || spaceBelow >= spaceAbove;
 
     if (openBelow) {
-      next.top = Math.max(MARGIN, triggerRect.bottom + MARGIN);
-      next.maxHeight = Math.max(0, vh - MARGIN - (next.top as number));
+      const top = Math.max(minTop, triggerRect.bottom + MARGIN);
+      next.top = top;
+      next.maxHeight = Math.max(0, maxBottom - top);
     } else {
-      next.bottom = Math.max(MARGIN, vh - triggerRect.top + MARGIN);
+      const bottom = Math.max(
+        window.innerHeight - maxBottom,
+        window.innerHeight - triggerRect.top + MARGIN
+      );
+      next.bottom = bottom;
       next.maxHeight = Math.max(0, spaceAbove);
     }
 
@@ -115,14 +144,14 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     // kept the left edge on-screen but silently pushed the right edge past the
     // viewport instead. `maxWidth` is the same last-resort clamp as above and
     // is what keeps the third branch honest.
-    if (triggerRect.right - popoverRect.width >= MARGIN) {
-      next.right = Math.max(MARGIN, vw - triggerRect.right);
-    } else if (triggerRect.left + popoverRect.width <= vw - MARGIN) {
-      next.left = Math.max(MARGIN, triggerRect.left);
+    if (triggerRect.right - popoverRect.width >= minLeft) {
+      next.right = Math.max(window.innerWidth - maxRight, window.innerWidth - triggerRect.right);
+    } else if (triggerRect.left + popoverRect.width <= maxRight) {
+      next.left = Math.max(minLeft, triggerRect.left);
     } else {
-      next.left = MARGIN;
+      next.left = minLeft;
     }
-    next.maxWidth = Math.max(0, vw - 2 * MARGIN);
+    next.maxWidth = availW;
 
     setStyle(next);
   }, [open]);
@@ -137,7 +166,7 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
   }, [onClose]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !outsideClick) return;
     const handlePointerDown = (e: PointerEvent) => {
       const target = e.target as Node;
       if (triggerRef.current?.contains(target)) return; // trigger's own onClick toggles it
@@ -146,9 +175,10 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     };
     document.addEventListener('pointerdown', handlePointerDown);
     return () => document.removeEventListener('pointerdown', handlePointerDown);
-  }, [open]);
+  }, [open, outsideClick]);
 
   useEscapeLayer(open, () => onCloseRef.current());
+  useBackDismiss(open, () => onCloseRef.current());
 
   return { triggerRef, popoverRef, style };
 }

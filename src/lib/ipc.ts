@@ -734,6 +734,9 @@ export const ipc = {
     }),
   /** Check &, if corrupt, rebuild the factual-memory DB (Memorabilia Health). */
   recoverMemorabiliaDb: () => invoke<DbRecoverReport>('recover_memorabilia_db'),
+  /** Sync Android status/nav bar icon contrast with Kitty's active theme. */
+  setSystemBarsAppearance: (light: boolean) =>
+    invoke<void>('set_system_bars_appearance', { light }),
 };
 
 /** Result of a plugin-DB recovery (`recover_pathway_db`/`recover_memorabilia_db`).

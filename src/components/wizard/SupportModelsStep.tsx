@@ -19,7 +19,7 @@ export function SupportModelsStep({ onNext, onSkip }: { onNext: () => void; onSk
   const [embedding, setEmbedding] = useState(false);
 
   return (
-    <div className="wizard-body">
+    <div className="wizard-panel">
       <h1>Download Kitty&apos;s memory model</h1>
       <p className="muted">
         This runs on your phone and does background work — it doesn&apos;t answer your questions.
@@ -32,12 +32,12 @@ export function SupportModelsStep({ onNext, onSkip }: { onNext: () => void; onSk
 
       {!embedding && (
         <p className="muted">
-          Optional — you can skip and add it later from Settings. Without the memory model, recall
-          falls back to keyword matching.
+          Optional — you can skip and add it later from Settings. Chat works without it; memory
+          activates once downloaded.
         </p>
       )}
 
-      <div className="row">
+      <div className="wizard-actions">
         {embedding ? (
           <button className="primary" onClick={onNext}>
             Continue

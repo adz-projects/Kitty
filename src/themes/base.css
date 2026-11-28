@@ -192,6 +192,16 @@ body,
   overscroll-behavior: none;
 }
 
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+:root[data-platform='android'] body {
+  background: var(--bg);
+}
+
 body {
   background: transparent;
   color: var(--text);
@@ -882,11 +892,13 @@ body:has(.overlay-root) {
   font-family: var(--mono, ui-monospace, monospace);
   font-size: var(--fs-sm-plus);
 }
-/* Fenced code block with a Copy/Download header (Round-2 item 12). */
+/* Fenced code block with a Copy/Download header (Round-2 item 12).
+   `overflow: clip` preserves rounded corners without establishing a scroll
+   container that would defeat `.code-block-head`'s `position: sticky`. */
 .code-block {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
+  overflow: clip;
   margin: 6px 0;
 }
 .code-block-head {
@@ -919,6 +931,72 @@ body:has(.overlay-root) {
 .code-block pre {
   margin: 0;
   border-radius: 0;
+}
+/* Override highlight.js/styles/github.css's light #ffffff box so dark themes
+   keep their own surface and readable syntax contrast. */
+.code-block .hljs {
+  background: transparent;
+  color: var(--text);
+}
+:root[data-theme='dark'] .code-block .hljs-comment,
+:root[data-theme='dark'] .code-block .hljs-quote {
+  color: var(--text-muted);
+  font-style: italic;
+}
+:root[data-theme='dark'] .code-block .hljs-keyword,
+:root[data-theme='dark'] .code-block .hljs-selector-tag,
+:root[data-theme='dark'] .code-block .hljs-subst,
+:root[data-theme='dark'] .code-block .hljs-meta-keyword {
+  color: #e39f7e;
+}
+:root[data-theme='dark'] .code-block .hljs-number,
+:root[data-theme='dark'] .code-block .hljs-literal,
+:root[data-theme='dark'] .code-block .hljs-variable,
+:root[data-theme='dark'] .code-block .hljs-template-variable,
+:root[data-theme='dark'] .code-block .hljs-tag .hljs-attr {
+  color: #8cc2dd;
+}
+:root[data-theme='dark'] .code-block .hljs-string,
+:root[data-theme='dark'] .code-block .hljs-doctag,
+:root[data-theme='dark'] .code-block .hljs-regexp {
+  color: #9ed09e;
+}
+:root[data-theme='dark'] .code-block .hljs-title,
+:root[data-theme='dark'] .code-block .hljs-section,
+:root[data-theme='dark'] .code-block .hljs-selector-id,
+:root[data-theme='dark'] .code-block .hljs-name {
+  color: #d6b6e8;
+}
+:root[data-theme='dark'] .code-block .hljs-type,
+:root[data-theme='dark'] .code-block .hljs-class .hljs-title,
+:root[data-theme='dark'] .code-block .hljs-built_in,
+:root[data-theme='dark'] .code-block .hljs-attribute {
+  color: #e5c884;
+}
+:root[data-theme='dark'] .code-block .hljs-addition {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+:root[data-theme='dark'] .code-block .hljs-deletion {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+[data-theme-style='cli'][data-theme='dark'] .code-block .hljs-keyword,
+[data-theme-style='cli'][data-theme='dark'] .code-block .hljs-title,
+[data-theme-style='cli'][data-theme='dark'] .code-block .hljs-type {
+  color: var(--warn);
+}
+[data-theme-style='cli'][data-theme='dark'] .code-block .hljs-string,
+[data-theme-style='cli'][data-theme='dark'] .code-block .hljs-number {
+  color: var(--accent);
+}
+.markdown-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 6px 0;
+}
+.markdown-table-wrap table {
+  margin: 0;
 }
 .markdown :not(pre) > code {
   background: var(--surface-2);
@@ -2215,6 +2293,9 @@ body:has(.overlay-root) {
   overflow-y: auto;
   overflow-x: hidden;
 }
+.chat-header-menu .ap-toggle {
+  max-width: none;
+}
 
 /* Inline hint badge (Round-C): under an assistant message that used the
    Adaptive Pathway extension's `decide` hint — always visible when hints
@@ -3242,6 +3323,7 @@ button.output-card-name:hover {
 .drag-handle {
   cursor: grab;
   user-select: none;
+  touch-action: none;
   padding: 0 6px;
 }
 .setup-row.dragging {
@@ -4178,7 +4260,7 @@ button.link {
 }
 .main-window > .artifacts-pane.artifacts-sheet {
   position: absolute;
-  top: calc(var(--safe-top) + 10vh);
+  top: calc(var(--safe-top) + 10%);
   right: 0;
   bottom: 0;
   left: 0;
@@ -4269,24 +4351,140 @@ button.link {
   }
 }
 
+/* --- Android shell layout, safe-area insets & IME sizing ------------------
+   Gated on `:root[data-platform='android']` (not only `max-width: 600px`) so
+   rotating a phone to landscape (>600px wide), using split-screen, or running
+   on a tablet/foldable keeps the 1-column shell and `--safe-*` insets instead
+   of collapsing into desktop's 286px sidebar track. */
+:root[data-platform='android'] .main-window {
+  grid-template-columns: 1fr;
+}
+:root[data-platform='android'] .main-window > .session-list {
+  display: none;
+}
+:root[data-platform='android'] .main-header {
+  justify-content: flex-start;
+  gap: 6px;
+  --hdr-control-h: 36px;
+}
+:root[data-platform='android'] .main-header .chat-header-controls {
+  flex: 1;
+  min-width: 0;
+}
+:root[data-platform='android'] .main-header .provider-badge {
+  max-width: 150px;
+  min-width: 0;
+}
+:root[data-platform='android'] .main-header .provider-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+:root[data-platform='android'] .main-header button:not(.mode-popover *):not(.chat-header-menu *),
+:root[data-platform='android'] .main-header .provider-badge {
+  height: var(--hdr-control-h);
+  min-height: var(--hdr-control-h);
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  line-height: 1;
+  appearance: none;
+}
+:root[data-platform='android']
+  .main-header
+  button:has(> svg:only-child):not(.mode-popover *):not(.chat-header-menu *) {
+  width: var(--hdr-control-h);
+  padding: 0;
+}
+:root[data-platform='android'] .artifacts-close {
+  margin-left: auto;
+  min-width: 38px;
+  min-height: 38px;
+  padding: 2px 8px;
+  line-height: 1;
+}
+:root[data-platform='android'] .main-window,
+:root[data-platform='android'] .settings-window,
+:root[data-platform='android'] .sessions-route {
+  padding-top: var(--safe-top);
+  padding-left: var(--safe-left);
+  padding-right: var(--safe-right);
+  padding-bottom: var(--safe-bottom);
+}
+:root[data-platform='android'] .window-root {
+  padding-top: calc(24px + var(--safe-top));
+  padding-left: calc(24px + var(--safe-left));
+  padding-right: calc(24px + var(--safe-right));
+  padding-bottom: calc(24px + var(--safe-bottom));
+}
+
+/* IME-safe modals & popovers on Android: track visualViewport (--app-top /
+   --app-h) and safe-area insets instead of centering against 100vh behind
+   the soft keyboard. */
+:root[data-platform='android'] .modal-backdrop {
+  top: var(--app-top, 0px);
+  height: var(--app-h, 100dvh);
+  bottom: auto;
+  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
+  box-sizing: border-box;
+}
+:root[data-platform='android'] .modal {
+  max-height: calc(var(--app-h, 100dvh) - var(--safe-top) - var(--safe-bottom) - 24px);
+}
+:root[data-platform='android'] .provider-popover {
+  max-height: min(calc(var(--app-h, 100dvh) * 0.7), 480px);
+}
+:root[data-platform='android'] .provider-switch-error {
+  left: 0;
+  right: auto;
+  max-width: calc(100vw - var(--safe-left) - var(--safe-right) - 32px);
+}
+
+/* Comfortable touch sizing on Android without breaking desktop density. */
+:root[data-platform='android'] .chat-header-menu button {
+  width: 100%;
+  min-height: 40px;
+  padding: 6px 10px;
+  justify-content: flex-start;
+  text-align: left;
+}
+:root[data-platform='android'] .composer-attach {
+  width: 38px;
+  height: 38px;
+}
+:root[data-platform='android'] .composer-submit {
+  min-height: 38px;
+  padding: 0 14px;
+}
+:root[data-platform='android'] .artifact-actions button,
+:root[data-platform='android'] .output-card-actions .link {
+  min-height: 36px;
+  padding: 6px 8px;
+}
+:root[data-platform='android'] .chip-x {
+  min-width: 28px;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+:root[data-platform='android'] .code-actions button {
+  min-height: 32px;
+  padding: 4px 10px;
+}
+:root[data-platform='android'] .icon-button {
+  min-width: 38px;
+  min-height: 38px;
+}
+
 /* --- Mobile breakpoint (docs/ANDROID.md §8.2) --------------------------
-   Deliberately the last block in this file. Every override below is the
-   same specificity as the desktop rule it replaces, so source order is
-   what decides — placing it earlier silently loses. That is not
-   hypothetical: the first cut of this sat above `.main-window` and left
-   the phone layout with a 260px track for a sidebar that was already
-   `display: none`, squeezing chat into 115px of a 375px screen.
-
-   **600px, not 480.** Measured on a Pixel 10 Pro: `window.innerWidth` is
-   **485** CSS px (1080 physical / 2.225 dpr), so a 480px cutoff missed a
-   current flagship entirely — the mobile layout never engaged and the
-   safe-area padding never applied, leaving content under the notch. 480 was
-   picked from convention rather than from a device.
-
-   600 is Android's own "compact" width class, which is exactly the
-   "this is a phone-shaped window" question being asked here. It does mean a
-   desktop hub window narrowed below 600px gets the one-column layout —
-   intended: at that width the three-column layout is unusable anyway. */
+   Deliberately the last layout block before theme styles. Every override
+   below keeps narrow desktop windows and portrait phones clean at <=600px. */
 @media (max-width: 600px) {
   /* Settings → Helper Models. At phone width there isn't room for the model
      label and its buttons side by side without the label wrapping to three
@@ -4298,11 +4496,17 @@ button.link {
     width: 100%;
     justify-content: flex-end;
   }
+  .decider-endpoint {
+    grid-template-columns: 1fr;
+  }
+  .modal-actions,
+  .wizard-actions {
+    flex-wrap: wrap;
+  }
 
   /* The desktop chat layout is a three-column grid (history | chat |
-     artifacts). On a phone only the middle column fits; the history lives in
-     the menu drawer and artifacts in a bottom sheet. (Android doesn't render
-     the sidebar at all; this hides it for a narrowed desktop window.) */
+     artifacts). On a narrow window only the middle column fits; Android
+     already gets this at all widths above. */
   .main-window {
     grid-template-columns: 1fr;
   }
@@ -4339,31 +4543,9 @@ button.link {
     white-space: nowrap;
   }
 
-  /* One shape for every control in this row.
-
-     They come from three different places — `.status-badge` (6px radius, 2px
-     padding, --fs-xs), the effort control (999px radius, 3px padding, --fs-xs)
-     and the bare `button` rule (calc(--radius)/2 radius, 6px padding,
-     inherited size) — so the row read as a jumble of mismatched heights and
-     corner shapes, and the tallest of them decided how much vertical space the
-     header took. Pinning one height and one radius here is what makes it a
-     single tidy row; the type step down to --fs-sm is what makes that height
-     fit the labels rather than the labels fighting the height.
-
-     Below the 44px touch guideline on purpose: this row is the whole header on
-     a phone, every control in it is a low-frequency action next to a full-width
-     scrollable conversation, and a taller row costs conversation. */
   .main-header {
     --hdr-control-h: 34px;
   }
-  /* The `:not()`s below matter: these are *descendant* selectors, and both
-     header popovers render inside this row's DOM, so without them the rule
-     also restyles their menu rows. A menu row pinned to --hdr-control-h and
-     centred can't fit a two-line provider name, and content wider than the
-     row gets centred *out of both edges* — where the popover's
-     `overflow-x: hidden` clips it, silently eating the leading character and
-     the trust icon. Menu rows size to their content and start at the left
-     edge; only the controls in the row itself get the uniform shape. */
   .main-header button:not(.mode-popover *):not(.chat-header-menu *),
   .main-header .provider-badge {
     height: var(--hdr-control-h);
@@ -4379,8 +4561,6 @@ button.link {
     line-height: 1;
     appearance: none;
   }
-  /* Icon-only buttons are square rather than pill-shaped, so the row reads as
-     "controls, then actions" instead of one undifferentiated run of boxes. */
   .main-header button:has(> svg:only-child):not(.mode-popover *):not(.chat-header-menu *) {
     width: var(--hdr-control-h);
     padding: 0;
@@ -4400,9 +4580,13 @@ button.link {
   }
   .settings-nav {
     flex-direction: row;
+    align-items: center;
     overflow-x: auto;
     border-right: none;
     border-bottom: 1px solid var(--border);
+  }
+  .settings-nav .settings-nav-home {
+    margin-bottom: 0;
   }
   /* `.settings-main`'s base rule pins it to `grid-row: 2` for the desktop
      2-row template (notice / nav+content) — this 3-row mobile template
@@ -4420,26 +4604,16 @@ button.link {
   }
   .settings-nav button {
     white-space: nowrap;
+    padding: 8px 12px;
   }
 
-  /* Clear the notch, the rounded corners and the gesture bar. Applied to the
-     route roots rather than to `body` so the drawer and sheet, which pad
-     themselves, aren't double-inset.
-
-     Split in two because the bases differ: the grid containers have no
-     padding of their own, while `.window-root` already carries 24px. Giving
-     that one a bare `padding-top: var(--safe-top)` would *replace* its
-     padding and leave the wizard's content flush against both screen edges,
-     so it adds instead. Measured insets on a Pixel 10 Pro: 78px top, 24px
-     bottom. */
+  /* Clear the notch, the rounded corners and the gesture bar on narrow screens. */
   .main-window,
   .settings-window,
   .sessions-route {
     padding-top: var(--safe-top);
     padding-left: var(--safe-left);
     padding-right: var(--safe-right);
-    /* The tab bar used to carry this; without it the composer sits under the
-       gesture bar. */
     padding-bottom: var(--safe-bottom);
   }
   .window-root {
@@ -4622,10 +4796,14 @@ button.link {
 
 [data-theme-style='cli'] .settings-nav {
   border-right-style: dashed;
+  border-bottom-style: dashed;
 }
 
 [data-theme-style='cli'] .artifacts-pane {
   border-left-style: dashed;
+}
+[data-theme-style='cli'] .main-window > .artifacts-pane.artifacts-sheet {
+  border-top-style: dashed;
 }
 
 [data-theme-style='cli'] .msg-user .bubble {
@@ -4734,6 +4912,7 @@ button.link {
 [data-theme-style='cli'][data-theme='dark']
   :is(
     .titlebar,
+    .main-header,
     .session-list,
     .settings-nav,
     .chat-header,

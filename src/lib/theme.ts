@@ -10,7 +10,7 @@ import modernDarkCss from '@/themes/modern-dark.css?raw';
 import cliLightCss from '@/themes/cli-light.css?raw';
 import cliDarkCss from '@/themes/cli-dark.css?raw';
 import { ipc, onThemeChanged } from './ipc';
-import { applyPlatformAttribute } from './platform';
+import { applyPlatformAttribute, isAndroid } from './platform';
 
 export type ThemeStyle = 'classic' | 'modern' | 'cli';
 
@@ -77,6 +77,9 @@ function setRootThemeAttrs(dataTheme: 'light' | 'dark' | null, dataStyle: ThemeS
   else root.removeAttribute('data-theme');
   if (dataStyle) root.setAttribute('data-theme-style', dataStyle);
   else root.removeAttribute('data-theme-style');
+  if (isAndroid() && (dataTheme === 'light' || dataTheme === 'dark')) {
+    void ipc.setSystemBarsAppearance(dataTheme === 'light').catch(() => {});
+  }
 }
 
 async function resolveThemePayload(name: string, style?: string | null): Promise<ResolvedTheme> {

@@ -21,7 +21,12 @@
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
+    <!-- Android Auto Backup is disabled because `SecretStore` seals API keys
+         and BigTiny's DB encryption key under a hardware-backed non-exportable
+         AndroidKeyStore key: restoring `kitty_secrets` without that key fails
+         with AEADBadTagException and prevents the embedded engine from starting. -->
     <application
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.kitty"

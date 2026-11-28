@@ -1,6 +1,7 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <!-- Base application theme. -->
     <style name="Theme.kitty" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <!-- Match Kitty's warm paper background to prevent a cold-start flash. -->
+        <item name="android:windowBackground">#f8f7f4</item>
     </style>
 </resources>

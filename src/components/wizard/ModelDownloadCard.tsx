@@ -106,7 +106,13 @@ export function ModelDownloadCard({
         <div className="gated-token">
           <label className="muted" htmlFor={`hf-token-${role}`}>
             This model is under the Gemma license. Accept it on the model page, then paste a{' '}
-            <a href={`https://huggingface.co/${model.repo}`} target="_blank" rel="noreferrer">
+            <a
+              href={`https://huggingface.co/${model.repo}`}
+              onClick={(e) => {
+                e.preventDefault();
+                void ipc.openUrl(`https://huggingface.co/${model.repo}`).catch(() => {});
+              }}
+            >
               HuggingFace access token
             </a>{' '}
             (read scope). It is used only for this download and never stored.

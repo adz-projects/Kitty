@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { isAndroid } from '@/lib/platform';
 import type {
   DeciderDefaults,
   DeciderFeature,
@@ -421,7 +422,9 @@ export function DecisionModel() {
       <p className="muted" style={{ margin: 0 }}>
         Uses (applied on Save, no restart):
       </p>
-      {DECIDER_FEATURES.map((f) => {
+      {DECIDER_FEATURES.filter(
+        (f) => !isAndroid() || (f.id !== 'shell_screen' && f.id !== 'ingest_gate')
+      ).map((f) => {
         const line = statLine(f.id, stats[f.id]);
         return (
           <div className="field" key={f.id}>
@@ -451,31 +454,33 @@ export function DecisionModel() {
         );
       })}
 
-      <div className="field">
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={chunking}
-            disabled={!draft.url.trim()}
-            onChange={(e) => {
-              const on = e.target.checked;
-              setChunking(on);
-              void ipc
-                .setDeciderChunking(on)
-                .then(() => setNotice(`Chunking turned ${on ? 'on' : 'off'}.`))
-                .catch((err) => {
-                  setChunking(!on);
-                  setError(String(err));
-                });
-            }}
-          />
-          Chunk the memory intake screen
-        </label>
-        <p className="muted" style={{ margin: 0 }}>
-          Screens several passages per call: cheaper, but lets a little more filler through. Off
-          (the default) is the most precise.
-        </p>
-      </div>
+      {!isAndroid() && (
+        <div className="field">
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={chunking}
+              disabled={!draft.url.trim()}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setChunking(on);
+                void ipc
+                  .setDeciderChunking(on)
+                  .then(() => setNotice(`Chunking turned ${on ? 'on' : 'off'}.`))
+                  .catch((err) => {
+                    setChunking(!on);
+                    setError(String(err));
+                  });
+              }}
+            />
+            Chunk the memory intake screen
+          </label>
+          <p className="muted" style={{ margin: 0 }}>
+            Screens several passages per call: cheaper, but lets a little more filler through. Off
+            (the default) is the most precise.
+          </p>
+        </div>
+      )}
 
       <button
         type="button"
@@ -487,22 +492,24 @@ export function DecisionModel() {
       {thresholdsOpen && (
         <>
           <p className="muted">Empty uses the model&apos;s default.</p>
-          {DECIDER_THRESHOLDS.map((t) => (
-            <label className="field" key={t.key}>
-              <span>{t.label}</span>
-              <input
-                type="text"
-                inputMode="decimal"
-                placeholder={
-                  defaults?.default_thresholds?.[t.key] != null
-                    ? String(defaults.default_thresholds[t.key])
-                    : ''
-                }
-                value={thresholdText[t.key] ?? ''}
-                onChange={(e) => setThresholdText({ ...thresholdText, [t.key]: e.target.value })}
-              />
-            </label>
-          ))}
+          {DECIDER_THRESHOLDS.filter((t) => !isAndroid() || t.key !== 'shell_screen_flag_at').map(
+            (t) => (
+              <label className="field" key={t.key}>
+                <span>{t.label}</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder={
+                    defaults?.default_thresholds?.[t.key] != null
+                      ? String(defaults.default_thresholds[t.key])
+                      : ''
+                  }
+                  value={thresholdText[t.key] ?? ''}
+                  onChange={(e) => setThresholdText({ ...thresholdText, [t.key]: e.target.value })}
+                />
+              </label>
+            )
+          )}
           <div className="row">
             <button onClick={() => setThresholdText({})}>Reset to model defaults</button>
           </div>

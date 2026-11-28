@@ -218,7 +218,9 @@ function MobileMessageActions({ message, actions }: { message: Message; actions:
   // document-level `pointerdown` would close the menu and then let the same
   // tap land on whatever is underneath — toggling another message's actions,
   // or following a link.
-  const { triggerRef, popoverRef, style } = usePopoverPosition(menuOpen, () => {});
+  const { triggerRef, popoverRef, style } = usePopoverPosition(menuOpen, () => setMenuOpen(false), {
+    outsideClick: false,
+  });
 
   if (!revealed) return null;
 

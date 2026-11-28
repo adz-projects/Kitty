@@ -47,10 +47,20 @@ class DownloadService : Service() {
         const val EXTRA_RECEIVED = "received"
         const val EXTRA_TOTAL = "total"
 
-        /** Start, or update the notification of an already-running instance —
-         *  `startForegroundService` on a started service just delivers another
-         *  `onStartCommand`, which is how progress updates arrive. */
+        @Volatile
+        private var isRunning = false
+
+        /** Start, or update the notification of an already-running instance.
+         *  Updating via `NotificationManager.notify` avoids calling
+         *  `startForegroundService` on every progress tick from the background
+         *  (which throws `ForegroundServiceStartNotAllowedException` on API 31+). */
         fun start(ctx: Context, title: String, received: Long, total: Long) {
+            if (isRunning) {
+                ensureChannel(ctx)
+                val manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                manager.notify(NOTIFICATION_ID, buildNotification(ctx, title, received, total))
+                return
+            }
             val intent = Intent(ctx, DownloadService::class.java)
                 .putExtra(EXTRA_TITLE, title)
                 .putExtra(EXTRA_RECEIVED, received)
@@ -59,24 +69,88 @@ class DownloadService : Service() {
         }
 
         fun stop(ctx: Context) {
+            isRunning = false
             ctx.stopService(Intent(ctx, DownloadService::class.java))
+        }
+
+        private fun ensureChannel(ctx: Context) {
+            val manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (manager.getNotificationChannel(CHANNEL_ID) != null) return
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Model downloads",
+                // LOW: this notification is a progress readout the user can glance
+                // at, not something to interrupt them with. It still cannot be
+                // swiped away while the service is foreground.
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Shown while Kitty is downloading a model in the background."
+                setShowBadge(false)
+            }
+            manager.createNotificationChannel(channel)
+        }
+
+        private fun buildNotification(ctx: Context, title: String, received: Long, total: Long): Notification {
+            val tapToOpen = PendingIntent.getActivity(
+                ctx,
+                0,
+                Intent(ctx, MainActivity::class.java)
+                    .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val builder = Notification.Builder(ctx, CHANNEL_ID)
+                .setContentTitle(title)
+                .setSmallIcon(R.drawable.ic_stat_download)
+                .setContentIntent(tapToOpen)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+
+            if (total > 0) {
+                val percent = ((received.toDouble() / total.toDouble()) * 100).toInt().coerceIn(0, 100)
+                builder.setContentText("$percent%  ·  ${humanBytes(received)} of ${humanBytes(total)}")
+                builder.setProgress(100, percent, false)
+            } else {
+                // Unknown length (no Content-Length on the response) — an
+                // indeterminate bar is honest; a fake percentage is not.
+                builder.setContentText(humanBytes(received))
+                builder.setProgress(0, 0, true)
+            }
+            return builder.build()
+        }
+
+        private fun humanBytes(n: Long): String {
+            if (n < 1024) return "$n B"
+            val units = arrayOf("KB", "MB", "GB", "TB")
+            var value = n.toDouble() / 1024.0
+            var unit = 0
+            while (value >= 1024.0 && unit < units.size - 1) {
+                value /= 1024.0
+                unit++
+            }
+            return String.format("%.1f %s", value, units[unit])
         }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val title = intent?.getStringExtra(EXTRA_TITLE) ?: "Downloading model"
-        val received = intent?.getLongExtra(EXTRA_RECEIVED, 0L) ?: 0L
-        val total = intent?.getLongExtra(EXTRA_TOTAL, 0L) ?: 0L
+        if (intent == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val title = intent.getStringExtra(EXTRA_TITLE) ?: "Downloading model"
+        val received = intent.getLongExtra(EXTRA_RECEIVED, 0L)
+        val total = intent.getLongExtra(EXTRA_TOTAL, 0L)
 
-        ensureChannel()
-        val notification = buildNotification(title, received, total)
+        ensureChannel(this)
+        val notification = buildNotification(this, title, received, total)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        isRunning = true
 
         if (wakeLock == null) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -91,12 +165,10 @@ class DownloadService : Service() {
             }
         }
 
-        // STICKY, not REDELIVER: if Android kills us under memory pressure the
-        // service coming back is pointless on its own — the Rust download died
-        // with the process. Restarting bare lets `onStartCommand` run with a
-        // null intent, post a generic notification, and be stopped by the next
-        // launch, rather than resurrecting a stale progress figure.
-        return START_STICKY
+        // NOT_STICKY: if Android kills us under memory pressure the Rust
+        // download died with the process, so resurrecting the service bare
+        // would strand an ongoing notification and wake lock.
+        return START_NOT_STICKY
     }
 
     /**
@@ -112,66 +184,9 @@ class DownloadService : Service() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         super.onDestroy()
-    }
-
-    private fun ensureChannel() {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (manager.getNotificationChannel(CHANNEL_ID) != null) return
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Model downloads",
-            // LOW: this notification is a progress readout the user can glance
-            // at, not something to interrupt them with. It still cannot be
-            // swiped away while the service is foreground.
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Shown while Kitty is downloading a model in the background."
-            setShowBadge(false)
-        }
-        manager.createNotificationChannel(channel)
-    }
-
-    private fun buildNotification(title: String, received: Long, total: Long): Notification {
-        val tapToOpen = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java)
-                .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val builder = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
-            .setSmallIcon(R.drawable.ic_stat_download)
-            .setContentIntent(tapToOpen)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-
-        if (total > 0) {
-            val percent = ((received.toDouble() / total.toDouble()) * 100).toInt().coerceIn(0, 100)
-            builder.setContentText("$percent%  ·  ${humanBytes(received)} of ${humanBytes(total)}")
-            builder.setProgress(100, percent, false)
-        } else {
-            // Unknown length (no Content-Length on the response) — an
-            // indeterminate bar is honest; a fake percentage is not.
-            builder.setContentText(humanBytes(received))
-            builder.setProgress(0, 0, true)
-        }
-        return builder.build()
-    }
-
-    private fun humanBytes(n: Long): String {
-        if (n < 1024) return "$n B"
-        val units = arrayOf("KB", "MB", "GB", "TB")
-        var value = n.toDouble() / 1024.0
-        var unit = 0
-        while (value >= 1024.0 && unit < units.size - 1) {
-            value /= 1024.0
-            unit++
-        }
-        return String.format("%.1f %s", value, units[unit])
     }
 }

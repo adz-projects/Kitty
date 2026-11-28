@@ -1,4 +1,6 @@
 import { isValidElement, useEffect, useRef, useState, type ReactNode } from 'react';
+import { ipc } from '@/lib/ipc';
+import { isAndroid } from '@/lib/platform';
 
 /** Recursively pull the plain text out of a react-markdown/rehype node tree
     (the fenced code content, minus the syntax-highlight <span> wrappers). */
@@ -76,10 +78,15 @@ export function CodeBlock({ children }: { children?: ReactNode; node?: unknown }
 
   const download = () => {
     const ext = EXT[lang.toLowerCase()] ?? 'txt';
+    const fileName = `snippet.${ext}`;
+    if (isAndroid()) {
+      void ipc.downloadText(fileName, text).catch(() => {});
+      return;
+    }
     const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
     const a = document.createElement('a');
     a.href = url;
-    a.download = `snippet.${ext}`;
+    a.download = fileName;
     a.click();
     // Defer the revoke instead of doing it synchronously: Chromium fetches
     // the blob URL asynchronously from the click, so an immediate revoke can

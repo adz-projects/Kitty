@@ -12,7 +12,7 @@ import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
     layers sitting over the chat, where a swipe means something else or
     nothing at all. */
 const NO_OPEN_FROM =
-  '.artifacts-sheet, .sheet-scrim, .msg-menu-backdrop, .modal-backdrop, .mode-popover';
+  '.artifacts-sheet, .sheet-scrim, .msg-menu-backdrop, .modal-backdrop, .mode-popover, .chat-header-menu, .slash-menu, textarea, input';
 
 const overflowX = (el: unknown) => getComputedStyle(el as Element).overflowX;
 
@@ -85,6 +85,7 @@ export function MobileDrawer() {
       }
       if (dx <= 0 || useRouteStore.getState().view !== 'chat') return false;
       if (target.closest(NO_OPEN_FROM)) return false;
+      if (window.getSelection()?.toString()) return false;
       return !canScrollHorizontally(target, 'right', overflowX);
     },
     onMove: (delta) => {
