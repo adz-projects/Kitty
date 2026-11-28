@@ -2,7 +2,8 @@
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:docDefaults>
     <w:rPrDefault>
-      <w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia" w:cs="Georgia"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr></w:rPrDefault>
+      <w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia" w:cs="Georgia"/><w:color w:val="1A1A1A"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>
+    </w:rPrDefault>
   </w:docDefaults>
   <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont">
     <w:name w:val="Default Paragraph Font"/>
@@ -11,76 +12,83 @@
   </w:style>
   <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
     <w:name w:val="Normal"/>
-    <w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr>
+    <w:pPr><w:spacing w:before="0" w:after="160" w:line="300" w:lineRule="auto"/></w:pPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Title">
     <w:name w:val="Title"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:spacing w:after="300"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="0" w:after="240" w:line="276" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:b/><w:color w:val="000000"/><w:sz w:val="48"/><w:szCs w:val="48"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading1">
     <w:name w:val="heading 1"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:keepNext/><w:outlineLvl w:val="0"/><w:spacing w:before="240" w:after="120"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="360" w:after="140" w:line="276" w:lineRule="auto"/><w:outlineLvl w:val="0"/></w:pPr>
+    <w:rPr><w:b/><w:color w:val="000000"/><w:sz w:val="40"/><w:szCs w:val="40"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading2">
     <w:name w:val="heading 2"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:keepNext/><w:outlineLvl w:val="1"/><w:spacing w:before="200" w:after="100"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="300" w:after="100" w:line="276" w:lineRule="auto"/><w:outlineLvl w:val="1"/></w:pPr>
+    <w:rPr><w:b/><w:color w:val="000000"/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading3">
     <w:name w:val="heading 3"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:keepNext/><w:outlineLvl w:val="2"/><w:spacing w:before="160" w:after="80"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="240" w:after="80" w:line="288" w:lineRule="auto"/><w:outlineLvl w:val="2"/></w:pPr>
+    <w:rPr><w:b/><w:color w:val="000000"/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading4">
     <w:name w:val="heading 4"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:keepNext/><w:outlineLvl w:val="3"/><w:spacing w:before="120" w:after="60"/></w:pPr>
-    <w:rPr><w:b/><w:i/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="200" w:after="60" w:line="288" w:lineRule="auto"/><w:outlineLvl w:val="3"/></w:pPr>
+    <w:rPr><w:b/><w:i/><w:color w:val="000000"/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading5">
     <w:name w:val="heading 5"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:keepNext/><w:outlineLvl w:val="4"/><w:spacing w:before="100" w:after="60"/></w:pPr>
-    <w:rPr><w:b/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="180" w:after="60" w:line="288" w:lineRule="auto"/><w:outlineLvl w:val="4"/></w:pPr>
+    <w:rPr><w:b/><w:color w:val="000000"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading6">
     <w:name w:val="heading 6"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:keepNext/><w:outlineLvl w:val="5"/><w:spacing w:before="100" w:after="60"/></w:pPr>
-    <w:rPr><w:b/><w:i/><w:color w:val="595959"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
+    <w:next w:val="Normal"/>
+    <w:pPr><w:keepNext/><w:keepLines/><w:spacing w:before="160" w:after="40" w:line="288" w:lineRule="auto"/><w:outlineLvl w:val="5"/></w:pPr>
+    <w:rPr><w:b/><w:i/><w:color w:val="000000"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Quote">
     <w:name w:val="Quote"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:ind w:left="720" w:right="720"/></w:pPr>
-    <w:rPr><w:i/><w:color w:val="404040"/></w:rPr>
+    <w:pPr><w:pBdr><w:left w:val="single" w:sz="24" w:space="12" w:color="262626"/></w:pBdr><w:shd w:val="clear" w:color="auto" w:fill="F5F5F5"/><w:spacing w:before="180" w:after="180" w:line="300" w:lineRule="auto"/><w:ind w:left="480" w:right="480"/></w:pPr>
+    <w:rPr><w:i/><w:color w:val="2B2B2B"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Code">
     <w:name w:val="Code"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr>
+    <w:pPr><w:pBdr><w:left w:val="single" w:sz="16" w:space="10" w:color="8C8C8C"/></w:pBdr><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/><w:spacing w:before="0" w:after="160" w:line="252" w:lineRule="auto"/><w:ind w:left="120" w:right="120"/><w:contextualSpacing/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:color w:val="1A1A1A"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr>
   </w:style>
   <w:style w:type="character" w:styleId="CodeChar">
     <w:name w:val="Code Char"/>
     <w:basedOn w:val="DefaultParagraphFont"/>
-    <w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:rPr>
+    <w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/><w:color w:val="000000"/><w:sz w:val="20"/><w:szCs w:val="20"/><w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="ListBullet">
     <w:name w:val="List Bullet"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+    <w:pPr><w:spacing w:before="0" w:after="160" w:line="240" w:lineRule="auto"/><w:ind w:left="540" w:hanging="270"/><w:contextualSpacing/></w:pPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="ListNumber">
     <w:name w:val="List Number"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+    <w:pPr><w:spacing w:before="0" w:after="160" w:line="240" w:lineRule="auto"/><w:ind w:left="540" w:hanging="270"/><w:contextualSpacing/></w:pPr>
   </w:style>
   <w:style w:type="character" w:styleId="Hyperlink">
     <w:name w:val="Hyperlink"/>
@@ -90,25 +98,43 @@
   <w:style w:type="character" w:styleId="FootnoteReference">
     <w:name w:val="footnote reference"/>
     <w:basedOn w:val="DefaultParagraphFont"/>
-    <w:rPr><w:vertAlign w:val="superscript"/></w:rPr>
+    <w:rPr><w:color w:val="000000"/><w:vertAlign w:val="superscript"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="FootnoteText">
     <w:name w:val="footnote text"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>
-    <w:rPr><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr>
+    <w:pPr><w:spacing w:before="0" w:after="40" w:line="264" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:color w:val="595959"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Footer">
+    <w:name w:val="footer"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:jc w:val="center"/></w:pPr>
+    <w:rPr><w:color w:val="595959"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="TableHeader">
+    <w:name w:val="Table Header"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:spacing w:before="0" w:after="0" w:line="264" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="TableCell">
+    <w:name w:val="Table Cell"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:spacing w:before="0" w:after="0" w:line="276" w:lineRule="auto"/></w:pPr>
+    <w:rPr><w:color w:val="1A1A1A"/><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr>
   </w:style>
   <w:style w:type="table" w:styleId="TableGrid">
     <w:name w:val="Table Grid"/>
     <w:basedOn w:val="TableNormal"/>
     <w:tblPr>
       <w:tblBorders>
-        <w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        <w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        <w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        <w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        <w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        <w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+        <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+        <w:left w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+        <w:bottom w:val="single" w:sz="10" w:space="0" w:color="000000"/>
+        <w:right w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+        <w:insideH w:val="single" w:sz="4" w:space="0" w:color="DCDCDC"/>
+        <w:insideV w:val="none" w:sz="0" w:space="0" w:color="auto"/>
       </w:tblBorders>
     </w:tblPr>
   </w:style>
@@ -119,10 +145,10 @@
     <w:tblPr>
       <w:tblInd w:w="0" w:type="dxa"/>
       <w:tblCellMar>
-        <w:top w:w="0" w:type="dxa"/>
-        <w:left w:w="108" w:type="dxa"/>
-        <w:bottom w:w="0" w:type="dxa"/>
-        <w:right w:w="108" w:type="dxa"/>
+        <w:top w:w="100" w:type="dxa"/>
+        <w:left w:w="140" w:type="dxa"/>
+        <w:bottom w:w="100" w:type="dxa"/>
+        <w:right w:w="140" w:type="dxa"/>
       </w:tblCellMar>
     </w:tblPr>
   </w:style>

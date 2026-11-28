@@ -27,6 +27,7 @@ const DOCUMENT_RELS: &str = include_str!("assets/document_rels.xml");
 const NUMBERING: &str = include_str!("assets/numbering.xml");
 const STYLES_TEMPLATE: &str = include_str!("assets/styles.xml");
 const STYLES_SERIF_TEMPLATE: &str = include_str!("assets/styles_serif.xml");
+const FOOTER_XML: &str = include_str!("assets/footer1.xml");
 const CORE_TEMPLATE: &str = include_str!("assets/core.xml");
 const APP_PROPS: &str = include_str!("assets/app.xml");
 
@@ -37,6 +38,7 @@ const REL_HYPERLINK: &str =
 const REL_IMAGE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const REL_FOOTNOTES: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
+const REL_FOOTER: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
 
 pub enum WriteMode {
     Create,
@@ -49,9 +51,10 @@ pub struct WriteResult {
     pub language: String,
 }
 
-/// Selectable style templates with considered fonts. `Default` is a clean
-/// sans-serif (Calibri); `Serif` is a bookish Georgia. Both meet the same
-/// accessibility structure (heading outline levels, table headers, lang).
+/// Selectable style templates with considered fonts. `Default` is a grayscale
+/// editorial layout (black Montserrat titles/headings, Open Sans body text,
+/// white-on-black table headers); `Serif` is a bookish Georgia. Both meet the
+/// same accessibility structure (heading outline levels, table headers, lang).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StyleTemplate {
     #[default]
@@ -134,6 +137,7 @@ enum Rel {
     Hyperlink { id: String, url: String },
     Image { id: String, target: String },
     Footnotes { id: String },
+    Footer { id: String },
 }
 
 /// Relationships discovered while rendering a body, in the order they appear.
@@ -188,6 +192,12 @@ impl LinkCollector {
         id
     }
 
+    fn add_footer(&mut self) -> String {
+        let id = self.alloc_id();
+        self.rels.push(Rel::Footer { id: id.clone() });
+        id
+    }
+
     fn is_empty(&self) -> bool {
         self.rels.is_empty()
     }
@@ -207,6 +217,9 @@ impl LinkCollector {
                 ),
                 Rel::Footnotes { id } => format!(
                     r#"<Relationship Id="{id}" Type="{REL_FOOTNOTES}" Target="footnotes.xml"/>"#
+                ),
+                Rel::Footer { id } => format!(
+                    r#"<Relationship Id="{id}" Type="{REL_FOOTER}" Target="footer1.xml"/>"#
                 ),
             })
             .collect()
@@ -628,40 +641,58 @@ fn table_xml(rows: &[Vec<String>], ctx: &mut RenderCtx) -> String {
         return String::new();
     }
 
+    let col_w = (9360 / num_cols).max(720);
     let grid_cols: String = (0..num_cols)
-        .map(|_| r#"<w:gridCol w:w="2000"/>"#)
+        .map(|_| format!(r#"<w:gridCol w:w="{col_w}"/>"#))
         .collect();
 
     let mut trs = String::new();
     for (r_idx, row) in rows.iter().enumerate() {
-        let mut tc_pr_header = String::new();
-        if r_idx == 0 {
-            tc_pr_header.push_str("<w:tblHeader/>");
+        let is_header = r_idx == 0;
+        let mut tr_pr = String::new();
+        if is_header {
+            tr_pr.push_str("<w:tblHeader/>");
         }
-        tc_pr_header.push_str("<w:cantSplit/>");
+        tr_pr.push_str("<w:cantSplit/>");
+
+        let fill = if is_header {
+            "000000"
+        } else if r_idx % 2 == 0 {
+            "F2F2F2"
+        } else {
+            "FFFFFF"
+        };
+        let p_style = if is_header {
+            Some("TableHeader")
+        } else {
+            Some("TableCell")
+        };
 
         let mut cells = String::new();
         for c_idx in 0..num_cols {
             let cell_text = row.get(c_idx).map(String::as_str).unwrap_or("");
             cells.push_str(&format!(
-                "<w:tc><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/></w:tcPr>{}</w:tc>",
-                paragraph_xml(None, "", &render_inline_runs(cell_text, ctx))
+                r#"<w:tc><w:tcPr><w:tcW w:w="{col_w}" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="{fill}"/><w:vAlign w:val="top"/></w:tcPr>{}</w:tc>"#,
+                paragraph_xml(p_style, "", &render_inline_runs(cell_text, ctx))
             ));
         }
-        trs.push_str(&format!(
-            "<w:tr><w:trPr>{tc_pr_header}</w:trPr>{cells}</w:tr>"
-        ));
+        trs.push_str(&format!("<w:tr><w:trPr>{tr_pr}</w:trPr>{cells}</w:tr>"));
     }
 
     format!(
-        r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/><w:tblBorders>
-            <w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-            <w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-            <w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-            <w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-            <w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-            <w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        </w:tblBorders></w:tblPr><w:tblGrid>{grid_cols}</w:tblGrid>{trs}</w:tbl>"#
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="9360" w:type="dxa"/><w:tblBorders>
+            <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>
+            <w:left w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+            <w:bottom w:val="single" w:sz="10" w:space="0" w:color="000000"/>
+            <w:right w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+            <w:insideH w:val="single" w:sz="4" w:space="0" w:color="DCDCDC"/>
+            <w:insideV w:val="none" w:sz="0" w:space="0" w:color="auto"/>
+        </w:tblBorders><w:tblCellMar>
+            <w:top w:w="100" w:type="dxa"/>
+            <w:left w:w="140" w:type="dxa"/>
+            <w:bottom w:w="100" w:type="dxa"/>
+            <w:right w:w="140" w:type="dxa"/>
+        </w:tblCellMar></w:tblPr><w:tblGrid>{grid_cols}</w:tblGrid>{trs}</w:tbl>"#
     )
 }
 
@@ -901,8 +932,18 @@ fn footnotes_xml(ctx: &RenderCtx) -> String {
 }
 
 /// Content-type entries for the parts this document actually carries.
-fn content_types_with(base: &str, has_footnotes: bool, image_exts: &[&str]) -> String {
+fn content_types_with(
+    base: &str,
+    has_footnotes: bool,
+    has_footer: bool,
+    image_exts: &[&str],
+) -> String {
     let mut additions = String::new();
+    if has_footer && !base.contains(r#"PartName="/word/footer1.xml""#) {
+        additions.push_str(
+            r#"<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>"#,
+        );
+    }
     if has_footnotes && !base.contains(r#"PartName="/word/footnotes.xml""#) {
         additions.push_str(
             r#"<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>"#,
@@ -980,9 +1021,10 @@ fn create(
     if has_footnotes {
         ctx.links.add_footnotes();
     }
+    let footer_rel_id = ctx.links.add_footer();
 
     let document_xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {DOCUMENT_XML_NS}><w:body>{body}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>"#
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {DOCUMENT_XML_NS}><w:body>{body}<w:sectPr><w:footerReference w:type="default" r:id="{footer_rel_id}"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr></w:body></w:document>"#
     );
 
     // WCAG accessibility metadata: `w:lang` in its schema-valid home,
@@ -1019,7 +1061,7 @@ fn create(
     write_zip_str(
         &mut zip,
         "[Content_Types].xml",
-        &content_types_with(CONTENT_TYPES, has_footnotes, &exts),
+        &content_types_with(CONTENT_TYPES, has_footnotes, true, &exts),
         opts,
     )?;
     write_zip_str(&mut zip, "_rels/.rels", ROOT_RELS, opts)?;
@@ -1032,6 +1074,7 @@ fn create(
     write_zip_str(&mut zip, "word/document.xml", &document_xml, opts)?;
     write_zip_str(&mut zip, "word/styles.xml", &styles_xml, opts)?;
     write_zip_str(&mut zip, "word/numbering.xml", NUMBERING, opts)?;
+    write_zip_str(&mut zip, "word/footer1.xml", FOOTER_XML, opts)?;
     if has_footnotes {
         write_zip_str(&mut zip, "word/footnotes.xml", &footnotes_xml(&ctx), opts)?;
     }
@@ -1246,7 +1289,7 @@ fn append(
         if let Some(ct_bytes) = parts.get("[Content_Types].xml").cloned() {
             let ct = String::from_utf8_lossy(&ct_bytes).to_string();
             let exts = image_extensions(&ctx.images);
-            let patched = content_types_with(&ct, has_footnotes, &exts);
+            let patched = content_types_with(&ct, has_footnotes, false, &exts);
             parts.insert("[Content_Types].xml".to_string(), patched.into_bytes());
         }
     }
@@ -1874,11 +1917,53 @@ mod tests {
 
     #[test]
     fn content_types_gain_footnotes_and_image_entries() {
-        let ct = content_types_with(CONTENT_TYPES, true, &["png"]);
+        let ct = content_types_with(CONTENT_TYPES, true, true, &["png"]);
+        assert!(ct.contains("/word/footer1.xml"));
         assert!(ct.contains("/word/footnotes.xml"));
         assert!(ct.contains(r#"Extension="png""#));
         // No additions leaves the base byte-identical.
-        assert_eq!(content_types_with(CONTENT_TYPES, false, &[]), CONTENT_TYPES);
+        assert_eq!(
+            content_types_with(CONTENT_TYPES, false, false, &[]),
+            CONTENT_TYPES
+        );
+    }
+
+    #[test]
+    fn default_template_uses_grayscale_montserrat_open_sans_and_page_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("styled.docx");
+        write_document(
+            &doc,
+            Some("# One\n\nBody\n\n- a\n- b\n\n| H1 | H2 |\n|---|---|\n| r1 | v1 |\n| r2 | v2 |"),
+            WriteMode::Create,
+            Some("My Title"),
+            "en-US",
+        )
+        .unwrap();
+
+        let styles = zip_part(&doc, "word/styles.xml").unwrap();
+        assert!(styles.contains(r#"w:ascii="Open Sans""#));
+        assert!(styles.contains(r#"w:ascii="Montserrat""#));
+        assert!(styles.contains(r#"<w:next w:val="Normal"/>"#));
+        assert!(styles.contains("<w:contextualSpacing/>"));
+        assert!(styles.contains(r#"w:color w:val="0563C1""#));
+        // Title 24pt (48), H1 20pt (40), H2 16pt (32), H3 14pt (28).
+        assert!(styles.contains(r#"w:sz w:val="48""#));
+        assert!(styles.contains(r#"w:sz w:val="40""#));
+        assert!(styles.contains(r#"w:sz w:val="32""#));
+        assert!(styles.contains(r#"w:sz w:val="28""#));
+
+        let body = zip_part(&doc, "word/document.xml").unwrap();
+        assert!(body.contains(r#"w:fill="000000""#));
+        assert!(body.contains(r#"w:fill="FFFFFF""#));
+        assert!(body.contains(r#"w:fill="F2F2F2""#));
+        assert!(body.contains(r#"<w:footerReference w:type="default""#));
+
+        let footer = zip_part(&doc, "word/footer1.xml").unwrap();
+        assert!(footer.contains("PAGE"));
+        assert!(footer.contains(r#"w:jc w:val="center""#));
+        assert!(!footer.contains("NUMPAGES"));
+        assert!(!footer.contains("pBdr"));
     }
 
     fn one_pixel_png() -> Vec<u8> {

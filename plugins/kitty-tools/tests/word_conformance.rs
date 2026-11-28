@@ -625,3 +625,83 @@ print("OK")
     ));
     assert_eq!(check, "OK");
 }
+
+#[tokio::test]
+async fn word_write_doc_default_template_matches_editorial_grayscale_spec() {
+    let path = tmp_path("editorial_grayscale.docx");
+    let server = KittyToolsServer::new();
+    let result = parse(
+        &server
+            .word_write_doc(Parameters(WordWriteDocRequest {
+                path: path.to_string_lossy().to_string(),
+                doc_text: Some(
+                    "# Heading One\n\n## Heading Two\n\n### Heading Three\n\nBody with [link](https://example.com).\n\n- item 1\n- item 2\n\n| Col A | Col B |\n|---|---|\n| r1a | r1b |\n| r2a | r2b |"
+                        .to_string(),
+                ),
+                write_mode: Some(WordWriteModeParam::Create),
+                title: Some("Document Title".to_string()),
+                language: Some("en-US".to_string()),
+            }))
+            .await,
+    );
+    assert_eq!(result["status"], "success", "{result:?}");
+
+    let check = run_python(&format!(
+        r#"
+from docx import Document
+from docx.shared import Inches, Pt
+
+doc = Document(r"{}")
+ns = {{"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}}
+
+# 1" margins and bottom-center PAGE footer (no hairline, no NUMPAGES).
+sec = doc.sections[0]
+assert sec.top_margin == Inches(1), sec.top_margin
+assert sec.bottom_margin == Inches(1), sec.bottom_margin
+assert sec.left_margin == Inches(1), sec.left_margin
+assert sec.right_margin == Inches(1), sec.right_margin
+ftr_xml = sec.footer._element.xml
+assert "PAGE" in ftr_xml and "NUMPAGES" not in ftr_xml, ftr_xml
+assert "pBdr" not in ftr_xml, ftr_xml
+
+# Typography: Montserrat headings (24/20/16/14pt, black, no pBdr, next=Normal, outlineLvl).
+expected = [
+    ("Title", 24, None),
+    ("Heading1", 20, "0"),
+    ("Heading2", 16, "1"),
+    ("Heading3", 14, "2"),
+]
+for sid, pts, lvl in expected:
+    st = doc.styles[sid]
+    assert st.font.name == "Montserrat", (sid, st.font.name)
+    assert st.font.size == Pt(pts), (sid, st.font.size)
+    assert str(st.font.color.rgb) == "000000", (sid, st.font.color.rgb)
+    assert st.next_paragraph_style.style_id == "Normal", (sid, st.next_paragraph_style)
+    assert st._element.find(".//w:pBdr", ns) is None, (sid, st._element.xml)
+    if lvl is not None:
+        ol = st._element.find(".//w:outlineLvl", ns)
+        assert ol is not None and ol.get("{{%s}}val" % ns["w"]) == lvl, (sid, ol)
+
+# Lists single-spaced internally (line=240 + contextualSpacing).
+for sid in ("ListBullet", "ListNumber"):
+    el = doc.styles[sid]._element
+    assert el.find(".//w:contextualSpacing", ns) is not None, sid
+
+# Hyperlinks in Word blue.
+assert str(doc.styles["Hyperlink"].font.color.rgb) == "0563C1"
+
+# Table: white on black header, alternating white and light-gray rows.
+t = doc.tables[0]
+def cell_fill(row_i):
+    shd = t.rows[row_i].cells[0]._tc.find(".//w:shd", ns)
+    return shd.get("{{%s}}fill" % ns["w"])
+assert cell_fill(0) == "000000", cell_fill(0)
+assert cell_fill(1) == "FFFFFF", cell_fill(1)
+assert cell_fill(2) == "F2F2F2", cell_fill(2)
+assert str(doc.styles["TableHeader"].font.color.rgb) == "FFFFFF"
+print("OK")
+"#,
+        path.display()
+    ));
+    assert_eq!(check, "OK");
+}
